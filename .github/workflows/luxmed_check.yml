@@ -48,6 +48,7 @@ jobs:
         telegram:
           token: "${{ secrets.TELEGRAM_TOKEN }}"
           chat_id: "${{ secrets.TELEGRAM_CHAT_ID }}"
+          message_template: "New visit! {AppointmentDate} at {ClinicPublicName} - {DoctorName}"
         misc:
           notifydb: ./notifications.db
         EOF
