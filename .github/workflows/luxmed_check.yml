@@ -54,4 +54,7 @@ jobs:
         EOF
 
     - name: Run Luxmed Sniper
-      run: python3 luxmed_sniper.py -c config.yml --run-once
+      run: |
+        python3 luxmed_sniper.py -c config.yml &
+        sleep 60
+        kill $!
