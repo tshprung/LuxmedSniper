@@ -44,7 +44,7 @@ jobs:
             - id: "${{ secrets.DOCTOR_ID }}"
               name: "Target Doctor Search"
               enabled: True
-          lookup_time_days: 30
+          lookup_time_days: 2
         telegram:
           token: "${{ secrets.TELEGRAM_TOKEN }}"
           chat_id: "${{ secrets.TELEGRAM_CHAT_ID }}"
