@@ -27,25 +27,27 @@ jobs:
 
     - name: Install dependencies
       run: |
+        print("Installing base requirements...")
         pip install -r requirements.txt
+        print("Installing telegram dependency...")
+        pip install telegram-send
 
     - name: Create Configuration File
       run: |
         cat <<EOF > config.yml
         luxmed:
-          email: "${{ secrets.LUXMED_EMAIL }}"
-          password: "${{ secrets.LUXMED_PASS }}"
+          login: "${{ secrets.LUXMED_LOGIN }}"
+          password: "${{ secrets.LUXMED_PASSWORD }}"
         luxmedsniper:
+          notification_provider: "telegram"
           doctor_locators:
             - id: "${{ secrets.DOCTOR_ID }}"
               name: "Target Doctor Search"
               enabled: True
           lookup_time_days: 14
-        pushover:
-          user_key: "${{ secrets.PUSHOVER_USER }}"
-          api_token: "${{ secrets.PUSHOVER_TOKEN }}"
-          message_template: "New visit! {AppointmentDate} at {ClinicPublicName} - {DoctorName}"
-          title: "New Lux Med visit available!"
+        telegram:
+          token: "${{ secrets.TELEGRAM_TOKEN }}"
+          chat_id: "${{ secrets.TELEGRAM_CHAT_ID }}"
         misc:
           notifydb: ./notifications.db
         EOF
