@@ -1,0 +1,54 @@
+name: LuxMed Slot Checker
+
+on:
+  schedule:
+    # --- פרופיל שעון קיץ ---
+    - cron: '30,40,50 3 * 3-10 *'
+    - cron: '*/10 4-19 * 3-10 *'
+    - cron: '0 20 * 3-10 *'
+    # --- פרופיל שעון חורף ---
+    - cron: '30,40,50 4 * 11,12,1,2 *'
+    - cron: '*/10 5-20 * 11,12,1,2 *'
+    - cron: '0 21 * 11,12,1,2 *'
+
+  workflow_dispatch:
+
+jobs:
+  check_slots:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Create Configuration File
+      run: |
+        cat <<EOF > config.yml
+        luxmed:
+          email: "${{ secrets.LUXMED_EMAIL }}"
+          password: "${{ secrets.LUXMED_PASS }}"
+        luxmedsniper:
+          doctor_locators:
+            - id: "${{ secrets.DOCTOR_ID }}"
+              name: "Target Doctor Search"
+              enabled: True
+          lookup_time_days: 14
+        pushover:
+          user_key: "${{ secrets.PUSHOVER_USER }}"
+          api_token: "${{ secrets.PUSHOVER_TOKEN }}"
+          message_template: "New visit! {AppointmentDate} at {ClinicPublicName} - {DoctorName}"
+          title: "New Lux Med visit available!"
+        misc:
+          notifydb: ./notifications.db
+        EOF
+
+    - name: Run Luxmed Sniper
+      run: python3 luxmed_sniper.py -c config.yml
