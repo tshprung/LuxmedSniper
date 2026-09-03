@@ -2,15 +2,8 @@ name: LuxMed Slot Checker
 
 on:
   schedule:
-    # --- פרופיל שעון קיץ (מרץ עד אוקטובר) ---
-    - cron: '30,40,50 3 * 3-10 *'
-    - cron: '*/10 4-19 * 3-10 *'
-    - cron: '0 20 * 3-10 *'
-    # --- פרופיל שעון חורף (נובמבר עד מרץ) ---
-    - cron: '30,40,50 4 * 11,12,1,2 *'
-    - cron: '*/10 5-20 * 11,12,1,2 *'
-    - cron: '0 21 * 11,12,1,2 *'
-
+    # Run once every 10 minutes, all day
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -32,17 +25,14 @@ jobs:
         echo "Installing telegram dependency..."
         pip install telegram-send
 
-    
     - name: Create Configuration File
       run: |
-        # יצירת קובץ ההגדרות של telegram-send
         cat <<EOF > telegram-send.conf
         [telegram]
         token = ${{ secrets.TELEGRAM_TOKEN }}
         chat_id = ${{ secrets.TELEGRAM_CHAT_ID }}
         EOF
 
-        # יצירת קובץ הקונפיגורציה הראשי
         cat <<EOF > config.yml
         luxmed:
           login: "${{ secrets.LUXMED_LOGIN }}"
@@ -62,8 +52,5 @@ jobs:
           notifydb: ./notifications.db
         EOF
 
-    - name: Run Luxmed Sniper
-      run: |
-        python3 luxmed_sniper.py -c config.yml &
-        sleep 60
-        kill $!
+    - name: Run one LuxMed check
+      run: python3 -c 'from luxmed_sniper import LuxMedSniper; LuxMedSniper(["config.yml"]).check()'
