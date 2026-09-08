@@ -1,6 +1,8 @@
 name: LuxMed Slot Checker
 
 on:
+  schedule:
+    - cron: '7,27,47 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -41,7 +43,7 @@ jobs:
             - id: "${{ secrets.DOCTOR_ID }}"
               name: "Target Doctor Search"
               enabled: True
-          lookup_time_days: 2
+          lookup_time_days: 10
         telegram:
           tele_conf_path: "./telegram-send.conf"
           message_template: "New visit! {AppointmentDate} at {ClinicPublicName} - {DoctorName}"
