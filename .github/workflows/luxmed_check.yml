@@ -1,9 +1,6 @@
 name: LuxMed Slot Checker
 
 on:
-  schedule:
-    # Run once every 30 minutes
-    - cron: '3,33 * * * *'
   workflow_dispatch:
 
 jobs:
