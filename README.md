@@ -109,6 +109,21 @@ a private SQLite database. An interruption between Telegram accepting a
 notification and the worker recording delivery can result in a duplicate
 notification.
 
+### Optional free-text requests
+
+Set `OPENAI_API_KEY` as a secret in the same GitHub environment and repeat
+the encrypted configuration handoff. Use an OpenAI API project key. The
+worker uses the Responses API for short English or Polish requests that the
+built-in parser could not interpret, such as “Could you check whether there’s
+an internist available for [patient] in Wrocław?”
+
+The worker recognizes the patient, service, and city locally. Only a small
+set of scheduling words and placeholders leave the VM. It sends no chat
+history, patient labels, service labels, results, or portal credentials.
+Messages with unrecognized details stay local. The model classifies intent
+and language. The worker validates the search criteria and controls all
+account access and scheduling.
+
 How to use LuxmedSniper?
 --------------------
 First of all create virtualenv and install Python requirements from requirements.txt
