@@ -2,7 +2,6 @@ import argparse
 import asyncio
 import copy
 import datetime
-import inspect
 import json
 import logging
 import os
@@ -23,6 +22,9 @@ import schedule
 import yaml
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
+
+WARSAW = ZoneInfo("Europe/Warsaw")
+PORTAL_TIMEOUT = (5, 15)
 
 
 class DoctorLocator(BaseModel):
@@ -83,7 +85,7 @@ class Luxmed(BaseModel):
     login: str | None = None
     email: str | None = None
 
-    model_config = {"validate_assignment": True}
+    model_config = {"validate_assignment": True, "hide_input_in_errors": True}
 
     @model_validator(mode="before")
     @classmethod
@@ -113,7 +115,7 @@ class LuxmedSniper(BaseModel):
     notification_provider: list[str]
 
 
-class LuxMedSniper:
+class LuxMedPortal:
     LUXMED_LOGIN_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/Account/LogIn'
     NEW_PORTAL_RESERVATION_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/terms/index'
 
@@ -122,40 +124,137 @@ class LuxMedSniper:
     DICTIONARY_SERVICES_URL = f'{DICTIONARY_URL}/serviceVariantsGroups'
     DICTIONARY_FACILITIES_AND_DOCTORS = f'{DICTIONARY_URL}/facilitiesAndDoctors'
 
-    def __init__(self, configuration_files: typing.Iterable[str] = tuple("luxmedSniper.yaml")):
-        logger.info("LuxMedSniper logger initialized")
-
-        self.config = LuxMedSniper._load_configuration(configuration_files)
-        self.notification_providers = self._setup_providers()
+    def __init__(self, credentials: Luxmed):
         self.session = requests.Session()
+        try:
+            data = self._portal_json(
+                "POST",
+                self.LUXMED_LOGIN_URL,
+                json={"login": credentials.login, "password": credentials.password},
+                authenticating=True,
+            )
+            token = data.get("token") if isinstance(data, dict) else None
+            if not isinstance(token, str) or not token or any(not 33 <= ord(char) <= 126 for char in token):
+                raise PortalError("login-unconfirmed", suspend=True)
+            self.session.headers["authorization-token"] = f"Bearer {token}"
+        except BaseException:
+            self.session.close()
+            raise
 
-        self._log_in()
+    def _portal_json(self, method: str, url: str, *, authenticating: bool = False, **kwargs: Any) -> Any:
+        try:
+            response = self.session.request(
+                method, url, timeout=PORTAL_TIMEOUT, allow_redirects=False, **kwargs,
+            )
+        except requests.RequestException:
+            raise PortalError("network-error") from None
+        if response.status_code == 429:
+            raise PortalError("rate-limited", suspend=True)
+        if response.status_code in (401, 403):
+            raise PortalError("access-denied", suspend=True)
+        if 300 <= response.status_code < 400:
+            raise PortalError("login-unconfirmed" if authenticating else "session-unconfirmed", suspend=True)
+        if response.status_code != 200:
+            raise PortalError("portal-error", suspend=authenticating and response.status_code < 500)
+        try:
+            return response.json()
+        except ValueError:
+            raise PortalError(
+                "login-unconfirmed" if authenticating else "unexpected-response",
+                suspend=True,
+            ) from None
+
+    def search(self, locator: DoctorLocator, *, days: int = 14) -> list[Appointment]:
+        now = datetime.datetime.now(tz=datetime.UTC)
+        end = now + datetime.timedelta(days=days)
+        params = {
+            "searchPlace.id": locator.city_id,
+            "searchPlace.type": 0,
+            "serviceVariantId": locator.service_id.split(",")[0],
+            "languageId": 10,
+            "searchDateFrom": now.astimezone(WARSAW).date().isoformat(),
+            "searchDateTo": end.astimezone(WARSAW).date().isoformat(),
+            "searchDatePreset": days,
+            "delocalized": "false",
+            "processId": str(uuid.uuid4()),
+        }
+        if locator.clinic_ids:
+            params["facilitiesIds"] = locator.clinic_ids
+        if locator.doctor_ids:
+            params["doctorsIds"] = locator.doctor_ids
+        content = self._portal_json("GET", self.NEW_PORTAL_RESERVATION_URL, params=params)
+        try:
+            appointments = self._parse_visits_new_portal(content, locator)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise PortalError("unexpected-response", suspend=True) from None
+        return [appointment for appointment in appointments if now <= appointment.AppointmentDate <= end]
+
+    @staticmethod
+    def _parse_visits_new_portal(content: Any, locator: DoctorLocator) -> list[Appointment]:
+        appointments = []
+        days = content["termsForService"]["termsForDays"]
+        if not isinstance(days, list):
+            raise ValueError("Expected a list of days")
+        for day in days:
+            terms = day["terms"]
+            if not isinstance(terms, list):
+                raise ValueError("Expected a list of slots")
+            for term in terms:
+                doctor = term["doctor"]
+                clinic_id = int(term["clinicGroupId"])
+                doctor_id = int(doctor["id"])
+                if locator.doctor_ids and doctor_id not in locator.doctor_ids:
+                    continue
+                if locator.clinic_ids and clinic_id not in locator.clinic_ids:
+                    continue
+                starts_at = datetime.datetime.fromisoformat(term["dateTimeFrom"])
+                if starts_at.tzinfo is None:
+                    starts_at = starts_at.replace(tzinfo=WARSAW)
+                appointments.append(
+                    Appointment(
+                        starts_at.astimezone(WARSAW),
+                        term["clinicId"],
+                        term["clinic"],
+                        f"{doctor['academicTitle']} {doctor['firstName']} {doctor['lastName']}",
+                        term["serviceId"],
+                    ),
+                )
+        return appointments
+
+    def get_cities(self) -> list[dict]:
+        return self._portal_json("GET", self.DICTIONARY_CITIES_URL)
+
+    def get_services(self) -> list[dict]:
+        return self._portal_json("GET", self.DICTIONARY_SERVICES_URL)
+
+    def get_facilities_and_doctors(self, city_id: int, service_variant_id: int) -> dict[str, Any]:
+        params = {"cityId": city_id, "serviceVariantId": service_variant_id}
+        return self._portal_json("GET", self.DICTIONARY_FACILITIES_AND_DOCTORS, params=params)
+
+
+class LuxMedSniper(LuxMedPortal):
+    def __init__(self, configuration_files: typing.Iterable[str] = ("luxmed_sniper.yaml",)):
+        self.config = self._load_configuration(configuration_files)
+        self.notification_providers = self._setup_providers()
+        super().__init__(Luxmed(**self.config["luxmed"]))
 
     @staticmethod
     def _load_configuration(configuration_files: Iterable[str]) -> dict[str, Any]:
-        def merge(a: dict[str, Any], b: dict[str, Any], error_path: str = "") -> dict[str, Any]:
-            for kb, vb in b.items():
-                va = a.get(kb, vb)
-                if va == vb:
-                    a[kb] = va
-                elif isinstance(a[kb], dict) and isinstance(vb, dict):
-                    merge(a[kb], vb, f"{error_path}.{kb}")
+        def merge(a: dict[str, Any], b: dict[str, Any]) -> None:
+            for key, value in b.items():
+                if key not in a or a[key] == value:
+                    a[key] = value
+                elif isinstance(a[key], dict) and isinstance(value, dict):
+                    merge(a[key], value)
                 else:
-                    err_msg = f"Conflict at {error_path}.{kb}"
-                    raise LuxmedSniperError(err_msg)
-            return a
+                    raise LuxmedSniperError("Conflicting configuration values")
 
         config: dict[str, Any] = {}
         for configuration_file in configuration_files:
             configuration_path = Path(configuration_file).expanduser()
             with configuration_path.open(encoding="utf-8") as stream:
-                cf = yaml.safe_load(stream)
-                config = merge(config, cf)
-
-        logger.debug("Configuration: {}", config)
-
+                merge(config, yaml.safe_load(stream))
         return config
-
     @staticmethod
     def _format_message(message_template: str, doctor_locator: DoctorLocator, appointment_data: Appointment) -> str:
         message_data = copy.deepcopy(appointment_data.__dict__)
@@ -181,8 +280,7 @@ class LuxMedSniper:
                 }
                 response = requests.post("https://api.pushover.net/1/messages.json", data=data, timeout=10)
                 if response.status_code != requests.codes["ok"]:
-                    err_msg = f"Pushover error: {response.text}"
-                    raise LuxmedSniperError(err_msg)
+                    raise LuxmedSniperError("Pushover rejected the notification")
 
             notification_providers.append(pushover_callback)
         if "slack" in providers:
@@ -265,92 +363,6 @@ class LuxMedSniper:
 
         return notification_providers
 
-    def _log_in(self) -> None:
-        luxmed = Luxmed(**self.config["luxmed"])
-        json_data = {
-            "login": luxmed.login,
-            "password": luxmed.password,
-        }
-        response = self.session.post(
-            url=LuxMedSniper.LUXMED_LOGIN_URL,
-            json=json_data,
-            headers={"Content-Type": "application/json"},
-        )
-        logger.debug("Login response: {}.\nLogin cookies: {}", response.text, response.cookies)
-        if response.status_code != requests.codes["ok"]:
-            err_msg = f"Unexpected response {response.status_code}, cannot log in"
-            raise LuxmedSniperError(err_msg)
-
-        logger.info("Successfully logged in!")
-        self.session.cookies = response.cookies
-        for k, v in self.session.cookies.items():
-            self.session.headers.update({k: v})
-
-        token = json.loads(response.text)["token"]
-        self.session.headers["authorization-token"] = f"Bearer {token}"
-
-    @staticmethod
-    def _parse_visits_new_portal(data: requests.Response, doctor_locator_id: DoctorLocator) -> list[Appointment]:
-        appointments = []
-        content = data.json()
-        for term_for_day in content["termsForService"]["termsForDays"]:
-            for term in term_for_day["terms"]:
-                doctor = term["doctor"]
-                clinic_id = int(term["clinicGroupId"])
-                doctor_id = int(doctor["id"])
-
-                if doctor_locator_id.doctor_ids and doctor_id not in doctor_locator_id.doctor_ids:
-                    continue
-                if doctor_locator_id.clinic_ids and clinic_id not in doctor_locator_id.clinic_ids:
-                    continue
-
-                appointments.append(
-                    Appointment(
-                        datetime.datetime.fromisoformat(term["dateTimeFrom"]).replace(
-                            tzinfo=ZoneInfo("Europe/Warsaw"),
-                        ),
-                        term["clinicId"],
-                        term["clinic"],
-                        f"{doctor['academicTitle']} {doctor['firstName']} {doctor['lastName']}",
-                        term["serviceId"],
-                    ),
-                )
-        return appointments
-
-    def _get_appointments_new_portal(self, doctor_locator: DoctorLocator) -> list[Appointment]:
-        logger.info(f"Get appointments for: {doctor_locator}")
-
-        lookup_days = self.config["luxmedsniper"]["lookup_time_days"]
-        date_to = datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(days=lookup_days)
-
-        params = {
-            "searchPlace.id": doctor_locator.city_id,
-            "searchPlace.type": 0,
-            "serviceVariantId": doctor_locator.service_id.split(",")[0],
-            "languageId": 10,
-            "searchDateFrom": datetime.datetime.now(tz=datetime.UTC).date().strftime("%Y-%m-%d"),
-            "searchDateTo": date_to.strftime("%Y-%m-%d"),
-            "searchDatePreset": lookup_days,
-            "delocalized": "false",
-            "processId": str(uuid.uuid4()),
-        }
-
-        if doctor_locator.clinic_ids:
-            params["facilitiesIds"] = doctor_locator.clinic_ids
-        if doctor_locator.doctor_ids:
-            params["doctorsIds"] = doctor_locator.doctor_ids
-
-        logger.debug("Parameters: {}", params)
-
-        response = self.session.get(url=LuxMedSniper.NEW_PORTAL_RESERVATION_URL, params=params)
-        logger.debug(response.text)
-        return [
-            *filter(
-                lambda appointment: appointment.AppointmentDate <= date_to,
-                LuxMedSniper._parse_visits_new_portal(response, doctor_locator),
-            ),
-        ]
-
     def _add_to_database(self, appointment: Appointment) -> None:
         path = Path(self.config["misc"]["notifydb"])
         if path.exists():
@@ -389,7 +401,7 @@ class LuxMedSniper:
             with path.open(encoding="utf-8") as f:
                 db: dict[str, list[str]] = json.load(f)
         except json.JSONDecodeError:
-            logger.exception("Database file corrupted, treating as empty")
+            logger.warning("Notification state file is invalid")
             return False
 
         notifications = map(datetime.datetime.fromisoformat, db.get(appointment.DoctorName, []))
@@ -401,8 +413,8 @@ class LuxMedSniper:
                 result = provider(doctor_locator, appointment)
                 if result is not None and asyncio.iscoroutine(result) is True:
                     asyncio.run(result)
-            except Exception as e:
-                logger.exception(f"Sending notification failed, reason: {e}")
+            except Exception:
+                logger.error("Sending notification failed")
 
     def check(self) -> None:
         doctor_locator_dict: dict[str, Any]
@@ -413,93 +425,39 @@ class LuxMedSniper:
             )
 
             if not doctor_locator.enabled:
-                logger.info(f"Appointments skipping: {doctor_locator.name}, disabled")
                 continue
             try:
-                appointments = self._get_appointments_new_portal(doctor_locator)
+                appointments = self.search(doctor_locator, days=self.config["luxmedsniper"]["lookup_time_days"])
                 if not appointments:
-                    logger.info(f"No appointments found for: {doctor_locator.name}")
+                    logger.info("No matching slots")
                     continue
                 for appointment in appointments:
-                    logger.info(
-                        "Appointment found for: {app_name}! {AppointmentDate} at {ClinicPublicName} - {DoctorName}".format(
-                            **appointment.__dict__,
-                            app_name=doctor_locator.name,
-                        ),
-                    )
                     if not self._is_already_known(appointment):
                         self._add_to_database(appointment)
                         self._send_notification(doctor_locator, appointment)
-                        logger.info(
-                            "Notification sent for: {app_name}! {AppointmentDate} at {ClinicPublicName} - {DoctorName}".format(
-                                **appointment.__dict__,
-                                app_name=doctor_locator.name,
-                            ),
-                        )
-                    else:
-                        logger.info(f"Notification was already sent for: {doctor_locator.name}")
-            except Exception as e:
-                logger.exception(f"Looking for appointments for {doctor_locator} failed, reason: {e}")
-
-    def get_cities(self) -> list[dict]:
-        response = self.session.get(
-            url=LuxMedSniper.DICTIONARY_CITIES_URL,
-            headers={"Content-Type": "application/json"},
-        )
-        return response.json()
-
-    def get_services(self) -> list[dict]:
-        response = self.session.get(
-            url=LuxMedSniper.DICTIONARY_SERVICES_URL,
-            headers={"Content-Type": "application/json"},
-        )
-        return response.json()
-
-    def get_facilities_and_doctors(self, city_id: int, service_variant_id: int) -> dict[str, Any]:
-        params = {
-            'cityId': city_id,
-            'serviceVariantId': service_variant_id
-        }
-        response = self.session.get(
-            url=LuxMedSniper.DICTIONARY_FACILITIES_AND_DOCTORS,
-            params = params,
-            headers={"Content-Type": "application/json"}
-        )
-        return response.json()
-
+            except PortalError as error:
+                if error.suspend:
+                    raise
+                logger.error("Portal search failed ({})", error)
+            except Exception:
+                logger.error("Search or notification state update failed")
 
 class LuxmedSniperError(Exception):
     pass
 
 
+class PortalError(LuxmedSniperError):
+    def __init__(self, status: str, *, suspend: bool = False):
+        super().__init__(status)
+        self.suspend = suspend
+
+
 def setup_logging() -> None:
-    class InterceptHandler(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            # Get corresponding Loguru level if it exists.
-            level: str | int
-            try:
-                level = logger.level(record.levelname).name
-            except ValueError:
-                level = record.levelno
-
-            # Find caller from where originated the logged message.
-            frame, depth = inspect.currentframe(), 0
-            while frame and (depth == 0 or frame.f_code.co_filename == logging.__file__):
-                frame = frame.f_back
-                depth += 1
-
-            logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
-
-    logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
-    requests_log = logging.getLogger("urllib3")
-    requests_log.setLevel(logging.DEBUG)
-    requests_log.propagate = True
-
-    handlers = [
-        dict(sink=sys.stdout, level=os.environ.get("LOGURU_LEVEL", "INFO")),
-        dict(sink="debug.log", format="{time} - {message}", serialize=True, rotation="1 week"),
-    ]
-    logger.configure(handlers=handlers)
+    # Third-party HTTP logs can include request URLs and authentication data.
+    logging.basicConfig(handlers=[logging.NullHandler()], force=True)
+    logger.configure(handlers=[
+        dict(sink=sys.stdout, level=os.environ.get("LOGURU_LEVEL", "INFO"), diagnose=False),
+    ])
 
 
 # noinspection PyTypeChecker
@@ -548,9 +506,15 @@ def dump_current_ids(config, city_wildcard: str | None, dump_ids_doctors: bool) 
 def work(config: list[str]) -> None:
     try:
         luxmed_sniper = LuxMedSniper(config)
-        luxmed_sniper.check()
-    except LuxmedSniperError as s:
-        logger.exception(s)
+        with luxmed_sniper.session:
+            luxmed_sniper.check()
+    except PortalError as error:
+        logger.error("Portal check failed ({})", error)
+        if error.suspend:
+            raise SystemExit(1) from None
+    except (LuxmedSniperError, ValueError, OSError, KeyError, TypeError, yaml.YAMLError):
+        logger.error("Unable to run with the current configuration")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
@@ -583,7 +547,14 @@ if __name__ == "__main__":
 
     if args.dump_ids is True:
         logger.info(f'Dumping IDs')
-        dump_current_ids(args.config, args.dump_ids_city, args.dump_ids_doctors)
+        try:
+            dump_current_ids(args.config, args.dump_ids_city, args.dump_ids_doctors)
+        except PortalError as error:
+            logger.error("Portal dictionary lookup failed ({})", error)
+            raise SystemExit(1) from None
+        except (LuxmedSniperError, ValueError, OSError, KeyError, TypeError, yaml.YAMLError):
+            logger.error("Unable to read or write portal dictionaries")
+            raise SystemExit(1) from None
     else:
         logger.info(f'Start working every: {args.delay} s')
         work(args.config)

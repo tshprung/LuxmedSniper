@@ -4,3 +4,4 @@ schedule==1.2.2
 loguru==0.7.3
 jsonschema==4.23.0
 pydantic >= 2.12.5
+tzdata; sys_platform == "win32"
