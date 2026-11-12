@@ -1,0 +1,117 @@
+"""Private, durable state for Telegram searches and their notifications."""
+
+import datetime as dt
+import sqlite3
+
+from luxmed_sniper import WARSAW
+from telegram_requests import Criteria
+
+
+def next_search_time(timestamp: int) -> int:
+    local = dt.datetime.fromtimestamp(timestamp, WARSAW)
+    if dt.time(6) <= local.time() < dt.time(22, 1):
+        return timestamp
+    opening = local.replace(hour=6, minute=0, second=0, microsecond=0)
+    if local.hour >= 6:
+        opening += dt.timedelta(days=1)
+    return int(opening.timestamp())
+
+
+class SearchState:
+    def __init__(self, path):
+        self.db = sqlite3.connect(path)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript("""
+            PRAGMA secure_delete = ON;
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS accounts (
+                patient TEXT PRIMARY KEY, next_attempt INTEGER NOT NULL DEFAULT 0, suspended INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS searches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, patient TEXT NOT NULL, service TEXT NOT NULL,
+                city_id INTEGER NOT NULL, city TEXT NOT NULL, polish INTEGER NOT NULL,
+                telephone INTEGER NOT NULL, next_due INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active'
+            );
+            CREATE TABLE IF NOT EXISTS outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, search_id INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS message_searches (
+                message_id INTEGER PRIMARY KEY, search_id INTEGER NOT NULL
+            );
+        """)
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        row = self.db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, value))
+
+    def queue_message(self, text: str, search_id: int | None = None) -> None:
+        self.db.execute("INSERT INTO outbox (text, search_id) VALUES (?, ?)", (text, search_id))
+
+    def next_message(self) -> sqlite3.Row | None:
+        return self.db.execute("SELECT * FROM outbox ORDER BY id LIMIT 1").fetchone()
+
+    def sent(self, message: sqlite3.Row, telegram_id: int) -> None:
+        with self.db:
+            if message["search_id"] is not None:
+                self.db.execute("INSERT OR IGNORE INTO message_searches VALUES (?, ?)", (telegram_id, message["search_id"]))
+            self.db.execute("DELETE FROM outbox WHERE id = ?", (message["id"],))
+
+    def search_for_message(self, message_id: int) -> int | None:
+        row = self.db.execute("SELECT search_id FROM message_searches WHERE message_id = ?", (message_id,)).fetchone()
+        return row["search_id"] if row else None
+
+    def add(self, criteria: Criteria, now: int) -> tuple[int, int, bool]:
+        self.db.execute("INSERT OR IGNORE INTO accounts (patient) VALUES (?)", (criteria.patient,))
+        account = self.db.execute("SELECT * FROM accounts WHERE patient = ?", (criteria.patient,)).fetchone()
+        due = next_search_time(max(now, account["next_attempt"]))
+        row = self.db.execute(
+            """INSERT INTO searches (patient, service, city_id, city, polish, telephone, next_due)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (criteria.patient, criteria.service, criteria.city_id, criteria.city, criteria.polish, criteria.telephone, due),
+        )
+        return row.lastrowid, due, bool(account["suspended"])
+
+    def active(self) -> list[sqlite3.Row]:
+        return self.db.execute(
+            """SELECT searches.*, accounts.suspended FROM searches JOIN accounts USING (patient)
+               WHERE status = 'active' ORDER BY id""",
+        ).fetchall()
+
+    def finish(self, search_id: int, status: str) -> bool:
+        cursor = self.db.execute(
+            "UPDATE searches SET status = ? WHERE id = ? AND status = 'active'", (status, search_id),
+        )
+        return cursor.rowcount == 1
+
+    def suspend(self, patient: str) -> None:
+        self.db.execute("UPDATE accounts SET suspended = 1 WHERE patient = ?", (patient,))
+
+    def resume(self, patient: str) -> bool:
+        row = self.db.execute("UPDATE accounts SET suspended = 0 WHERE patient = ? AND suspended = 1", (patient,))
+        return row.rowcount == 1
+
+    def claim_batch(self, now: int) -> list[sqlite3.Row]:
+        if next_search_time(now) != now:
+            return []
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            patient = self.db.execute(
+                """SELECT patient FROM searches JOIN accounts USING (patient)
+                   WHERE status = 'active' AND next_due <= ? AND next_attempt <= ? AND suspended = 0
+                   ORDER BY next_due, id LIMIT 1""",
+                (now, now),
+            ).fetchone()
+            if patient is None:
+                return []
+            rows = self.db.execute(
+                """SELECT * FROM searches WHERE patient = ? AND status = 'active' AND next_due <= ?
+                   ORDER BY next_due, id""",
+                (patient["patient"], now),
+            ).fetchall()
+            retry_at = next_search_time(now + 3600)
+            self.db.execute("UPDATE accounts SET next_attempt = ? WHERE patient = ?", (retry_at, patient["patient"]))
+            self.db.executemany("UPDATE searches SET next_due = ? WHERE id = ?", ((retry_at, row["id"]) for row in rows))
+            return rows

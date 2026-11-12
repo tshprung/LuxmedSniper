@@ -1,0 +1,26 @@
+[Unit]
+Description=Private LUX MED Telegram availability worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/luxmed-telegram/current
+ExecStart=/opt/luxmed-telegram/current/.venv/bin/python /opt/luxmed-telegram/current/telegram_bot.py
+Environment=LUXMED_STATE_DIRECTORY=/var/lib/luxmed-telegram
+LoadCredentialEncrypted=telegram-config:/etc/luxmed-telegram/telegram-config.cred
+StateDirectory=luxmed-telegram
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+Restart=on-failure
+RestartSec=10s
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target
