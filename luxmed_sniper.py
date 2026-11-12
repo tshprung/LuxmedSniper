@@ -227,6 +227,36 @@ class LuxMedPortal:
     def get_services(self) -> list[dict]:
         return self._portal_json("GET", self.DICTIONARY_SERVICES_URL)
 
+    def resolve_in_person_service(self, service_name: str) -> int:
+        target = " ".join(service_name.casefold().split())
+        names = {"internista", "konsultacja internisty"} if target == "internista" else {target}
+        matches = set()
+        catalog = self.get_services()
+
+        def collect(nodes: Any) -> None:
+            if not isinstance(nodes, list):
+                raise PortalError("unexpected-catalog", suspend=True)
+            for node in nodes:
+                if not isinstance(node, dict) or not isinstance(node.get("name"), str):
+                    raise PortalError("unexpected-catalog", suspend=True)
+                children = node.get("children", [])
+                if children:
+                    collect(children)
+                    continue
+                name = " ".join(node["name"].casefold().split())
+                if name in names and node.get("isTelemedicine") is False:
+                    service_id = node.get("id")
+                    if type(service_id) is not int or service_id <= 0:
+                        raise PortalError("unexpected-catalog", suspend=True)
+                    matches.add(service_id)
+
+        collect(catalog)
+        if not matches:
+            raise PortalError("service-not-in-catalog", suspend=True)
+        if len(matches) > 1:
+            raise PortalError("ambiguous-service", suspend=True)
+        return matches.pop()
+
     def get_facilities_and_doctors(self, city_id: int, service_variant_id: int) -> dict[str, Any]:
         params = {"cityId": city_id, "serviceVariantId": service_variant_id}
         return self._portal_json("GET", self.DICTIONARY_FACILITIES_AND_DOCTORS, params=params)

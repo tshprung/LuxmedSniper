@@ -140,6 +140,44 @@ class AuditCliTests(unittest.TestCase):
         self.assertEqual((status, output), (0, "search-completed"))
         self.assertEqual(request.call_count, 2)
 
+    def test_service_name_resolves_from_live_catalog_before_search(self):
+        catalog = [{
+            "name": "Consultations",
+            "children": [
+                {"id": 734, "name": "Internista", "isTelemedicine": True},
+                {"id": 735, "name": "Konsultacja internisty", "isTelemedicine": False},
+            ],
+        }]
+        status, output, request = self.run_audit("patient1", {
+            "LUXMED_PATIENT1_LOGIN": "fixture",
+            "LUXMED_PATIENT1_PASSWORD": "fixture",
+            "LUXMED_PATIENT1_LOCATOR": "5*Internista*-1*-1",
+        }, [
+            response({"token": "fixture-token"}),
+            response(catalog),
+            response({"termsForService": {"termsForDays": []}}),
+        ], options=("--status-only",))
+        self.assertEqual((status, output), (0, "search-completed"))
+        self.assertEqual(request.call_args_list[1].args, ("GET", LuxMedPortal.DICTIONARY_SERVICES_URL))
+        self.assertEqual(request.call_args_list[2].args, ("GET", LuxMedPortal.NEW_PORTAL_RESERVATION_URL))
+        self.assertEqual(request.call_args_list[2].kwargs["params"]["serviceVariantId"], "735")
+
+    def test_service_name_requires_one_in_person_match(self):
+        service = {"id": 735, "name": "Internista", "isTelemedicine": False}
+        for catalog, message in (
+            ([{**service, "isTelemedicine": True}], "service-not-in-catalog"),
+            ([service, {**service, "id": 736}], "ambiguous-service"),
+            ({"unexpected": []}, "unexpected-catalog"),
+        ):
+            with self.subTest(message=message):
+                status, output, request = self.run_audit("patient1", {
+                    "LUXMED_PATIENT1_LOGIN": "fixture",
+                    "LUXMED_PATIENT1_PASSWORD": "fixture",
+                    "LUXMED_PATIENT1_LOCATOR": "5*Internista*-1*-1",
+                }, [response({"token": "fixture-token"}), response(catalog)])
+                self.assertEqual((status, output), (1, message))
+                self.assertEqual(request.call_count, 2)
+
     def test_unconfirmed_and_restricted_logins_stop_after_one_request(self):
         for reply, message in (
             (response({"challenge": "private-fixture"}), "login-unconfirmed"),
