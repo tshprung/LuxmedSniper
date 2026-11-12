@@ -39,6 +39,16 @@ class SearchState:
                 message_id INTEGER PRIMARY KEY, search_id INTEGER NOT NULL
             );
         """)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in self.db.execute("PRAGMA table_info(searches)")}
+            for name, declaration in (
+                ("last_checked", "INTEGER"),
+                ("last_result", "TEXT"),
+                ("first_result_sent", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE searches ADD COLUMN {name} {declaration}")
 
     def get_setting(self, key: str, default: str = "") -> str:
         row = self.db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -76,9 +86,37 @@ class SearchState:
 
     def active(self) -> list[sqlite3.Row]:
         return self.db.execute(
-            """SELECT searches.*, accounts.suspended FROM searches JOIN accounts USING (patient)
+            """SELECT searches.*, accounts.suspended, max(next_due, next_attempt) AS next_check
+               FROM searches JOIN accounts USING (patient)
                WHERE status = 'active' ORDER BY id""",
         ).fetchall()
+
+    def revise(self, search_id: int, criteria: Criteria, now: int) -> tuple[int, bool]:
+        account = self.db.execute("SELECT * FROM accounts WHERE patient = ?", (criteria.patient,)).fetchone()
+        due = next_search_time(max(now, account["next_attempt"]))
+        self.db.execute(
+            """UPDATE searches SET service = ?, city_id = ?, city = ?, polish = ?, telephone = ?,
+                   next_due = ?, last_checked = NULL, last_result = NULL, first_result_sent = 0
+               WHERE id = ? AND status = 'active' AND patient = ?""",
+            (criteria.service, criteria.city_id, criteria.city, criteria.polish, criteria.telephone,
+             due, search_id, criteria.patient),
+        )
+        return due, bool(account["suspended"])
+
+    def record_result(self, search_id: int, now: int, result: str) -> int | None:
+        row = self.db.execute(
+            """UPDATE searches SET last_checked = ?, last_result = ?
+               WHERE id = ? AND status = 'active' RETURNING next_due""",
+            (now, result, search_id),
+        ).fetchone()
+        return row["next_due"] if row else None
+
+    def mark_first_result(self, search_id: int) -> bool:
+        cursor = self.db.execute(
+            "UPDATE searches SET first_result_sent = 1 WHERE id = ? AND status = 'active' AND first_result_sent = 0",
+            (search_id,),
+        )
+        return cursor.rowcount == 1
 
     def finish(self, search_id: int, status: str) -> bool:
         cursor = self.db.execute(

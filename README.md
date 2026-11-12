@@ -64,17 +64,22 @@ Example requests include `Find an internist for <patient>`,
 `Znajdź pediatrę dla <pacjent>`, and
 `/find patient | exact portal service | city`. Wrocław is the default city.
 A generic pediatric request asks which visit type to use. Use `/active` to
-list searches and `Stop 123` to stop one, or reply `Stop` to a search's
-message. The structured form accepts a portal service label, a patient and a
-city. Appointment-time, doctor and clinic preferences are outside this
-first Telegram worker.
+list searches with their last result and next check. Use `Stop 123` to stop
+one, or reply `Stop` to a search's message. Use
+`/change 123 | service | city` or `/zmień 123 | usługa | miasto` to update
+an active search. You can leave the service blank to change only the city.
+An update keeps the search ID, patient and hourly account limit.
+Appointment-time, doctor and clinic preferences are outside this first
+Telegram worker.
 
 Searches use a rolling 14-day window and repeat at most hourly during
 06:00–22:00 Europe/Warsaw until slots are found or the search is stopped.
 After-hours requests queue until the next opening. An access restriction or
 unconfirmed login pauses that account. Check the official Patient Portal
 before using `/resume <patient>`. Availability is returned in the private
-chat. The worker does not write appointments or calendar events.
+chat. The first completed check reports whether it found a match. Later
+checks with no matches update `/active` quietly. The worker does not write
+appointments or calendar events.
 
 ### Deploy to the Linux VM
 

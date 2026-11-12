@@ -131,6 +131,39 @@ class BotTests(unittest.TestCase):
         self.bot.flush()
         self.assertIsNone(self.state.next_message())
 
+    def test_first_empty_result_is_reported_and_later_checks_are_visible_in_active(self):
+        self.update(1, "Find an internist for Adult")
+        self.bot.flush()
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            portal.return_value.resolve_service.return_value = 12
+            portal.return_value.search.return_value = []
+            self.bot.search_due()
+            message = self.state.next_message()["text"]
+            self.assertIn("#1 · Adult · Internista · Wrocław", message)
+            self.assertIn("No matching slots in the next 14 days", message)
+            self.assertIn("Next check: 30.03 11:00", message)
+            self.bot.flush()
+            self.now += 3600
+            self.bot.search_due()
+            self.assertIsNone(self.state.next_message())
+        self.update(2, "/active")
+        message = self.state.next_message()["text"]
+        self.assertIn("Last check 30.03 11:00: no matching slots", message)
+        self.assertIn("Next check 30.03 12:00 Warsaw time", message)
+
+    def test_change_keeps_id_patient_and_account_cooldown(self):
+        self.update(1, "Find an internist for Adult")
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            portal.return_value.resolve_service.return_value = 12
+            portal.return_value.search.return_value = []
+            self.bot.search_due()
+        self.update(2, "/change 1 | Dermatolog | Kraków")
+        row, = self.state.active()
+        self.assertEqual((row["id"], row["patient"], row["service"], row["city"]), (1, "patient1", "Dermatolog", "Kraków"))
+        self.assertEqual(row["next_due"], self.now + 3600)
+        self.assertIsNone(row["last_checked"])
+        self.assertFalse(row["first_result_sent"])
+
     def test_warsaw_close_and_dst(self):
         self.assertEqual(next_search_time(local_timestamp(30, 22)), local_timestamp(30, 22))
         self.assertEqual(next_search_time(local_timestamp(30, 22, 1)), local_timestamp(31, 6))
