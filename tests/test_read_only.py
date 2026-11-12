@@ -162,6 +162,27 @@ class AuditCliTests(unittest.TestCase):
         self.assertEqual(request.call_args_list[2].args, ("GET", LuxMedPortal.NEW_PORTAL_RESERVATION_URL))
         self.assertEqual(request.call_args_list[2].kwargs["params"]["serviceVariantId"], "735")
 
+    def test_pediatric_service_name_matches_routine_in_person_visit(self):
+        catalog = [{
+            "name": "Consultations",
+            "children": [
+                {"id": 701, "name": "Pediatra - gabinet dzieci chorych", "isTelemedicine": False},
+                {"id": 702, "name": "Konsultacja w gabinecie dzieci zdrowych", "isTelemedicine": False},
+                {"id": 703, "name": "Pediatra - gabinet dzieci zdrowych", "isTelemedicine": True},
+            ],
+        }]
+        status, output, request = self.run_audit("patient2", {
+            "LUXMED_PATIENT2_LOGIN": "fixture",
+            "LUXMED_PATIENT2_PASSWORD": "fixture",
+            "LUXMED_PATIENT2_LOCATOR": "5*Pediatra - gabinet dzieci zdrowych*-1*-1",
+        }, [
+            response({"token": "fixture-token"}),
+            response(catalog),
+            response({"termsForService": {"termsForDays": []}}),
+        ], options=("--status-only",))
+        self.assertEqual((status, output), (0, "search-completed"))
+        self.assertEqual(request.call_args.kwargs["params"]["serviceVariantId"], "702")
+
     def test_service_name_requires_one_in_person_match(self):
         service = {"id": 735, "name": "Internista", "isTelemedicine": False}
         for catalog, message in (
