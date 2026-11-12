@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field, model_validator
 
 WARSAW = ZoneInfo("Europe/Warsaw")
 PORTAL_TIMEOUT = (5, 15)
+INTERNIST_NAMES = {"internista", "konsultacja internisty", "konsultacja internistyczna"}
 
 
 class DoctorLocator(BaseModel):
@@ -229,7 +230,7 @@ class LuxMedPortal:
 
     def resolve_in_person_service(self, service_name: str) -> int:
         target = " ".join(service_name.casefold().split())
-        names = {"internista", "konsultacja internisty"} if target == "internista" else {target}
+        names = INTERNIST_NAMES if target in INTERNIST_NAMES else {target}
         matches = set()
         catalog = self.get_services()
 
