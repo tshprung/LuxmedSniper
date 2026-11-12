@@ -11,6 +11,7 @@ from luxmed_sniper import WARSAW, DoctorLocator, Luxmed, LuxMedPortal, PortalErr
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile", choices=("patient1", "patient2", "patient3"))
+    parser.add_argument("--status-only", action="store_true", help="Omit the slot count from output")
     args = parser.parse_args()
 
     now = datetime.datetime.now(WARSAW)
@@ -43,7 +44,10 @@ def main() -> int:
         print(error)
         return 1
 
-    print(f"search-completed, matching-slots={len(slots)}")
+    if args.status_only:
+        print("search-completed")
+    else:
+        print(f"search-completed, matching-slots={len(slots)}")
     return 0
 
 

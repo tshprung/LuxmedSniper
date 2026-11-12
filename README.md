@@ -37,6 +37,22 @@ portal response and verify the supported flow before continuing.
 GitHub Actions runs the tests with simulated responses and requires no patient
 credentials. The smoke check has no scheduler.
 
+### Run one live check from GitHub
+
+1. In the repository's **Settings → Environments**, create `luxmed-audit`.
+   Restrict the environment to the default branch and add the selected
+   profile's `LOGIN`, `PASSWORD` and `LOCATOR` secrets using the full names
+   above. The locator contains the search criteria and belongs in a secret.
+2. Once the workflow is on the default branch, open **Actions → Read-only
+   LUX MED check**. Run it on the default branch and select the profile you
+   configured. Use it once per account per hour during the Warsaw search
+   window. Run the first check with one authorized account before adding the
+   others.
+3. Read the status in the final step. The job supplies only the selected
+   profile's secrets to the check. The workflow log omits slot counts and
+   appointment details. Complete any verification in the official Patient
+   Portal. Stop if the check reports a restriction or an unconfirmed session.
+
 How to use LuxmedSniper?
 --------------------
 First of all create virtualenv and install Python requirements from requirements.txt

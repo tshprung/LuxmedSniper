@@ -85,11 +85,11 @@ class SearchTests(unittest.TestCase):
 
 
 class AuditCliTests(unittest.TestCase):
-    def run_audit(self, profile, environment, replies, *, hour=10):
+    def run_audit(self, profile, environment, replies, *, hour=10, options=()):
         out = io.StringIO()
         with (
             patch.dict(os.environ, environment, clear=True),
-            patch("sys.argv", ["audit_search.py", profile]),
+            patch("sys.argv", ["audit_search.py", profile, *options]),
             patch("audit_search.datetime.datetime", wraps=datetime.datetime) as clock,
             patch.object(requests.Session, "request", side_effect=replies) as request,
             redirect_stdout(out),
@@ -127,6 +127,18 @@ class AuditCliTests(unittest.TestCase):
                 status, output, request = self.run_audit("patient3", {}, [], hour=hour)
                 self.assertEqual((status, output), (2, message))
                 request.assert_not_called()
+
+    def test_status_only_omits_search_results(self):
+        status, output, request = self.run_audit("patient1", {
+            "LUXMED_PATIENT1_LOGIN": "fixture",
+            "LUXMED_PATIENT1_PASSWORD": "fixture",
+            "LUXMED_PATIENT1_LOCATOR": "8*20*-1*-1",
+        }, [
+            response({"token": "fixture-token"}),
+            response({"termsForService": {"termsForDays": [{"terms": [slot("2030-03-31T14:00:00")]}]}}),
+        ], options=("--status-only",))
+        self.assertEqual((status, output), (0, "search-completed"))
+        self.assertEqual(request.call_count, 2)
 
     def test_unconfirmed_and_restricted_logins_stop_after_one_request(self):
         for reply, message in (
