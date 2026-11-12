@@ -3,6 +3,56 @@ LUX MED appointments sniper
 =======================================
 Simple tool to notify about available slot in LUX MED medical care service using pushover notifications.
 
+## Milestone 1 read-only search
+
+Run the offline tests with Python 3.11 or newer.
+
+    python -m pip install -r requirements.txt
+    python -m unittest discover -s tests
+
+The manual smoke check uses one separately authorized account and one city and
+service variant per run. Configure the selected profile through a private
+environment or secrets runner. For `patient1` it reads `LUXMED_PATIENT1_LOGIN`,
+`LUXMED_PATIENT1_PASSWORD` and `LUXMED_PATIENT1_LOCATOR`. The other profiles
+use the corresponding `PATIENT2` and `PATIENT3` prefixes. Use a confirmed
+locator in the existing `cityId*serviceVariantId*facilitiesIds*doctorsIds`
+format. Keep credentials and patient-specific searches out of the repository,
+shell history and shared logs.
+
+    python audit_search.py patient1
+
+Start during 06:00–22:00 Europe/Warsaw, including the 22:00 minute. The
+command performs one login and, if a session token is returned, one
+availability request for the next 14 days. It outputs a status and, on
+success, a count. Each run uses a fresh session and has no Telegram,
+appointment or calendar write operations. A successful count of zero means
+the expected slot response was returned with no matching slots.
+
+`login-unconfirmed` means the legacy endpoint did not establish a recognized
+session. It can indicate a verification challenge or a changed login flow.
+If the official Patient Portal requests verification, the account holder
+completes it there. A successful browser login alone cannot validate the
+script. Stop the smoke test on access denial, a rate limit or unexpected
+portal response and verify the supported flow before continuing.
+GitHub Actions runs the tests with simulated responses and requires no patient
+credentials. The smoke check has no scheduler.
+
+### Run one live check from GitHub
+
+1. In the repository's **Settings → Environments**, create `luxmed-audit`.
+   Restrict the environment to the default branch and add the selected
+   profile's `LOGIN`, `PASSWORD` and `LOCATOR` secrets using the full names
+   above. The locator contains the search criteria and belongs in a secret.
+2. Once the workflow is on the default branch, open **Actions → Read-only
+   LUX MED check**. Run it on the default branch and select the profile you
+   configured. Use it once per account per hour during the Warsaw search
+   window. Run the first check with one authorized account before adding the
+   others.
+3. Read the status in the final step. The job supplies only the selected
+   profile's secrets to the check. The workflow log omits slot counts and
+   appointment details. Complete any verification in the official Patient
+   Portal. Stop if the check reports a restriction or an unconfirmed session.
+
 How to use LuxmedSniper?
 --------------------
 First of all create virtualenv and install Python requirements from requirements.txt
