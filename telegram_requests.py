@@ -41,7 +41,7 @@ GENERAL_SERVICES = {
     "ent": "Laryngolog",
     "laryngologa": "Laryngolog",
 }
-PEDIATRIC_REQUESTS = {"pediatrician", "paediatrician", "pediatric consultation", "pediatra", "pediatre", "pediatry"}
+PEDIATRIC_REQUESTS = {"pediatrician", "paediatrician", "pediatric consultation", "pediatric visit", "pediatra", "pediatre", "pediatry"}
 GENERAL_REQUESTS = {"doctor", "lekarz", "lekarza"}
 
 
@@ -75,7 +75,8 @@ class RequestError(ValueError):
 
 def parse_search(text: str, aliases: dict[str, str], children: set[str], cities: dict) -> Criteria | None:
     if re.match(r"^/(?:find|szukaj)(?:\s|$)", text, re.IGNORECASE):
-        command, _, arguments = text.partition(" ")
+        command, *tail = text.split(maxsplit=1)
+        arguments = tail[0] if tail else ""
         polish = command.casefold() == "/szukaj"
         parts = [part.strip() for part in arguments.split("|")]
         if len(parts) not in (2, 3) or not all(parts):

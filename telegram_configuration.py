@@ -15,12 +15,13 @@ SECRET_KEYS = (
     "LUXMED_TELEGRAM_PROFILES",
     *(f"LUXMED_{key.upper()}_{field}" for key in PROFILE_KEYS for field in ("LOGIN", "PASSWORD")),
 )
+OPTIONAL_SECRET_KEYS = ("OPENAI_API_KEY",)
 
 
 def validate(settings) -> dict:
     if not isinstance(settings, dict) or any(
         not isinstance(settings.get(key), str) or not settings[key].strip() for key in SECRET_KEYS
-    ):
+    ) or any(key in settings and not isinstance(settings[key], str) for key in OPTIONAL_SECRET_KEYS):
         raise ValueError("Incomplete configuration")
     token = settings["TELEGRAM_BOT_TOKEN"]
     owner = settings["TELEGRAM_OWNER_ID"]
@@ -55,7 +56,12 @@ def package_settings(settings: dict, public_key: str) -> bytes:
 
     validate(settings)
     key = PublicKey(base64.b64decode(public_key, validate=True))
-    payload = json.dumps({name: settings[name] for name in SECRET_KEYS}, ensure_ascii=False).encode("utf-8")
+    values = {name: settings[name] for name in SECRET_KEYS}
+    values.update({
+        name: settings[name] for name in OPTIONAL_SECRET_KEYS
+        if isinstance(settings.get(name), str) and settings[name].strip()
+    })
+    payload = json.dumps(values, ensure_ascii=False).encode("utf-8")
     return SealedBox(key).encrypt(payload)
 
 

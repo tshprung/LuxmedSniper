@@ -13,6 +13,7 @@ import requests
 
 from luxmed_sniper import WARSAW, DoctorLocator, Luxmed, LuxMedPortal, PortalError
 from telegram_configuration import PROFILE_KEYS, validate, worker_settings
+from telegram_free_text import FreeText
 from telegram_requests import Criteria, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
 from telegram_state import SearchState, next_search_time
 
@@ -89,11 +90,12 @@ def local_time(timestamp: int) -> str:
 
 
 class SearchBot:
-    def __init__(self, telegram: Telegram, state: SearchState, profiles: dict[str, Profile], *, clock=time.time):
+    def __init__(self, telegram: Telegram, state: SearchState, profiles: dict[str, Profile], *, clock=time.time, free_text: FreeText | None = None):
         self.telegram = telegram
         self.state = state
         self.profiles = profiles
         self.clock = clock
+        self.free_text = free_text
         self.cities = city_catalog()
         self.children = {key for key, profile in profiles.items() if profile.child}
         self.aliases = {}
@@ -142,30 +144,38 @@ class SearchBot:
                 self.state.queue_message(localized(polish, "Searches resumed for the next eligible hour.", "Wznowiono wyszukiwania na najbliższą dostępną godzinę."))
             else:
                 self.state.queue_message(localized(polish, "Use /resume followed by a paused patient's name.", "Użyj /wznow i podaj pacjenta ze wstrzymanym wyszukiwaniem."))
-        elif len(text) <= 600:
+        elif len(text) <= 600 and key not in {"/start", "/help", "help", "/pomoc", "pomoc"}:
+            self.handle_search(text)
+        else:
+            self.help()
+
+    def handle_search(self, text: str) -> None:
+        error_message = None
+        try:
+            criteria = parse_search(text, self.aliases, self.children, self.cities)
+        except RequestError as error:
+            criteria = None
+            error_message = str(error)
+        pending = self.state.get_setting("pending")
+        if criteria is None and pending and error_message is None:
+            candidate = Criteria(**json.loads(pending))
+            if service := pediatric_choice(text, candidate.polish):
+                criteria = replace(candidate, service=service, telephone="telefonicz" in normalize(service))
+        if criteria is None and self.free_text is not None and not text.startswith("/"):
             try:
-                criteria = parse_search(text, self.aliases, self.children, self.cities)
+                criteria = self.free_text.criteria(text, self.aliases, self.children, self.cities)
             except RequestError as error:
-                self.state.queue_message(str(error))
-                return
-            if criteria and not criteria.service:
-                self.state.set_setting("pending", json.dumps(asdict(criteria)))
-                self.state.queue_message(pediatric_menu(criteria.polish))
-            elif criteria:
-                self.state.set_setting("pending", "")
-                self.start(criteria)
-            elif key in {"/start", "/help", "help", "/pomoc", "pomoc"}:
-                self.help()
-            elif pending := self.state.get_setting("pending"):
-                criteria = Criteria(**json.loads(pending))
-                service = pediatric_choice(text, criteria.polish)
-                if service:
-                    self.state.set_setting("pending", "")
-                    self.start(replace(criteria, service=service, telephone="telefonicz" in normalize(service)))
-                else:
-                    self.state.queue_message(pediatric_menu(criteria.polish))
-            else:
-                self.help()
+                error_message = str(error)
+        if criteria and not criteria.service:
+            self.state.set_setting("pending", json.dumps(asdict(criteria)))
+            self.state.queue_message(pediatric_menu(criteria.polish))
+        elif criteria:
+            self.state.set_setting("pending", "")
+            self.start(criteria)
+        elif error_message:
+            self.state.queue_message(error_message)
+        elif pending:
+            self.state.queue_message(pediatric_menu(Criteria(**json.loads(pending)).polish))
         else:
             self.help()
 
@@ -354,7 +364,9 @@ def main() -> int:
         owner = int(settings["TELEGRAM_OWNER_ID"])
         path = Path(os.environ.get("LUXMED_STATE_DIRECTORY", "./data"))
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        bot = SearchBot(Telegram(token, owner), SearchState(path / "telegram.sqlite3"), profiles)
+        key = settings.get("OPENAI_API_KEY", "").strip()
+        interpreter = FreeText(key) if key else None
+        bot = SearchBot(Telegram(token, owner), SearchState(path / "telegram.sqlite3"), profiles, free_text=interpreter)
     except (KeyError, ValueError, OSError):
         print("Telegram bot configuration is incomplete.", file=sys.stderr)
         return 2

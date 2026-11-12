@@ -12,6 +12,7 @@ from nacl.public import PrivateKey, SealedBox
 from luxmed_sniper import WARSAW, Appointment, Luxmed, PortalError
 from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_configuration import SECRET_KEYS, package_settings
+from telegram_free_text import FreeText, redacted_request
 from telegram_state import SearchState, next_search_time
 
 
@@ -169,6 +170,39 @@ class BotTests(unittest.TestCase):
         self.assertEqual(next_search_time(local_timestamp(30, 22, 1)), local_timestamp(31, 6))
         self.assertEqual(next_search_time(local_timestamp(31, 5, 59)), local_timestamp(31, 6))
 
+    def test_free_text_path_keeps_names_and_service_local(self):
+        self.bot.free_text = FreeText("fixture-key")
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"intent":"search","language":"pl"}'}]}],
+        }
+        with patch.object(self.bot.free_text.session, "post", return_value=response) as api:
+            self.update(1, "Czy możesz sprawdzić dostępność pediatry dla Dziecka we Wrocławiu?")
+            payload = api.call_args.kwargs["json"]
+            self.assertEqual(payload["input"], "czy mozesz sprawdzic dostepnosc SERVICE dla PERSON we CITY")
+            self.assertFalse(payload["store"])
+            self.assertTrue(payload["text"]["format"]["strict"])
+            self.assertEqual(self.state.active(), [])
+            self.assertIn("Który rodzaj wizyty?", self.state.next_message()["text"])
+            self.update(2, "4")
+            self.update(3, "/active")
+            api.assert_called_once()
+        row, = self.state.active()
+        self.assertEqual(row["patient"], "patient2")
+        self.assertIn("gabinet dzieci zdrowych", row["service"])
+
+    def test_free_text_does_not_send_unrecognized_details_or_broaden_constraints(self):
+        for text in (
+            "Please find an internist for Adult tomorrow",
+            "Please find an internist for Adult at 9",
+            "Please book an internist for Adult",
+            "Please find an internist for Adult or Child",
+            "Could you find a pediatric visit for Child with details unknown-private-note?",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(redacted_request(text, self.bot.aliases, self.bot.cities))
+
 
 class TelegramTransportTests(unittest.TestCase):
     def test_protected_messages_always_target_configured_owner(self):
@@ -194,6 +228,7 @@ class DeploymentConfigTests(unittest.TestCase):
         config.update({
             "TELEGRAM_BOT_TOKEN": "123:fixture",
             "TELEGRAM_OWNER_ID": "42",
+            "OPENAI_API_KEY": "sk-fixture",
             "LUXMED_TELEGRAM_PROFILES": json.dumps({
                 f"patient{n}": {"name": f"Fixture {n}", "child": n > 1} for n in range(1, 4)
             }),
@@ -204,4 +239,4 @@ class DeploymentConfigTests(unittest.TestCase):
         ciphertext = package_settings(config, public)
         self.assertNotIn(b"fixture", ciphertext)
         decoded = json.loads(SealedBox(key).decrypt(ciphertext))
-        self.assertEqual(decoded, {name: config[name] for name in SECRET_KEYS})
+        self.assertEqual(decoded, {name: config[name] for name in (*SECRET_KEYS, "OPENAI_API_KEY")})
