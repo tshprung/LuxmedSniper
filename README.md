@@ -57,6 +57,53 @@ credentials. The smoke check has no scheduler.
    appointment details. Complete any verification in the official Patient
    Portal. Stop if the check reports a restriction or an unconfirmed session.
 
+## Private Telegram availability worker
+
+The worker accepts messages only from its configured owner's private chat.
+Example requests include `Find an internist for <patient>`,
+`Znajdź pediatrę dla <pacjent>`, and
+`/find patient | exact portal service | city`. Wrocław is the default city.
+A generic pediatric request asks which visit type to use. Use `/active` to
+list searches and `Stop 123` to stop one, or reply `Stop` to a search's
+message. The structured form accepts a portal service label, a patient and a
+city. Appointment-time, doctor and clinic preferences are outside this
+first Telegram worker.
+
+Searches use a rolling 14-day window and repeat at most hourly during
+06:00–22:00 Europe/Warsaw until slots are found or the search is stopped.
+After-hours requests queue until the next opening. An access restriction or
+unconfirmed login pauses that account. Check the official Patient Portal
+before using `/resume <patient>`. Availability is returned in the private
+chat. The worker does not write appointments or calendar events.
+
+### Deploy to the Linux VM
+
+1. Stage a reviewed release in `/opt/luxmed-telegram/current` with Python
+   3.11 or newer and a virtual environment containing `requirements.txt`
+   and `deploy/requirements.txt`. Install `deploy/luxmed-telegram.service`.
+2. Use the existing `luxmed-audit` GitHub environment on the default branch.
+   Add `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID` and
+   `LUXMED_TELEGRAM_PROFILES` as environment secrets alongside the three
+   account logins and passwords. The profiles secret maps `patient1` through
+   `patient3` to objects with `name`, `child` and optional `aliases`.
+3. In the release directory on the VM, run
+   `sudo .venv/bin/python -m deploy.install_credentials public-key`.
+   Set the returned public key as the environment variable
+   `LUXMED_TELEGRAM_RECEIVER_KEY` in GitHub. Run **Package Telegram
+   configuration** on the default branch and retrieve that run's encrypted
+   artifact. Deliver the sealed file to the VM over its trusted SSH connection.
+4. In the release directory on the VM, run
+   `sudo .venv/bin/python -m deploy.install_credentials install < telegram-config.sealed`.
+   The installer validates the decrypted configuration and stores it as a
+   host-bound systemd credential. Enable and start `luxmed-telegram.service`
+   after the credential is installed. On rotation, prepare a new transfer key
+   and restart the service after installing the new credential.
+
+The VM stores active searches, Telegram offsets and pending notifications in
+a private SQLite database. An interruption between Telegram accepting a
+notification and the worker recording delivery can result in a duplicate
+notification.
+
 How to use LuxmedSniper?
 --------------------
 First of all create virtualenv and install Python requirements from requirements.txt

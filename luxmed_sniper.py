@@ -238,10 +238,15 @@ class LuxMedPortal:
         return self._portal_json("GET", self.DICTIONARY_SERVICES_URL)
 
     def resolve_in_person_service(self, service_name: str) -> int:
+        return self.resolve_service(service_name, self.get_services())
+
+    @staticmethod
+    def resolve_service(service_name: str, catalog: Any, *, telephone: bool = False) -> int:
         target = " ".join(service_name.casefold().split())
-        names = next((names for names in IN_PERSON_SERVICE_NAMES if target in names), {target})
+        names = {target}
+        if not telephone:
+            names = next((aliases for aliases in IN_PERSON_SERVICE_NAMES if target in aliases), names)
         matches = set()
-        catalog = self.get_services()
 
         def collect(nodes: Any) -> None:
             if not isinstance(nodes, list):
@@ -254,7 +259,7 @@ class LuxMedPortal:
                     collect(children)
                     continue
                 name = " ".join(node["name"].casefold().split())
-                if name in names and node.get("isTelemedicine") is False:
+                if name in names and node.get("isTelemedicine") is telephone:
                     service_id = node.get("id")
                     if type(service_id) is not int or service_id <= 0:
                         raise PortalError("unexpected-catalog", suspend=True)
