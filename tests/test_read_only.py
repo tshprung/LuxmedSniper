@@ -145,7 +145,7 @@ class AuditCliTests(unittest.TestCase):
             "name": "Consultations",
             "children": [
                 {"id": 734, "name": "Internista", "isTelemedicine": True},
-                {"id": 735, "name": "Konsultacja internisty", "isTelemedicine": False},
+                {"id": 735, "name": "Konsultacja internistyczna", "isTelemedicine": False},
             ],
         }]
         status, output, request = self.run_audit("patient1", {
