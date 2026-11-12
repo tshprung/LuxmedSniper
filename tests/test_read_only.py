@@ -167,7 +167,7 @@ class AuditCliTests(unittest.TestCase):
             "name": "Consultations",
             "children": [
                 {"id": 701, "name": "Pediatra - gabinet dzieci chorych", "isTelemedicine": False},
-                {"id": 702, "name": "Konsultacja w gabinecie dzieci zdrowych", "isTelemedicine": False},
+                {"id": 702, "name": "Konsultacja pediatryczna - gabinet dzieci zdrowych", "isTelemedicine": False},
                 {"id": 703, "name": "Pediatra - gabinet dzieci zdrowych", "isTelemedicine": True},
             ],
         }]

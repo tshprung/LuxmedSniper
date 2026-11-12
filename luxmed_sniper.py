@@ -31,6 +31,7 @@ IN_PERSON_SERVICE_NAMES = (
         "pediatra - gabinet dzieci zdrowych",
         "konsultacja w gabinecie dzieci zdrowych",
         "konsultacja pediatry w gabinecie dzieci zdrowych",
+        "konsultacja pediatryczna - gabinet dzieci zdrowych",
         "konsultacja pediatryczna - w gabinecie dzieci zdrowych",
     },
 )
