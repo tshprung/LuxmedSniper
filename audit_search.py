@@ -26,7 +26,7 @@ def main() -> int:
     if not login.strip() or not password:
         print("missing-credentials")
         return 2
-    locator_pattern = r"[0-9]+\*[0-9]+\*(?:-1|[0-9]+(?:,[0-9]+)*)\*(?:-1|[0-9]+(?:,[0-9]+)*)"
+    locator_pattern = r"[0-9]+\*(?:[0-9]+|[^\W\d_][^*\r\n]{0,119})\*(?:-1|[0-9]+(?:,[0-9]+)*)\*(?:-1|[0-9]+(?:,[0-9]+)*)"
     if not re.fullmatch(locator_pattern, locator_id):
         print("invalid-search-configuration")
         return 2
@@ -39,6 +39,10 @@ def main() -> int:
     try:
         portal = LuxMedPortal(Luxmed(login=login, password=password))
         with portal.session:
+            if not re.fullmatch(r"[0-9]+", locator.service_id):
+                city, service_name, clinics, doctors = locator_id.split("*")
+                service_id = portal.resolve_in_person_service(service_name)
+                locator = DoctorLocator(id=f"{city}*{service_id}*{clinics}*{doctors}")
             slots = portal.search(locator)
     except PortalError as error:
         print(error)

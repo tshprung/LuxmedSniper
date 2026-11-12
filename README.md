@@ -16,14 +16,18 @@ environment or secrets runner. For `patient1` it reads `LUXMED_PATIENT1_LOGIN`,
 `LUXMED_PATIENT1_PASSWORD` and `LUXMED_PATIENT1_LOCATOR`. The other profiles
 use the corresponding `PATIENT2` and `PATIENT3` prefixes. Use a confirmed
 locator in the existing `cityId*serviceVariantId*facilitiesIds*doctorsIds`
-format. Keep credentials and patient-specific searches out of the repository,
+format. You can use the exact Polish Patient Portal service name in the second
+field instead of a variant ID. The check resolves one in-person service from
+the authenticated catalog and stops if it finds zero or multiple matches.
+Keep credentials and patient-specific searches out of the repository,
 shell history and shared logs.
 
     python audit_search.py patient1
 
 Start during 06:00–22:00 Europe/Warsaw, including the 22:00 minute. The
-command performs one login and, if a session token is returned, one
-availability request for the next 14 days. It outputs a status and, on
+command performs one login and, if a session token is returned, resolves the
+service name when needed and makes one availability request for the next 14
+days. It outputs a status and, on
 success, a count. Each run uses a fresh session and has no Telegram,
 appointment or calendar write operations. A successful count of zero means
 the expected slot response was returned with no matching slots.
