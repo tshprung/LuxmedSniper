@@ -88,6 +88,7 @@ class Appointment:
     ClinicPublicName: str
     DoctorName: str
     service_id: int
+    doctor_search_name: str = ""
 
 
 class Luxmed(BaseModel):
@@ -227,6 +228,7 @@ class LuxMedPortal:
                         term["clinic"],
                         f"{doctor['academicTitle']} {doctor['firstName']} {doctor['lastName']}",
                         term["serviceId"],
+                        doctor_search_name=f"{doctor['firstName']} {doctor['lastName']}",
                     ),
                 )
         return appointments

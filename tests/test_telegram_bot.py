@@ -169,6 +169,65 @@ class BotTests(unittest.TestCase):
         self.assertIsNone(row["last_checked"])
         self.assertFalse(row["first_result_sent"])
 
+    def test_pediatric_selection_keeps_date_time_and_clinic_preferences(self):
+        self.update(1, "Find a pediatrician for Child next week, after 16:00, near Dominikańska.")
+        self.update(2, "4")
+        row, = self.state.active()
+        criteria = self.state.criteria(row)
+        self.assertEqual(criteria.service, "Konsultacja pediatryczna - gabinet dzieci zdrowych")
+        self.assertEqual(criteria.preferences.first_date, "2030-04-01")
+        self.assertEqual(criteria.preferences.last_date, "2030-04-07")
+        self.assertEqual(criteria.preferences.start_minute, 960)
+        self.assertTrue(criteria.preferences.preferred_clinic)
+        self.update(3, "Change 1 to after 17:00")
+        edited, = self.state.active()
+        self.assertEqual(edited["id"], row["id"])
+        self.assertEqual(self.state.criteria(edited).preferences.start_minute, 1020)
+        self.assertEqual(self.state.criteria(edited).preferences.clinic, "Dominikańska")
+
+    def test_preferences_filter_returned_slots_and_expire_without_portal_call(self):
+        self.update(1, "Find an internist for Adult tomorrow after 16:00 with Dr Anna Smith, near Dominikańska")
+        self.bot.flush()
+        date = dt.datetime(2030, 3, 31, tzinfo=WARSAW)
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            portal.return_value.resolve_service.return_value = 12
+            portal.return_value.search.return_value = [
+                Appointment(date.replace(hour=16), 1, "Plac Dominikański", "Anna Smith", 12),
+                Appointment(date.replace(hour=17), 1, "Plac Dominikański", "John Smith", 12),
+                Appointment(date.replace(hour=17), 2, "Swobodna", "Anna Smith", 12),
+                Appointment(date.replace(day=30, hour=17), 1, "Plac Dominikański", "Anna Smith", 12),
+            ]
+            self.bot.search_due()
+            self.assertIn("Other clinics have matches", self.state.next_message()["text"])
+            self.assertEqual(len(self.state.active()), 1)
+            self.bot.flush()
+            self.now = int(dt.datetime(2030, 4, 1, 10, tzinfo=WARSAW).timestamp())
+            self.bot.search_due()
+            portal.assert_called_once()
+        self.assertEqual(self.state.active(), [])
+        self.assertIn("date window has ended", self.state.next_message()["text"])
+
+    def test_preferred_time_returns_closest_matching_slot_on_same_day(self):
+        self.update(1, "/find Adult | internist | Wrocław | around 4pm")
+        self.bot.flush()
+        date = dt.datetime(2030, 3, 31, tzinfo=WARSAW)
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            portal.return_value.resolve_service.return_value = 12
+            portal.return_value.search.return_value = [
+                Appointment(date.replace(hour=14, minute=59), 1, "Outside", "Anna Smith", 12),
+                Appointment(date.replace(hour=15), 1, "Earlier", "Anna Smith", 12),
+                Appointment(date.replace(hour=16, minute=10), 1, "Closer", "Anna Smith", 12),
+            ]
+            self.bot.search_due()
+        result = self.state.next_message()["text"]
+        self.assertNotIn("Outside", result)
+        self.assertLess(result.index("Closer"), result.index("Earlier"))
+
+    def test_invalid_time_filter_does_not_start_search(self):
+        self.update(1, "Find an internist for Adult after 25:00")
+        self.assertEqual(self.state.active(), [])
+        self.assertIn("valid appointment time", self.state.next_message()["text"])
+
     def test_warsaw_close_and_dst(self):
         self.assertEqual(next_search_time(local_timestamp(30, 22)), local_timestamp(30, 22))
         self.assertEqual(next_search_time(local_timestamp(30, 22, 1)), local_timestamp(31, 6))

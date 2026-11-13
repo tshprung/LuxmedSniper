@@ -1,10 +1,12 @@
 """Private, durable state for Telegram searches and their notifications."""
 
 import datetime as dt
+import json
 import sqlite3
+from dataclasses import asdict
 
 from luxmed_sniper import WARSAW
-from telegram_requests import Criteria
+from telegram_requests import Criteria, Preferences
 
 
 def next_search_time(timestamp: int) -> int:
@@ -46,6 +48,7 @@ class SearchState:
                 ("last_checked", "INTEGER"),
                 ("last_result", "TEXT"),
                 ("first_result_sent", "INTEGER NOT NULL DEFAULT 0"),
+                ("preferences", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE searches ADD COLUMN {name} {declaration}")
@@ -78,9 +81,10 @@ class SearchState:
         account = self.db.execute("SELECT * FROM accounts WHERE patient = ?", (criteria.patient,)).fetchone()
         due = next_search_time(max(now, account["next_attempt"]))
         row = self.db.execute(
-            """INSERT INTO searches (patient, service, city_id, city, polish, telephone, next_due)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (criteria.patient, criteria.service, criteria.city_id, criteria.city, 0, criteria.telephone, due),
+            """INSERT INTO searches (patient, service, city_id, city, polish, telephone, next_due, preferences)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (criteria.patient, criteria.service, criteria.city_id, criteria.city, 0, criteria.telephone,
+             due, json.dumps(asdict(criteria.preferences), ensure_ascii=False)),
         )
         return row.lastrowid, due, bool(account["suspended"])
 
@@ -91,17 +95,30 @@ class SearchState:
                WHERE status = 'active' ORDER BY id""",
         ).fetchall()
 
+    def expired(self, today: str) -> list[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT * FROM searches WHERE status = 'active' AND json_extract(preferences, '$.last_date') < ?",
+            (today,),
+        ).fetchall()
+
     def revise(self, search_id: int, criteria: Criteria, now: int) -> tuple[int, bool]:
         account = self.db.execute("SELECT * FROM accounts WHERE patient = ?", (criteria.patient,)).fetchone()
         due = next_search_time(max(now, account["next_attempt"]))
         self.db.execute(
             """UPDATE searches SET service = ?, city_id = ?, city = ?, polish = ?, telephone = ?,
-                   next_due = ?, last_checked = NULL, last_result = NULL, first_result_sent = 0
+                   next_due = ?, preferences = ?, last_checked = NULL, last_result = NULL, first_result_sent = 0
                WHERE id = ? AND status = 'active' AND patient = ?""",
             (criteria.service, criteria.city_id, criteria.city, 0, criteria.telephone,
-             due, search_id, criteria.patient),
+             due, json.dumps(asdict(criteria.preferences), ensure_ascii=False), search_id, criteria.patient),
         )
         return due, bool(account["suspended"])
+
+    @staticmethod
+    def criteria(row: sqlite3.Row) -> Criteria:
+        return Criteria(
+            row["patient"], row["service"], row["city_id"], row["city"], bool(row["telephone"]),
+            Preferences(**json.loads(row["preferences"])),
+        )
 
     def record_result(self, search_id: int, now: int, result: str) -> int | None:
         row = self.db.execute(

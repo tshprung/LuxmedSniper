@@ -1,10 +1,13 @@
 """Translate private chat requests into read-only search criteria."""
 
+import datetime as dt
 import json
 import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+
+from telegram_preferences import Preferences, parse_preferences, split_preferences
 
 
 PEDIATRIC_PREFIX = "Konsultacja pediatryczna - "
@@ -65,22 +68,27 @@ class Criteria:
     city_id: int
     city: str
     telephone: bool = False
+    preferences: Preferences = Preferences()
 
 
 class RequestError(ValueError):
     pass
 
 
-def parse_search(text: str, aliases: dict[str, str], children: set[str], cities: dict) -> Criteria | None:
+def parse_search(text: str, aliases: dict[str, str], children: set[str], cities: dict, *, today: dt.date | None = None) -> Criteria | None:
+    preference_text = ""
     if re.match(r"^/find(?:\s|$)", text, re.IGNORECASE):
         _, *tail = text.split(maxsplit=1)
         arguments = tail[0] if tail else ""
         parts = [part.strip() for part in arguments.split("|")]
-        if len(parts) not in (2, 3) or not all(parts):
-            raise RequestError("Use /find patient | service | city.")
+        if len(parts) not in (2, 3, 4) or not all(parts):
+            raise RequestError("Use /find patient | service | city | filters.")
         patient_name, service = parts[:2]
-        city_name = parts[2] if len(parts) == 3 else "Wrocław"
+        city_name = parts[2] if len(parts) >= 3 else "Wrocław"
+        preference_text = parts[3] if len(parts) == 4 else ""
     else:
+        if today is not None:
+            text, preference_text = split_preferences(text)
         phrase = re.fullmatch(
             r"(?:find|search for)\s+(.+?)\s+for\s+(.+?)(?:\s+in\s+(.+))?",
             text, re.IGNORECASE,
@@ -98,23 +106,24 @@ def parse_search(text: str, aliases: dict[str, str], children: set[str], cities:
     if city is None:
         raise RequestError("Use the city name shown in the portal.")
     city_id, city_name = city
+    preferences = parse_preferences(preference_text, today) if today is not None else Preferences()
     key = normalize(service)
     if key in PEDIATRIC_REQUESTS or (patient in children and key in GENERAL_REQUESTS):
         if patient not in children:
             raise RequestError("Which child is this for?")
-        return Criteria(patient, "", city_id, city_name)
+        return Criteria(patient, "", city_id, city_name, preferences=preferences)
     if key in GENERAL_REQUESTS:
         raise RequestError("Which service or specialty?")
     if patient in children:
         if GENERAL_SERVICES.get(key, service).casefold() == "internista":
-            return Criteria(patient, "", city_id, city_name)
+            return Criteria(patient, "", city_id, city_name, preferences=preferences)
         selected = pediatric_choice(service, allow_number=False)
         if selected:
-            return Criteria(patient, selected, city_id, city_name, "telefonicz" in normalize(selected))
+            return Criteria(patient, selected, city_id, city_name, "telefonicz" in normalize(selected), preferences)
     service = GENERAL_SERVICES.get(key, service)
     if len(service) > 130 or not service.strip():
         raise RequestError("Use a service name from the portal.")
-    return Criteria(patient, service, city_id, city_name, "telefonicz" in normalize(service))
+    return Criteria(patient, service, city_id, city_name, "telefonicz" in normalize(service), preferences)
 
 
 def pediatric_choice(text: str, *, allow_number: bool = True) -> str | None:

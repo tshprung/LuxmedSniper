@@ -66,11 +66,24 @@ Example requests include `Find an internist for <patient>`,
 A generic pediatric request asks which visit type to use. Use `/active` to
 list searches with their last result and next check. Use `Stop 123` to stop
 one, or reply `Stop` to a search's message. Use
-`/change 123 | service | city` to update
+`/change 123 | service | city | filters` to update
 an active search. You can leave the service blank to change only the city.
 An update keeps the search ID, patient and hourly account limit.
-Appointment-time, doctor and clinic preferences are outside this first
-Telegram worker.
+
+For example, send “Find a pediatrician for <patient> next week, after 16:00,
+near Dominikańska” and then choose the visit type. The worker shows the
+interpreted filters in the confirmation and in `/active`. Date filters
+include today, tomorrow, a weekday, this week, next week or a date in
+YYYY-MM-DD format. A week runs Monday to Sunday. Times use Warsaw time.
+Use `around 16:00` for a one-hour tolerance in either direction, `after
+16:00`, `before 16:00`, or `between 09:00 and 12:00`. Use `with Dr
+<full name>` to filter for a doctor and `clinic <name>` to filter for a
+clinic. `Near <name>` prefers clinics whose displayed name or address
+matches that text. The worker can tell you about matches elsewhere while
+continuing to look for the preferred clinic. It does not calculate distances.
+Use `Change 123 to after 17:00` or `Change 123 to clear filters` to update
+an active search in plain English. A search for a fixed date window ends
+once those dates have passed.
 
 Searches use a rolling 14-day window and repeat at most hourly during
 06:00–22:00 Europe/Warsaw until slots are found or the search is stopped.
