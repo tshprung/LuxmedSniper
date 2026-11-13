@@ -14,6 +14,7 @@ import requests
 from luxmed_sniper import WARSAW, DoctorLocator, Luxmed, LuxMedPortal, PortalError
 from telegram_configuration import PROFILE_KEYS, validate, worker_settings
 from telegram_free_text import FreeText
+from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences, split_preferences
 from telegram_requests import Criteria, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
 from telegram_state import SearchState, next_search_time
 
@@ -146,8 +147,12 @@ class SearchBot:
 
     def handle_search(self, text: str) -> None:
         error_message = None
+        today = dt.datetime.fromtimestamp(self.clock(), WARSAW).date()
         try:
-            criteria = parse_search(text, self.aliases, self.children, self.cities)
+            criteria = parse_search(text, self.aliases, self.children, self.cities, today=today)
+        except PreferenceError as error:
+            self.state.queue_message(str(error))
+            return
         except RequestError as error:
             criteria = None
             error_message = str(error)
@@ -155,12 +160,20 @@ class SearchBot:
         if criteria is None and pending and error_message is None:
             fields = json.loads(pending)
             fields.pop("polish", None)  # Pending choices saved by the bilingual worker.
+            fields["preferences"] = Preferences(**fields.get("preferences", {}))
             candidate = Criteria(**fields)
             if service := pediatric_choice(text):
                 criteria = replace(candidate, service=service, telephone="telefonicz" in normalize(service))
         if criteria is None and self.free_text is not None and not text.startswith("/"):
             try:
-                criteria = self.free_text.criteria(text, self.aliases, self.children, self.cities)
+                request, filters = split_preferences(text)
+                preferences = parse_preferences(filters, today)
+                criteria = self.free_text.criteria(request, self.aliases, self.children, self.cities)
+                if criteria is not None:
+                    criteria = replace(criteria, preferences=preferences)
+            except PreferenceError as error:
+                self.state.queue_message(str(error))
+                return
             except RequestError as error:
                 error_message = str(error)
         if criteria and not criteria.service:
@@ -180,9 +193,10 @@ class SearchBot:
         self.state.queue_message(
             "Read-only appointment search\n"
             "Find an internist for <patient>\nFind a pediatrician for <patient>\n"
-            "/find patient | portal service | city\n"
+            "Find an internist for <patient> next week after 16:00\n"
+            "/find patient | portal service | city | optional filters\n"
             "/active · Stop <number>\n"
-            "/change number | service | city",
+            "Change 123 to after 16:00\n/change number | service | city | optional filters",
         )
 
     def start(self, criteria: Criteria) -> None:
@@ -191,7 +205,6 @@ class SearchBot:
         self.confirm_search(search_id, criteria, due, paused, now)
 
     def confirm_search(self, search_id: int, criteria: Criteria, due: int, paused: bool, now: int, *, changed: bool = False) -> None:
-        profile = self.profiles[criteria.patient]
         if paused:
             status = "Paused. Check the portal, then use /resume."
         elif due > now:
@@ -199,33 +212,46 @@ class SearchBot:
         else:
             status = "Checking availability. I’ll send the first result when the check finishes."
         prefix = "Updated\n" if changed else ""
-        self.state.queue_message(f"{prefix}#{search_id} · {profile.name} · {criteria.service} · {criteria.city}\n{status}", search_id)
+        self.state.queue_message(f"{prefix}{self.search_heading(search_id, criteria)}\n{status}", search_id)
+
+    def search_heading(self, search_id: int, criteria: Criteria) -> str:
+        heading = f"#{search_id} · {self.profiles[criteria.patient].name} · {criteria.service} · {criteria.city}"
+        if filters := criteria.preferences.describe():
+            heading += f"\n{filters}"
+        return heading
 
     def change(self, text: str) -> None:
         parts = [part.strip() for part in text.split("|")]
-        number = parts[0].split(maxsplit=1)
-        if len(text) > 600 or len(parts) not in (2, 3) or len(number) != 2 or not re.fullmatch(r"#?[0-9]{1,18}", number[1]):
-            self.state.queue_message("Use /change number | service | city.")
+        match = re.fullmatch(r"/?change\s+#?([0-9]{1,18})(?:\s+to\s+(.+))?", parts[0], re.IGNORECASE)
+        if len(text) > 600 or match is None or len(parts) > 4 or (len(parts) == 1) != bool(match[2]):
+            self.state.queue_message("Try Change 123 to after 16:00 or /change 123 | service | city | filters.")
             return
-        search_id = int(number[1].lstrip("#"))
+        search_id = int(match[1])
         row = next((item for item in self.state.active() if item["id"] == search_id), None)
         if row is None:
             self.state.queue_message(f"Search #{search_id} is inactive.")
             return
-        service = parts[1] or row["service"]
-        city = parts[2] if len(parts) == 3 and parts[2] else row["city"]
+        current = self.state.criteria(row)
+        filters = match[2] or (parts[3] if len(parts) == 4 else "")
+        now = int(self.clock())
+        today = dt.datetime.fromtimestamp(now, WARSAW).date()
         try:
-            criteria = parse_search(f"/find {row['patient']} | {service} | {city}", self.aliases, self.children, self.cities)
-        except RequestError as error:
+            if len(parts) == 1:
+                criteria = current
+            else:
+                service = parts[1] or current.service
+                city = parts[2] if len(parts) >= 3 and parts[2] else current.city
+                criteria = parse_search(f"/find {current.patient} | {service} | {city}", self.aliases, self.children, self.cities)
+            criteria = replace(criteria, preferences=parse_preferences(filters, today, current.preferences))
+        except (RequestError, PreferenceError) as error:
             self.state.queue_message(str(error))
             return
         if not criteria.service:
             self.state.queue_message("Choose a specific pediatric visit type in /change, such as routine visit.")
             return
-        if (criteria.service, criteria.city_id, criteria.telephone) == (row["service"], row["city_id"], bool(row["telephone"])):
+        if criteria == current:
             self.state.queue_message(f"Search #{search_id} already uses those settings.")
             return
-        now = int(self.clock())
         due, paused = self.state.revise(search_id, criteria, now)
         self.confirm_search(search_id, criteria, due, paused, now, changed=True)
 
@@ -234,15 +260,17 @@ class SearchBot:
         if not rows:
             self.state.queue_message("No active searches.")
             return
-        for index in range(0, len(rows), 10):
+        for index in range(0, len(rows), 6):
             lines = []
-            for row in rows[index:index + 10]:
-                heading = f"#{row['id']} · {self.profiles[row['patient']].name} · {row['service']} · {row['city']}"
+            for row in rows[index:index + 6]:
+                heading = self.search_heading(row["id"], self.state.criteria(row))
                 if row["last_checked"] is None:
                     last = "Awaiting a recorded result"
                 else:
                     result = {
                         "no-slots": "no matching slots",
+                        "outside-preferred-clinic": "matches at other clinics only",
+                        "ambiguous-doctor": "doctor name needs clarification",
                         "paused": "paused",
                         "temporary-error": "temporary error",
                     }.get(row["last_result"], "checked")
@@ -282,6 +310,12 @@ class SearchBot:
             self.state.sent(message, sent)
 
     def search_due(self) -> None:
+        today = dt.datetime.fromtimestamp(self.clock(), WARSAW).date().isoformat()
+        with self.state.db:
+            for row in self.state.expired(today):
+                if self.state.finish(row["id"], "date-window-ended"):
+                    heading = self.search_heading(row["id"], self.state.criteria(row))
+                    self.state.queue_message(f"{heading}\nThe requested date window has ended. Search finished.", row["id"])
         batch = self.state.claim_batch(int(self.clock()))
         if not batch:
             return
@@ -311,6 +345,8 @@ class SearchBot:
 
     def search_one(self, portal: LuxMedPortal, catalog: list, row) -> None:
         search_id = row["id"]
+        criteria = self.state.criteria(row)
+        heading = self.search_heading(search_id, criteria)
         try:
             service_id = portal.resolve_service(row["service"], catalog, telephone=bool(row["telephone"]))
         except PortalError as error:
@@ -323,23 +359,32 @@ class SearchBot:
             return
 
         locator = DoctorLocator(id=f"{row['city_id']}*{service_id}*-1*-1")
-        slots = portal.search(locator)
+        try:
+            slots, outside_clinic = matching_slots(portal.search(locator), criteria.preferences)
+        except PreferenceError as error:
+            with self.state.db:
+                self.state.record_result(search_id, int(self.clock()), "ambiguous-doctor")
+                if self.state.mark_first_result(search_id):
+                    self.state.queue_message(f"{heading}\n{error}", search_id)
+            return
         if not slots:
             with self.state.db:
-                next_check = self.state.record_result(search_id, int(self.clock()), "no-slots")
+                result = "outside-preferred-clinic" if outside_clinic else "no-slots"
+                next_check = self.state.record_result(search_id, int(self.clock()), result)
                 if next_check is not None and self.state.mark_first_result(search_id):
-                    name = self.profiles[row["patient"]].name
                     due = local_time(next_check)
-                    status = f"No matching slots in the next 14 days. I’ll check hourly from 06:00 to 22:00 Warsaw time and message you if I find one. Next check: {due}."
-                    self.state.queue_message(f"#{search_id} · {name} · {row['service']} · {row['city']}\n{status}", search_id)
+                    window = "the requested dates" if criteria.preferences.first_date else "the next 14 days"
+                    status = f"No matching slots in {window}."
+                    if outside_clinic:
+                        status += " Other clinics have matches. Use /change to adjust the clinic filter."
+                    status += f" I’ll check hourly from 06:00 to 22:00 Warsaw time and message you if I find one. Next check: {due}."
+                    self.state.queue_message(f"{heading}\n{status}", search_id)
             return
         with self.state.db:
             if not self.state.finish(search_id, "found"):
                 return
-            name = self.profiles[row["patient"]].name
-            heading = "Available slots"
-            lines = [f"#{search_id} · {name} · {row['service']} · {row['city']}", heading]
-            for slot in sorted(slots, key=lambda item: item.AppointmentDate)[:3]:
+            lines = [heading, "Available slots"]
+            for slot in slots[:3]:
                 start = slot.AppointmentDate.astimezone(WARSAW).strftime("%d.%m %H:%M")
                 details = [start, slot.ClinicPublicName, slot.DoctorName]
                 lines.append(" · ".join(str(value)[:160].strip() for value in details if value))
