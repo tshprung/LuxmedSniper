@@ -34,7 +34,7 @@ BOOKING_FAILURES = {
     "booking-eligibility": "LUX MED didn't confirm that this service is covered and available to book online.",
     "portal-questions": QUESTIONNAIRE_NOTICE,
     "portal-preparation": PREPARATION_NOTICE,
-    "booking-needs-portal": "LUX MED returned a warning, a payment or referral choice, or an existing visit. Check the Patient Portal.",
+    "booking-needs-portal": "LUX MED returned a warning, a conflict, a payment or referral choice, or an existing visit. Check the Patient Portal.",
     "booking-rejected": "LUX MED declined the reservation. Check the Patient Portal for details.",
     "booking-hold-unavailable": "LUX MED didn't return a usable slot hold. Check the Patient Portal.",
 }

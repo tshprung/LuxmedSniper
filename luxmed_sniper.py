@@ -374,7 +374,10 @@ class LuxMedPortal:
         ):
             raise PortalError("booking-needs-portal")
         params = {"locationId": city_id, "serviceVariantId": service_variant_id, "process": 4}
-        triage = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/PNM/Index", params=params, stage="questionnaire")
+        triage = self._portal_json(
+            "GET", f"{self.NEW_PORTAL_URL}/PNM/Index",
+            params=params, headers={"X-Requested-With": "XMLHttpRequest"}, stage="questionnaire",
+        )
         if not isinstance(triage, dict) or triage.get("questions") not in (None, []):
             raise PortalError("portal-questions")
         availability = self._portal_json(
@@ -404,7 +407,8 @@ class LuxMedPortal:
             "timeTo": term["end"].strftime("%H:%M"), "correlationId": term["correlationId"],
             "isTelemedicine": False, "isPoz": False, "isRehabilitation": False, "isVideoConsultation": False,
             "isAdditional": False, "isImpediment": False, "isPreparationRequired": False,
-            "parentReservationId": None, "referralId": None, "eReferralId": None, "executedTriageId": None,
+            "parentReservationId": None, "referralId": None, "eReferralId": None, "referralTypeId": None,
+            "executedTriageId": None,
         }
         base = f"{self.NEW_PORTAL_URL}/Reservation"
         hold = self._portal_json("POST", f"{base}/LockTerm", json=payload)
@@ -421,11 +425,14 @@ class LuxMedPortal:
             hold.get("hasErrors") is False and hold.get("hasWarnings") is False
             and hold.get("errors", []) == [] and hold.get("warnings", []) == []
             and value.get("askForReferral") is False and value.get("relatedVisits") in (None, [])
+            and value.get("conflictedVisit") is None
+            and value.get("changeTermAvailable", False) is False
             and isinstance(valuation, dict)
             and type(valuation.get("valuationType")) is int and valuation["valuationType"] == 1  # InPackage.
             and type(valuation.get("price")) in (int, float) and valuation["price"] == 0
             and (alternative_price is None or (type(alternative_price) in (int, float) and alternative_price == 0))
             and valuation.get("isReferralRequired") is False
+            and valuation.get("requireReferralForPP", False) is False
         )
         if not can_confirm:
             self.release_booking_hold(hold_id)
