@@ -328,6 +328,44 @@ class BotTests(unittest.TestCase):
             client.check_booking_eligibility.assert_not_called()
             client.reserve_standard_visit.assert_not_called()
 
+    def test_questionnaire_denial_pauses_booking_and_preserves_searches(self):
+        self.update(1, "/find Adult | Internista")
+        self.bot.flush()
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            client = portal.return_value
+            client.resolve_service.return_value = 12
+            client.search.return_value = [
+                Appointment(dt.datetime(2030, 3, 31, hour, tzinfo=WARSAW),
+                            2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9)
+                for hour in (11, 12)
+            ]
+            client.is_booking_blocked_by_penalty.return_value = False
+            client.check_booking_eligibility.side_effect = PortalError(
+                "access-denied", suspend=True, stage="questionnaire", http_status=401,
+            )
+            self.bot.search_due()
+            self.bot.flush()
+            self.update(2, "Book 1")
+            self.update(3, "Book 2")
+            self.bot.flush()
+            self.bot.booking_due()
+            self.bot.booking_due()
+            self.assertIn("Direct booking is paused", self.state.next_message()["text"])
+            self.assertTrue(self.state.booking_paused("patient1"))
+            self.assertFalse(self.state.account_paused("patient1"))
+            self.assertFalse(self.state.booking_paused("patient2"))
+            client.check_booking_eligibility.assert_called_once()
+            client.reserve_standard_visit.assert_not_called()
+            self.bot.flush()
+            self.update(4, "Book 2")
+            self.assertIn("Direct booking is paused", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(5, "/find Adult | Internista")
+            self.bot.search_due()
+            self.assertEqual(client.search.call_count, 2)
+            self.update(6, "/resume Adult")
+            self.assertFalse(self.state.booking_paused("patient1"))
+
     def test_sick_child_search_shows_questionnaire_and_preparation_with_portal_handoff(self):
         self.update(1, "/find Child | sick kids")
         self.bot.flush()
