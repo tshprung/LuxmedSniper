@@ -27,6 +27,7 @@ SICK_CHILD_VISIT = normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[0][2])
 SUPPORTED_BOOKING_SERVICES = {"internista", normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[3][2])}
 QUESTIONNAIRE_NOTICE = "LUX MED requires a medical questionnaire for this visit. Complete it in the Patient Portal."
 PREPARATION_NOTICE = "LUX MED lists preparation instructions for this visit. Open “Zobacz szczegóły” in the Patient Portal."
+BOOKING_ACCESS_NOTICE = "LUX MED denied access to its questionnaire check. Direct booking is paused for this patient. Availability searches can continue."
 BOOKING_FAILURES = {
     "slot-gone": "That exact slot is no longer available. Use More or Continue to find another.",
     "booking-details-missing": "I couldn't verify all the details for this slot. Check it in the Patient Portal.",
@@ -177,8 +178,12 @@ class SearchBot:
                 self.state.queue_message("Use Reviewed followed by the request number after checking the Patient Portal.")
         elif command in {"/resume", "resume"}:
             patient = self.aliases.get(argument)
+            booking_paused = patient is not None and self.state.booking_paused(patient)
             if patient and self.state.resume(patient):
-                self.state.queue_message("Searches resumed for the next eligible hour.")
+                message = "Searches resumed for the next eligible hour."
+                if booking_paused:
+                    message = "Booking pause cleared. Start a fresh search to request a booking again."
+                self.state.queue_message(message)
             else:
                 self.state.queue_message("Use /resume followed by a paused patient's name.")
         elif len(text) <= 600 and key not in {"/start", "/help", "help"}:
@@ -301,7 +306,11 @@ class SearchBot:
         lines.extend(f"{number}. {self.slot_details(slot)}" for number, slot in page)
         if any(slot["start"] > now for slot in slots[page[-1][0]:]):
             lines.append("Reply More to see the next options.")
-        can_book = self.booking_enabled and not notices and not row["telephone"] and normalize(row["service"]) in SUPPORTED_BOOKING_SERVICES
+        can_book = (
+            self.booking_enabled and not notices and not row["telephone"]
+            and normalize(row["service"]) in SUPPORTED_BOOKING_SERVICES
+            and not self.state.booking_paused(row["patient"])
+        )
         action = "Book <option number> to request that slot" if can_book else "Details <option number> for the Patient Portal link"
         lines.append(f"Reply {action}, or Continue to search for different slots.")
         self.state.queue_message("\n".join(lines), search_id)
@@ -368,6 +377,9 @@ class SearchBot:
                 f"{description}\nDirect booking is unavailable. Confirm the appointment in the Patient Portal.\n{PATIENT_PORTAL_URL}",
                 search_id,
             )
+            return
+        if self.state.booking_paused(row["patient"]):
+            self.state.queue_message(f"{description}\n{BOOKING_ACCESS_NOTICE}\n{PATIENT_PORTAL_URL}", search_id)
             return
         if row["telephone"] or normalize(row["service"]) not in SUPPORTED_BOOKING_SERVICES:
             self.state.queue_message(f"This visit type needs to be booked in the Patient Portal.\n{PATIENT_PORTAL_URL}", search_id)
@@ -576,6 +588,8 @@ class SearchBot:
                 raise PortalError("prior-booking-unverified")
             if self.state.account_paused(criteria.patient):
                 raise PortalError("booking-account-paused")
+            if self.state.booking_paused(criteria.patient):
+                raise PortalError("booking-access-paused")
             portal = self.portal_for(criteria.patient)
             if portal.is_booking_blocked_by_penalty(criteria.city_id, slot["service_id"]):
                 raise PortalError("booking-penalty")
@@ -655,8 +669,12 @@ class SearchBot:
     def report_booking_failure(self, booking, description: str, error: PortalError, reservation_id: int | None) -> None:
         code = str(error)
         unknown = reservation_id is not None or code == "booking-outcome-unknown"
+        booking_access_denied = error.stage == "questionnaire" and error.http_status == 401
         with self.state.db:
-            if error.suspend:
+            if booking_access_denied and not unknown:
+                self.close_portal(booking["patient"])
+                self.state.pause_booking(booking["patient"])
+            elif error.suspend:
                 self.close_portal(booking["patient"])
                 self.state.suspend(booking["patient"])
             self.state.booking_status(booking["id"], "unknown" if unknown else "ended", reservation_id=reservation_id)
@@ -669,6 +687,8 @@ class SearchBot:
                 message = "LUX MED reported a no-show restriction. Check the Patient Portal before booking."
             elif code == "prior-booking-unverified":
                 message = "Check the earlier unverified booking in the Patient Portal first."
+            elif booking_access_denied or code == "booking-access-paused":
+                message = BOOKING_ACCESS_NOTICE
             elif error.suspend or code == "booking-account-paused":
                 message = "LUX MED access is paused. Check the Patient Portal and complete any verification there."
             else:

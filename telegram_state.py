@@ -57,6 +57,9 @@ class SearchState:
         """)
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
+            account_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(accounts)")}
+            if "booking_paused" not in account_columns:
+                self.db.execute("ALTER TABLE accounts ADD COLUMN booking_paused INTEGER NOT NULL DEFAULT 0")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(searches)")}
             for name, declaration in (
                 ("last_checked", "INTEGER"),
@@ -195,6 +198,17 @@ class SearchState:
     def account_paused(self, patient: str) -> bool:
         return bool(self.db.execute("SELECT suspended FROM accounts WHERE patient = ?", (patient,)).fetchone()[0])
 
+    def booking_paused(self, patient: str) -> bool:
+        row = self.db.execute("SELECT booking_paused FROM accounts WHERE patient = ?", (patient,)).fetchone()
+        return bool(row and row["booking_paused"])
+
+    def pause_booking(self, patient: str) -> None:
+        self.db.execute("UPDATE accounts SET booking_paused = 1 WHERE patient = ?", (patient,))
+        self.db.execute(
+            "UPDATE booking_requests SET status = 'ended' WHERE patient = ? AND status IN ('queued', 'approval')",
+            (patient,),
+        )
+
     def unresolved_booking(self, patient: str) -> bool:
         return self.db.execute(
             """SELECT 1 FROM booking_requests WHERE patient = ? AND status IN ('unknown', 'verifying') LIMIT 1""",
@@ -264,7 +278,11 @@ class SearchState:
         self.db.execute("UPDATE accounts SET suspended = 1 WHERE patient = ?", (patient,))
 
     def resume(self, patient: str) -> bool:
-        row = self.db.execute("UPDATE accounts SET suspended = 0 WHERE patient = ? AND suspended = 1", (patient,))
+        row = self.db.execute(
+            """UPDATE accounts SET suspended = 0, booking_paused = 0
+               WHERE patient = ? AND (suspended = 1 OR booking_paused = 1)""",
+            (patient,),
+        )
         return row.rowcount == 1
 
     def claim_batch(self, now: int) -> list[sqlite3.Row]:
