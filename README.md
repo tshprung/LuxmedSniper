@@ -102,6 +102,14 @@ chat. The first completed check reports whether it found a match. Later
 checks with no matches update `/active` quietly. The worker does not write
 appointments or calendar events.
 
+Results are numbered in groups of three. Reply `More` for more options from
+the same check, or `Book 2` for the details of option 2 and the Patient
+Portal link. Confirm availability and book in the portal. `Continue`
+or `Find something else` starts a follow-up with the same filters, skipping
+slots already shown and respecting the search's next hourly check.
+Reply to a result message to select that list. Standalone commands use the
+latest list.
+
 ### Deploy to the Linux VM
 
 1. Stage a reviewed release in `/opt/luxmed-telegram/current` with Python
