@@ -121,6 +121,14 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(confirm.kwargs["json"]["temporaryReservationId"], 135)
         self.assertEqual(confirm.kwargs["json"]["valuation"], valuation)
 
+        result["termsForService"]["additionalData"] = {
+            "isPreparationRequired": True, "preparationItems": ["private-fixture"],
+        }
+        preparation_slot, = LuxMedPortal._parse_visits_new_portal(result, locator)
+        self.assertTrue(preparation_slot.requires_preparation)
+        self.assertIsNone(preparation_slot.booking_term)
+        self.assertNotIn("private-fixture", repr(preparation_slot))
+
     def test_booking_warning_or_fee_releases_hold_without_confirmation(self):
         locator = DoctorLocator(id="5*30*-1*-1")
         term = dict(slot("2030-04-01T10:00:00"), cityId=5, dateTimeTo="2030-04-01T10:15:00",
