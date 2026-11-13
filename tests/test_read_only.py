@@ -103,7 +103,7 @@ class SearchTests(unittest.TestCase):
                     isTelemedicine=False, isAdditional=False, isImpediment=False)
         result = {"correlationId": "fixture", "termsForService": {"termsForDays": [{"terms": [term]}]}}
         appointment, = LuxMedPortal._parse_visits_new_portal(result, locator)
-        valuation = {"valuationType": 1, "price": 0, "isReferralRequired": False}
+        valuation = {"valuationType": 1, "price": 0, "alternativePrice": None, "isReferralRequired": False}
         hold = {"hasErrors": False, "hasWarnings": False,
                 "value": {"temporaryReservationId": 135, "askForReferral": False, "valuations": [valuation]}}
         confirmed = {"hasErrors": False, "value": {"reservationId": 246}}
@@ -116,9 +116,12 @@ class SearchTests(unittest.TestCase):
         lock, confirm = request.call_args_list[1:]
         self.assertTrue(lock.args[1].endswith("/Reservation/LockTerm"))
         self.assertEqual(lock.kwargs["json"]["doctorId"], 9)
+        self.assertEqual(lock.kwargs["json"]["date"], "2030-04-01T08:00:00.000Z")
         self.assertEqual(lock.kwargs["json"]["timeFrom"], "10:00")
         self.assertTrue(confirm.args[1].endswith("/Reservation/Confirm"))
         self.assertEqual(confirm.kwargs["json"]["temporaryReservationId"], 135)
+        self.assertEqual(confirm.kwargs["json"]["date"], "2030-04-01T08:00:00.000Z")
+        self.assertEqual(confirm.kwargs["json"]["timeFrom"], "10:00")
         self.assertEqual(confirm.kwargs["json"]["valuation"], valuation)
 
         result["termsForService"]["additionalData"] = {
@@ -135,11 +138,14 @@ class SearchTests(unittest.TestCase):
                     roomId=19, scheduleId=20, isTelemedicine=False, isAdditional=False, isImpediment=False)
         result = {"correlationId": "fixture", "termsForService": {"termsForDays": [{"terms": [term]}]}}
         appointment, = LuxMedPortal._parse_visits_new_portal(result, locator)
-        for warning, price in ((True, 0), (False, 25)):
-            with self.subTest(warning=warning, price=price):
+        for warning, price, alternative_price in ((True, 0, None), (False, 25, None), (False, 0, 25)):
+            with self.subTest(warning=warning, price=price, alternative_price=alternative_price):
                 hold = {"hasErrors": False, "hasWarnings": warning, "value": {
                     "temporaryReservationId": 135, "askForReferral": False,
-                    "valuations": [{"valuationType": 1, "price": price, "isReferralRequired": False}],
+                    "valuations": [{
+                        "valuationType": 1, "price": price, "alternativePrice": alternative_price,
+                        "isReferralRequired": False,
+                    }],
                 }}
                 with patch.object(requests.Session, "request", side_effect=[
                     response({"token": "fixture-token"}), response(hold), response({}),

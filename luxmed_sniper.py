@@ -377,7 +377,8 @@ class LuxMedPortal:
             "facilityId": appointment.clinic_id, "facilityName": appointment.ClinicPublicName,
             "doctorId": appointment.doctor_id, "doctor": term["doctor"],
             "roomId": term["roomId"], "scheduleId": term["scheduleId"],
-            "date": term["start"].isoformat(), "timeFrom": term["start"].strftime("%H:%M"),
+            "date": term["start"].astimezone(datetime.UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "timeFrom": term["start"].strftime("%H:%M"),
             "timeTo": term["end"].strftime("%H:%M"), "correlationId": term["correlationId"],
             "isTelemedicine": False, "isPoz": False, "isRehabilitation": False, "isVideoConsultation": False,
             "isAdditional": False, "isImpediment": False, "isPreparationRequired": False,
@@ -393,6 +394,7 @@ class LuxMedPortal:
             raise PortalError("booking-hold-unavailable")
         valuations = value.get("valuations")
         valuation = valuations[0] if isinstance(valuations, list) and len(valuations) == 1 else None
+        alternative_price = valuation.get("alternativePrice") if isinstance(valuation, dict) else None
         can_confirm = (
             hold.get("hasErrors") is False and hold.get("hasWarnings") is False
             and hold.get("errors", []) == [] and hold.get("warnings", []) == []
@@ -400,7 +402,7 @@ class LuxMedPortal:
             and isinstance(valuation, dict)
             and type(valuation.get("valuationType")) is int and valuation["valuationType"] == 1  # InPackage.
             and type(valuation.get("price")) in (int, float) and valuation["price"] == 0
-            and valuation.get("alternativePrice", 0) == 0
+            and (alternative_price is None or (type(alternative_price) in (int, float) and alternative_price == 0))
             and valuation.get("isReferralRequired") is False
         )
         if not can_confirm:
