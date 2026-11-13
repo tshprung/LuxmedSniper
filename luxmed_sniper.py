@@ -91,6 +91,7 @@ class Appointment:
     doctor_search_name: str = ""
     doctor_id: int | None = None
     booking_term: dict | None = field(default=None, repr=False)
+    requires_preparation: bool = False
 
 
 class Luxmed(BaseModel):
@@ -216,6 +217,8 @@ class LuxMedPortal:
         days = terms_for_service["termsForDays"]
         if not isinstance(days, list):
             raise ValueError("Expected a list of days")
+        additional = terms_for_service.get("additionalData")
+        requires_preparation = isinstance(additional, dict) and additional.get("isPreparationRequired") is True
         for day in days:
             terms = day["terms"]
             if not isinstance(terms, list):
@@ -241,6 +244,7 @@ class LuxMedPortal:
                         doctor_search_name=f"{doctor['firstName']} {doctor['lastName']}",
                         doctor_id=doctor_id,
                         booking_term=LuxMedPortal._booking_term(term, terms_for_service, content.get("correlationId")),
+                        requires_preparation=requires_preparation,
                     ),
                 )
         return appointments

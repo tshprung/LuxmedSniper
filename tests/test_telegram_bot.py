@@ -189,7 +189,7 @@ class BotTests(unittest.TestCase):
         self.assertIn("Next check 30.03 12:00 Warsaw time", message)
 
     def test_numbered_options_support_booking_steps_more_and_continue(self):
-        self.update(1, "/find Child | sick kids")
+        self.update(1, "/find Child | routine visit")
         self.bot.flush()
         date = dt.datetime(2030, 3, 31, tzinfo=WARSAW)
         slots = [Appointment(date.replace(hour=hour), 2, "Fixture clinic", f"Doctor {hour}", 12, doctor_id=hour)
@@ -231,7 +231,7 @@ class BotTests(unittest.TestCase):
         self.assertNotIn("09:00", final)
 
     def test_booking_asks_for_approval_when_calendar_is_unavailable_or_short_notice(self):
-        self.update(1, "/find Child | sick kids")
+        self.update(1, "/find Child | routine visit")
         self.bot.flush()
         with patch("telegram_bot.LuxMedPortal") as portal:
             client = portal.return_value
@@ -269,7 +269,7 @@ class BotTests(unittest.TestCase):
     def test_clear_booking_submits_once_and_verification_failure_is_not_retried(self):
         self.bot.calendar = MagicMock()
         self.bot.calendar.busy.return_value = False
-        self.update(1, "/find Child | sick kids")
+        self.update(1, "/find Child | routine visit")
         self.bot.flush()
         with patch("telegram_bot.LuxMedPortal") as portal:
             client = portal.return_value
@@ -297,7 +297,7 @@ class BotTests(unittest.TestCase):
 
     def test_disabled_booking_returns_portal_link_without_accessing_luxmed(self):
         self.bot.booking_enabled = False
-        self.update(1, "/find Child | sick kids")
+        self.update(1, "/find Child | routine visit")
         self.bot.flush()
         with patch("telegram_bot.LuxMedPortal") as portal:
             client = portal.return_value
@@ -311,6 +311,34 @@ class BotTests(unittest.TestCase):
             self.update(2, "Book 1")
             self.bot.booking_due()
             self.assertIn("Direct booking is unavailable", self.state.next_message()["text"])
+            client.check_booking_eligibility.assert_not_called()
+            client.reserve_standard_visit.assert_not_called()
+
+    def test_sick_child_search_shows_questionnaire_and_preparation_with_portal_handoff(self):
+        self.update(1, "/find Child | sick kids")
+        self.bot.flush()
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            client = portal.return_value
+            client.resolve_service.return_value = 12
+            client.search.return_value = [
+                Appointment(dt.datetime(2030, 3, 31, 11, tzinfo=WARSAW), 2, "Fixture clinic",
+                            "Fixture doctor", 12, doctor_id=9, requires_preparation=True),
+            ]
+            self.bot.search_due()
+            message = self.state.next_message()["text"]
+            self.assertIn("requires a medical questionnaire", message)
+            self.assertIn("Zobacz szczegóły", message)
+            self.assertIn("Reply Details <option number>", message)
+            self.assertNotIn("Reply Book", message)
+            self.bot.flush()
+            self.update(2, "Details 1")
+            self.assertIn("requires a medical questionnaire", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(3, "Book 1")
+            self.bot.booking_due()
+            message = self.state.next_message()["text"]
+            self.assertIn("Book this visit in the Patient Portal", message)
+            self.assertIn("Zobacz szczegóły", message)
             client.check_booking_eligibility.assert_not_called()
             client.reserve_standard_visit.assert_not_called()
 

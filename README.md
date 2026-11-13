@@ -110,6 +110,11 @@ slots already shown and respecting the search's next hourly check.
 Reply to a result message to select that list. Standalone commands use the
 latest list.
 
+The standard sick-child pediatric visit has a LUX MED questionnaire. The
+bot can list times, and `Details 2` links to the Patient Portal to complete
+the questionnaire and reserve the visit there. When LUX MED flags a visit
+as requiring preparation, the bot points you to the portal instructions.
+
 ### Direct Telegram booking pilot
 
 Direct booking defaults to off. The live audit of the worker's session
@@ -119,8 +124,8 @@ booking checks. The configuration package accepts the environment variable
 `LUXMED_DIRECT_BOOKING=1` for that rollout.
 
 With the pilot enabled, reply `Book 2` to a fresh list to request that exact
-slot. The initial scope is covered in-person internist and standard sick
-or routine pediatric visits. The bot rechecks the slot and asks for
+slot. The initial scope is covered in-person internist and routine
+pediatric visits. The bot rechecks the slot and asks for
 approval when it starts in less than six hours, it detects a scheduling
 conflict, or a conflict check is unavailable. Use `Approve 1` with the
 request number shown, or `Stop booking 1` to drop a pending request.

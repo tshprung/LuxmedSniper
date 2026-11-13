@@ -23,13 +23,17 @@ PORTAL_REUSE_SECONDS = 3600
 RESULTS_PER_PAGE = 3
 SHORT_NOTICE_SECONDS = 6 * 3600
 PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
-SUPPORTED_BOOKING_SERVICES = {"internista", *(normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[index][2]) for index in (0, 3))}
+SICK_CHILD_VISIT = normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[0][2])
+SUPPORTED_BOOKING_SERVICES = {"internista", normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[3][2])}
+QUESTIONNAIRE_NOTICE = "LUX MED requires a medical questionnaire for this visit. Complete it in the Patient Portal."
+PREPARATION_NOTICE = "LUX MED lists preparation instructions for this visit. Open “Zobacz szczegóły” in the Patient Portal."
 BOOKING_FAILURES = {
     "slot-gone": "That exact slot is no longer available. Use More or Continue to find another.",
     "booking-details-missing": "I couldn't verify all the details for this slot. Check it in the Patient Portal.",
     "booking-limit": "LUX MED didn't clear its booking limit check. Check the Patient Portal.",
     "booking-eligibility": "LUX MED didn't confirm that this service is covered and available to book online.",
-    "portal-questions": "LUX MED needs you to complete its eligibility check in the Patient Portal.",
+    "portal-questions": QUESTIONNAIRE_NOTICE,
+    "portal-preparation": PREPARATION_NOTICE,
     "booking-needs-portal": "LUX MED returned a warning, a payment or referral choice, or an existing visit. Check the Patient Portal.",
     "booking-rejected": "LUX MED declined the reservation. Check the Patient Portal for details.",
     "booking-hold-unavailable": "LUX MED didn't return a usable slot hold. Check the Patient Portal.",
@@ -267,6 +271,15 @@ class SearchBot:
     def slot_key(slot: dict) -> tuple[int, str, str]:
         return slot["start"], slot["clinic"], slot["doctor"]
 
+    @staticmethod
+    def portal_notices(service: str, slots: list[dict]) -> list[str]:
+        notices = []
+        if normalize(service) == SICK_CHILD_VISIT:
+            notices.append(QUESTIONNAIRE_NOTICE)
+        if any(slot.get("requires_preparation") is True for slot in slots):
+            notices.append(PREPARATION_NOTICE)
+        return notices
+
     def show_results(self, search_id: int) -> None:
         row = self.state.results(search_id)
         slots = json.loads(row["slots"])
@@ -283,11 +296,13 @@ class SearchBot:
         self.state.mark_shown(search_id, page[-1][0])
         self.state.set_setting("latest_result", str(search_id))
         heading = self.search_heading(row["display_number"], self.state.criteria(row))
-        lines = [heading, "Available slots (Warsaw time)"]
+        notices = self.portal_notices(row["service"], [slot for _, slot in page])
+        lines = [heading, *notices, "Available slots (Warsaw time)"]
         lines.extend(f"{number}. {self.slot_details(slot)}" for number, slot in page)
         if any(slot["start"] > now for slot in slots[page[-1][0]:]):
             lines.append("Reply More to see the next options.")
-        action = "Book <option number> to request that slot" if self.booking_enabled else "Details <option number> for the Patient Portal link"
+        can_book = self.booking_enabled and not notices and not row["telephone"] and normalize(row["service"]) in SUPPORTED_BOOKING_SERVICES
+        action = "Book <option number> to request that slot" if can_book else "Details <option number> for the Patient Portal link"
         lines.append(f"Reply {action}, or Continue to search for different slots.")
         self.state.queue_message("\n".join(lines), search_id)
 
@@ -318,13 +333,12 @@ class SearchBot:
                 return
             if action == "details":
                 heading = self.search_heading(row["display_number"], self.state.criteria(row))
-                notice = ""
+                notices = self.portal_notices(row["service"], [slot])
                 if slot["start"] - now < SHORT_NOTICE_SECONDS:
-                    notice = "This appointment starts within six hours. Check the cancellation terms before confirming.\n"
-                self.state.queue_message(
-                    f"{heading}\nOption {number}. {self.slot_details(slot)}\n{notice}"
-                    f"Confirm availability in the Patient Portal.\n{PATIENT_PORTAL_URL}", search_id,
-                )
+                    notices.append("This appointment starts within six hours. Check the cancellation terms before confirming.")
+                lines = [heading, f"Option {number}. {self.slot_details(slot)}", *notices,
+                         "Confirm availability in the Patient Portal.", PATIENT_PORTAL_URL]
+                self.state.queue_message("\n".join(lines), search_id)
             else:
                 self.request_booking(row, number, slot, now)
         elif action == "more":
@@ -345,6 +359,10 @@ class SearchBot:
         search_id = row["id"]
         heading = self.search_heading(row["display_number"], self.state.criteria(row))
         description = f"{heading}\nOption {number}. {self.slot_details(slot)}"
+        notices = self.portal_notices(row["service"], [slot])
+        if notices:
+            self.state.queue_message("\n".join([description, *notices, "Book this visit in the Patient Portal.", PATIENT_PORTAL_URL]), search_id)
+            return
         if not self.booking_enabled:
             self.state.queue_message(
                 f"{description}\nDirect booking is unavailable. Confirm the appointment in the Patient Portal.\n{PATIENT_PORTAL_URL}",
@@ -544,6 +562,10 @@ class SearchBot:
         try:
             if slot["start"] <= now:
                 raise PortalError("slot-gone")
+            if normalize(criteria.service) == SICK_CHILD_VISIT:
+                raise PortalError("portal-questions")
+            if slot.get("requires_preparation") is True:
+                raise PortalError("portal-preparation")
             if self.state.unresolved_booking(criteria.patient):
                 raise PortalError("prior-booking-unverified")
             if self.state.account_paused(criteria.patient):
@@ -596,6 +618,8 @@ class SearchBot:
         if len(matches) != 1:
             raise PortalError("slot-gone")
         appointment = matches[0]
+        if appointment.requires_preparation:
+            raise PortalError("portal-preparation")
         if appointment.booking_term is None or str(appointment.booking_term["cityId"]) != locator.city_id:
             raise PortalError("booking-details-missing")
         return appointment
@@ -727,6 +751,8 @@ class SearchBot:
                 "doctor": str(slot.DoctorName or "")[:160].strip(),
                 "clinic_id": slot.clinic_id, "doctor_id": slot.doctor_id, "service_id": int(service_id),
             }
+            if slot.requires_preparation:
+                option["requires_preparation"] = True
             key = self.slot_key(option)
             if key not in excluded:
                 excluded.add(key)
