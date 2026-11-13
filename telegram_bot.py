@@ -20,6 +20,7 @@ from telegram_state import SearchState, next_search_time
 
 PORTAL_REUSE_SECONDS = 3600
 RESULTS_PER_PAGE = 3
+SHORT_NOTICE_SECONDS = 6 * 3600
 PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
 
 
@@ -284,9 +285,13 @@ class SearchBot:
             if slot["start"] <= now:
                 self.state.queue_message("That appointment time has passed. Use More or Continue for other options.", search_id)
                 return
+            short_notice = ""
+            if slot["start"] - now < SHORT_NOTICE_SECONDS:
+                short_notice = "This appointment starts within six hours. Check the cancellation terms before confirming.\n"
             heading = self.search_heading(row["display_number"], self.state.criteria(row))
             self.state.queue_message(
                 f"{heading}\nOption {number}. {self.slot_details(slot)}\n"
+                f"{short_notice}"
                 "No appointment has been booked. Open the Patient Portal under the selected patient, "
                 "search for the same service, and confirm the slot if it is still available.\n"
                 f"{PATIENT_PORTAL_URL}",

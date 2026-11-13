@@ -104,11 +104,29 @@ appointments or calendar events.
 
 Results are numbered in groups of three. Reply `More` for more options from
 the same check, or `Book 2` for the details of option 2 and the Patient
-Portal link. Confirm availability and book in the portal. `Continue`
+Portal link. The bot flags selections within six hours of the appointment.
+Confirm availability and book in the portal. `Continue`
 or `Find something else` starts a follow-up with the same filters, skipping
 slots already shown and respecting the search's next hourly check.
 Reply to a result message to select that list. Standalone commands use the
 latest list.
+
+### Read-only booking feasibility
+
+Run `python audit_search.py patient1 --booking-check` with the same private
+profile settings and Warsaw search hours as the manual availability check.
+The command reads the dashboard's upcoming visits and the no-show restriction
+for the selected city and service without a referral. Its output is a status
+only. The upcoming visits response can verify a reservation by its ID when
+the dashboard shows the visit as reserved or confirmed. An absent ID leaves
+the result unknown. A clear no-show restriction check does not establish
+eligibility, payment terms, or calendar availability.
+
+The [LUX MED booking guide](https://www.luxmed.pl/dla-pacjenta/portal-pacjenta/rezerwacja-i-zarzadzanie-uslugami)
+describes the reservation summary and timeline. The portal's reservation
+page places a temporary hold before displaying slot-specific warnings,
+referral prompts and pricing. The audit performs only login and read
+requests and leaves the appointment inventory untouched.
 
 ### Deploy to the Linux VM
 

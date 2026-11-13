@@ -83,6 +83,19 @@ class SearchTests(unittest.TestCase):
                 self.assertEqual(first.session.headers["authorization-token"], "Bearer first-fixture")
                 self.assertEqual(second.session.headers["authorization-token"], "Bearer second-fixture")
 
+    def test_booking_verification_uses_only_reserved_and_confirmed_visit_ids(self):
+        events = [
+            {"eventType": 1, "status": status, "eventId": status + 10}
+            for status in range(7)
+        ] + [{"eventType": 16, "status": 1, "eventId": 100}]
+        with patch.object(requests.Session, "request", side_effect=[
+            response({"token": "fixture-token"}), response({"events": events}),
+        ]) as request:
+            portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
+            with portal.session:
+                self.assertEqual(portal.booked_visit_ids(), {11, 12})
+        self.assertEqual(request.call_args.args, ("GET", LuxMedPortal.UPCOMING_VISITS_URL))
+
 
 class AuditCliTests(unittest.TestCase):
     def run_audit(self, profile, environment, replies, *, hour=10, options=()):
@@ -139,6 +152,45 @@ class AuditCliTests(unittest.TestCase):
         ], options=("--status-only",))
         self.assertEqual((status, output), (0, "search-completed"))
         self.assertEqual(request.call_count, 2)
+
+    def test_booking_audit_reports_only_completion_and_uses_read_only_checks(self):
+        status, output, request = self.run_audit("patient1", {
+            "LUXMED_PATIENT1_LOGIN": "fixture",
+            "LUXMED_PATIENT1_PASSWORD": "fixture",
+            "LUXMED_PATIENT1_LOCATOR": "8*20*-1*-1",
+        }, [
+            response({"token": "fixture-token"}),
+            response({"events": [{"eventType": 1, "status": 1, "eventId": 4321, "title": "private-fixture"}]}),
+            response({"canReserve": False, "blockadeTo": "private-fixture"}),
+        ], options=("--booking-check",))
+        self.assertEqual((status, output), (0, "booking-check-completed"))
+        self.assertEqual([call.args for call in request.call_args_list], [
+            ("POST", LuxMedPortal.LUXMED_LOGIN_URL),
+            ("GET", LuxMedPortal.UPCOMING_VISITS_URL),
+            ("GET", LuxMedPortal.NON_SHOW_PENALTIES_URL),
+        ])
+        self.assertEqual(request.call_args.kwargs["params"], {
+            "cityId": 8, "serviceVariantId": 20, "referralId": "",
+        })
+
+    def test_booking_audit_stops_on_unknown_response(self):
+        environment = {
+            "LUXMED_PATIENT1_LOGIN": "fixture",
+            "LUXMED_PATIENT1_PASSWORD": "fixture",
+            "LUXMED_PATIENT1_LOCATOR": "8*20*-1*-1",
+        }
+        for payload, message, request_count in (
+            ([response({"events": [{"eventType": 1, "status": 1, "eventId": "private-fixture"}]})],
+             "unexpected-upcoming-visits", 2),
+            ([response({"events": []}), response({"canReserve": "private-fixture"})],
+             "unexpected-penalty-status", 3),
+        ):
+            with self.subTest(message=message):
+                status, output, request = self.run_audit("patient1", environment, [
+                    response({"token": "fixture-token"}), *payload,
+                ], options=("--booking-check",))
+                self.assertEqual((status, output), (1, message))
+                self.assertEqual(request.call_count, request_count)
 
     def test_service_name_resolves_from_live_catalog_before_search(self):
         catalog = [{

@@ -191,6 +191,7 @@ class BotTests(unittest.TestCase):
             self.update(4, "Book 4")
             self.assertIn("Option 4. 31.03 12:00", self.state.next_message()["text"])
             self.assertIn("No appointment has been booked", self.state.next_message()["text"])
+            self.assertNotIn("within six hours", self.state.next_message()["text"])
             self.bot.flush()
             self.update(5, "find something else", reply_to=43)
             self.update(6, "Continue", reply_to=43)
@@ -206,6 +207,24 @@ class BotTests(unittest.TestCase):
         final = self.state.next_message()["text"]
         self.assertIn("1. 31.03 14:00", final)
         self.assertNotIn("09:00", final)
+
+    def test_booking_handoff_warns_for_appointments_less_than_six_hours_away(self):
+        self.update(1, "/find Child | sick kids")
+        self.bot.flush()
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            portal.return_value.resolve_service.return_value = 12
+            portal.return_value.search.return_value = [
+                Appointment(dt.datetime.fromtimestamp(self.now + hours * 3600, WARSAW),
+                            2, "Fixture clinic", "Fixture doctor", 12)
+                for hours in (5, 6)
+            ]
+            self.bot.search_due()
+        self.bot.flush()
+        self.update(2, "Book 1")
+        self.assertIn("within six hours", self.state.next_message()["text"])
+        self.bot.flush()
+        self.update(3, "Book 2")
+        self.assertNotIn("within six hours", self.state.next_message()["text"])
 
     def test_reply_to_previous_list_does_not_select_from_new_list_with_same_search_number(self):
         date = dt.datetime(2030, 3, 31, 11, tzinfo=WARSAW)
