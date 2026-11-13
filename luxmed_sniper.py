@@ -360,6 +360,17 @@ class LuxMedPortal:
             raise PortalError("unexpected-penalty-status", suspend=True)
         return not can_reserve
 
+    def _booking_request_headers(self) -> dict[str, str]:
+        headers = {"X-Requested-With": "XMLHttpRequest"}
+        result = self._portal_json(
+            "GET", f"{self.NEW_PORTAL_URL}/security/getforgerytoken",
+            headers=headers, stage="booking-request-token",
+        )
+        token = result.get("token") if isinstance(result, dict) else None
+        if not isinstance(token, str) or not token or any(not 33 <= ord(char) <= 126 for char in token):
+            raise PortalError("unexpected-response", stage="booking-request-token")
+        return {**headers, "XSRF-TOKEN": token}
+
     def check_booking_eligibility(self, city_id: int, service_variant_id: int) -> None:
         """Check the normal portal prerequisites for an in-person visit without a referral."""
         limits = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/Reservation/GetLimits", stage="booking-limits")
@@ -376,7 +387,7 @@ class LuxMedPortal:
         params = {"locationId": city_id, "serviceVariantId": service_variant_id, "process": 4}
         triage = self._portal_json(
             "GET", f"{self.NEW_PORTAL_URL}/PNM/Index",
-            params=params, headers={"X-Requested-With": "XMLHttpRequest"}, stage="questionnaire",
+            params=params, headers=self._booking_request_headers(), stage="questionnaire",
         )
         if not isinstance(triage, dict) or triage.get("questions") not in (None, []):
             raise PortalError("portal-questions")
@@ -411,7 +422,8 @@ class LuxMedPortal:
             "executedTriageId": None,
         }
         base = f"{self.NEW_PORTAL_URL}/Reservation"
-        hold = self._portal_json("POST", f"{base}/LockTerm", json=payload)
+        headers = self._booking_request_headers()
+        hold = self._portal_json("POST", f"{base}/LockTerm", json=payload, headers=headers, stage="booking-hold")
         value = hold.get("value") if isinstance(hold, dict) else None
         if not isinstance(value, dict):
             raise PortalError("booking-hold-unavailable")
@@ -435,7 +447,7 @@ class LuxMedPortal:
             and valuation.get("requireReferralForPP", False) is False
         )
         if not can_confirm:
-            self.release_booking_hold(hold_id)
+            self.release_booking_hold(hold_id, headers)
             raise PortalError("booking-needs-portal")
         confirmation = {key: payload[key] for key in (
             "cityId", "serviceVariantId", "doctorId", "facilityId", "roomId", "scheduleId",
@@ -443,11 +455,11 @@ class LuxMedPortal:
         )}
         confirmation.update(temporaryReservationId=hold_id, referralRequired=False, valuationId=None, valuation=valuation)
         try:
-            result = self._portal_json("POST", f"{base}/Confirm", json=confirmation)
+            result = self._portal_json("POST", f"{base}/Confirm", json=confirmation, headers=headers)
         except PortalError as error:
             raise PortalError("booking-outcome-unknown", suspend=error.suspend) from None
         if isinstance(result, dict) and result.get("hasErrors") is True:
-            self.release_booking_hold(hold_id)
+            self.release_booking_hold(hold_id, headers)
             raise PortalError("booking-rejected")
         value = result.get("value") if isinstance(result, dict) and result.get("hasErrors") is False else None
         reservation_id = value.get("reservationId") if isinstance(value, dict) else None
@@ -455,11 +467,11 @@ class LuxMedPortal:
             raise PortalError("booking-outcome-unknown")
         return reservation_id
 
-    def release_booking_hold(self, hold_id: int) -> None:
+    def release_booking_hold(self, hold_id: int, headers: dict[str, str]) -> None:
         try:
             self._portal_json(
                 "POST", f"{self.NEW_PORTAL_URL}/Reservation/ReleaseTerm",
-                params={"reservationId": hold_id}, json={},
+                params={"reservationId": hold_id}, json={}, headers=headers,
             )
         except PortalError as error:
             if error.suspend:
