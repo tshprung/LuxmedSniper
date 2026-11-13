@@ -44,6 +44,16 @@ class SearchState:
             CREATE TABLE IF NOT EXISTS search_results (
                 search_id INTEGER PRIMARY KEY, slots TEXT NOT NULL, shown INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS booking_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                search_id INTEGER NOT NULL, option_number INTEGER NOT NULL,
+                patient TEXT NOT NULL, slot_key TEXT NOT NULL,
+                status TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0,
+                reason TEXT, reservation_id INTEGER,
+                UNIQUE (search_id, option_number)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS outstanding_booking_slot
+                ON booking_requests (patient, slot_key) WHERE status NOT IN ('stopped', 'ended');
         """)
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -138,6 +148,64 @@ class SearchState:
 
     def mark_continued(self, search_id: int) -> None:
         self.db.execute("UPDATE searches SET status = 'continued' WHERE id = ? AND status = 'found'", (search_id,))
+
+    def request_booking(self, search_id: int, number: int, patient: str, slot_key: str):
+        self.db.execute(
+            """INSERT OR IGNORE INTO booking_requests (search_id, option_number, patient, slot_key, status)
+               VALUES (?, ?, ?, ?, 'queued')""",
+            (search_id, number, patient, slot_key),
+        )
+        return self.db.execute(
+            """SELECT * FROM booking_requests WHERE patient = ? AND slot_key = ?
+               ORDER BY status IN ('stopped', 'ended'), id DESC LIMIT 1""",
+            (patient, slot_key),
+        ).fetchone()
+
+    def approve_booking(self, booking_id: int) -> bool:
+        return self.db.execute(
+            "UPDATE booking_requests SET approved = 1, status = 'queued' WHERE id = ? AND status = 'approval'",
+            (booking_id,),
+        ).rowcount == 1
+
+    def claim_booking(self):
+        with self.db:
+            return self.db.execute(
+                """UPDATE booking_requests SET status = 'checking'
+                   WHERE id = (SELECT id FROM booking_requests WHERE status = 'queued' ORDER BY id LIMIT 1)
+                   RETURNING *""",
+            ).fetchone()
+
+    def booking_status(self, booking_id: int, status: str, *, reason=None, reservation_id=None) -> None:
+        self.db.execute(
+            "UPDATE booking_requests SET status = ?, reason = ?, reservation_id = ? WHERE id = ?",
+            (status, reason, reservation_id, booking_id),
+        )
+
+    def booking_recovery(self):
+        return self.db.execute(
+            "SELECT * FROM booking_requests WHERE status IN ('checking', 'submitting', 'verifying')",
+        ).fetchall()
+
+    def stop_booking(self, booking_id: int) -> bool:
+        return self.db.execute(
+            "UPDATE booking_requests SET status = 'stopped' WHERE id = ? AND status IN ('queued', 'approval')",
+            (booking_id,),
+        ).rowcount == 1
+
+    def account_paused(self, patient: str) -> bool:
+        return bool(self.db.execute("SELECT suspended FROM accounts WHERE patient = ?", (patient,)).fetchone()[0])
+
+    def unresolved_booking(self, patient: str) -> bool:
+        return self.db.execute(
+            """SELECT 1 FROM booking_requests WHERE patient = ? AND status IN ('unknown', 'verifying') LIMIT 1""",
+            (patient,),
+        ).fetchone() is not None
+
+    def acknowledge_unverified_booking(self, booking_id: int) -> bool:
+        return self.db.execute(
+            "UPDATE booking_requests SET status = 'reviewed' WHERE id = ? AND status = 'unknown'",
+            (booking_id,),
+        ).rowcount == 1
 
     def active(self) -> list[sqlite3.Row]:
         return self.db.execute(

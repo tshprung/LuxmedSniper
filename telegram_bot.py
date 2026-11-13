@@ -12,16 +12,28 @@ from pathlib import Path
 import requests
 
 from luxmed_sniper import WARSAW, DoctorLocator, Luxmed, LuxMedPortal, PortalError
-from telegram_configuration import PROFILE_KEYS, validate, worker_settings
+from telegram_calendar import CalendarAvailability, CalendarUnavailable
+from telegram_configuration import PROFILE_KEYS, calendar_settings, validate, worker_settings
 from telegram_free_text import FreeText
 from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences, split_preferences
-from telegram_requests import Criteria, PatientServiceMismatch, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
+from telegram_requests import PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria, PatientServiceMismatch, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
 from telegram_state import SearchState, next_search_time
 
 PORTAL_REUSE_SECONDS = 3600
 RESULTS_PER_PAGE = 3
 SHORT_NOTICE_SECONDS = 6 * 3600
 PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
+SUPPORTED_BOOKING_SERVICES = {"internista", *(normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[index][2]) for index in (0, 3))}
+BOOKING_FAILURES = {
+    "slot-gone": "That exact slot is no longer available. Use More or Continue to find another.",
+    "booking-details-missing": "I couldn't verify all the details for this slot. Check it in the Patient Portal.",
+    "booking-limit": "LUX MED didn't clear its booking limit check. Check the Patient Portal.",
+    "booking-eligibility": "LUX MED didn't confirm that this service is covered and available to book online.",
+    "portal-questions": "LUX MED needs you to complete its eligibility check in the Patient Portal.",
+    "booking-needs-portal": "LUX MED returned a warning, a payment or referral choice, or an existing visit. Check the Patient Portal.",
+    "booking-rejected": "LUX MED declined the reservation. Check the Patient Portal for details.",
+    "booking-hold-unavailable": "LUX MED didn't return a usable slot hold. Check the Patient Portal.",
+}
 
 
 class TelegramError(Exception):
@@ -92,12 +104,16 @@ def local_time(timestamp: int) -> str:
 
 
 class SearchBot:
-    def __init__(self, telegram: Telegram, state: SearchState, profiles: dict[str, Profile], *, clock=time.time, free_text: FreeText | None = None):
+    def __init__(self, telegram: Telegram, state: SearchState, profiles: dict[str, Profile], *, clock=time.time,
+                 free_text: FreeText | None = None, calendar: CalendarAvailability | None = None,
+                 booking_enabled: bool = False):
         self.telegram = telegram
         self.state = state
         self.profiles = profiles
         self.clock = clock
         self.free_text = free_text
+        self.calendar = calendar
+        self.booking_enabled = booking_enabled
         self.portals: dict[str, tuple[float, LuxMedPortal]] = {}
         self.cities = city_catalog()
         self.children = {key for key, profile in profiles.items() if profile.child}
@@ -141,10 +157,20 @@ class SearchBot:
             self.show_active()
         elif command in {"/change", "change"}:
             self.change(text, reply)
-        elif command in {"book", "/book"} or key in {
+        elif command in {"book", "/book", "details", "/details"} or key in {
             "more", "/more", "continue", "/continue", "find something else",
         }:
             self.handle_results(command, argument, reply)
+        elif command in {"approve", "/approve"}:
+            if self.booking_enabled and re.fullmatch(r"[1-9][0-9]{0,8}", argument) and self.state.approve_booking(int(argument)):
+                self.state.queue_message("Approved. I’ll recheck the selected appointment before booking.")
+            else:
+                self.state.queue_message("Use Approve followed by the booking request number shown in my message.")
+        elif command in {"reviewed", "/reviewed"}:
+            if re.fullmatch(r"[1-9][0-9]{0,8}", argument) and self.state.acknowledge_unverified_booking(int(argument)):
+                self.state.queue_message("Marked as reviewed. You can request a different appointment for this patient.")
+            else:
+                self.state.queue_message("Use Reviewed followed by the request number after checking the Patient Portal.")
         elif command in {"/resume", "resume"}:
             patient = self.aliases.get(argument)
             if patient and self.state.resume(patient):
@@ -212,14 +238,17 @@ class SearchBot:
         self.state.queue_message(f"{name} {error} Please send a new request with the patient and service you intended.")
 
     def help(self) -> None:
+        title = "LUX MED appointment assistant" if self.booking_enabled else "Read-only appointment search"
         self.state.queue_message(
-            "Read-only appointment search\n"
+            f"{title}\n"
             "Find an internist for <patient>\nFind a pediatrician for <patient>\n"
             "Find an internist for <patient> next week after 16:00\n"
             "/find patient | portal service | city | optional filters\n"
             "/active · Stop <number>\n"
             "Change 123 to after 16:00\n/change number | service | city | optional filters\n"
-            "From a result list: Book 2 · More · Continue",
+            "From a result list: Details 2 · More · Continue"
+            + (" · Book 2\nFor booking approval: Approve <request number> · Stop booking <request number>"
+               if self.booking_enabled else ""),
         )
 
     def start(self, criteria: Criteria, *, excluded_slots=(), not_before: int = 0) -> None:
@@ -258,13 +287,15 @@ class SearchBot:
         lines.extend(f"{number}. {self.slot_details(slot)}" for number, slot in page)
         if any(slot["start"] > now for slot in slots[page[-1][0]:]):
             lines.append("Reply More to see the next options.")
-        lines.append("Reply Book <option number> for booking steps, or Continue to search for different slots.")
+        action = "Book <option number> to request that slot" if self.booking_enabled else "Details <option number> for the Patient Portal link"
+        lines.append(f"Reply {action}, or Continue to search for different slots.")
         self.state.queue_message("\n".join(lines), search_id)
 
     def handle_results(self, command: str, argument: str, reply: dict) -> None:
         action = command.lstrip("/")
-        if action == "book" and not re.fullmatch(r"[1-9][0-9]{0,8}", argument):
-            self.state.queue_message("Use Book followed by an option number, for example Book 2.")
+        if action in {"book", "details"} and not re.fullmatch(r"[1-9][0-9]{0,8}", argument):
+            label = action.capitalize()
+            self.state.queue_message(f"Use {label} followed by an option number, for example {label} 2.")
             return
         original = self.replied_search(reply)
         row = self.state.results(original["id"]) if original else None
@@ -276,7 +307,7 @@ class SearchBot:
         search_id = row["id"]
         slots = json.loads(row["slots"])
         now = int(self.clock())
-        if action == "book":
+        if action in {"book", "details"}:
             number = int(argument)
             if number > row["shown"]:
                 self.state.queue_message("Choose an option number shown in this list, or use More.", search_id)
@@ -285,18 +316,17 @@ class SearchBot:
             if slot["start"] <= now:
                 self.state.queue_message("That appointment time has passed. Use More or Continue for other options.", search_id)
                 return
-            short_notice = ""
-            if slot["start"] - now < SHORT_NOTICE_SECONDS:
-                short_notice = "This appointment starts within six hours. Check the cancellation terms before confirming.\n"
-            heading = self.search_heading(row["display_number"], self.state.criteria(row))
-            self.state.queue_message(
-                f"{heading}\nOption {number}. {self.slot_details(slot)}\n"
-                f"{short_notice}"
-                "No appointment has been booked. Open the Patient Portal under the selected patient, "
-                "search for the same service, and confirm the slot if it is still available.\n"
-                f"{PATIENT_PORTAL_URL}",
-                search_id,
-            )
+            if action == "details":
+                heading = self.search_heading(row["display_number"], self.state.criteria(row))
+                notice = ""
+                if slot["start"] - now < SHORT_NOTICE_SECONDS:
+                    notice = "This appointment starts within six hours. Check the cancellation terms before confirming.\n"
+                self.state.queue_message(
+                    f"{heading}\nOption {number}. {self.slot_details(slot)}\n{notice}"
+                    f"Confirm availability in the Patient Portal.\n{PATIENT_PORTAL_URL}", search_id,
+                )
+            else:
+                self.request_booking(row, number, slot, now)
         elif action == "more":
             self.show_results(search_id)
         elif row["status"] == "continued":
@@ -310,6 +340,47 @@ class SearchBot:
             exclusions = json.loads(row["excluded_slots"]) + slots[:row["shown"]]
             self.state.mark_continued(search_id)
             self.start(criteria, excluded_slots=[slot for slot in exclusions if slot["start"] > now], not_before=row["next_due"])
+
+    def request_booking(self, row, number: int, slot: dict, now: int) -> None:
+        search_id = row["id"]
+        heading = self.search_heading(row["display_number"], self.state.criteria(row))
+        description = f"{heading}\nOption {number}. {self.slot_details(slot)}"
+        if not self.booking_enabled:
+            self.state.queue_message(
+                f"{description}\nDirect booking is unavailable. Confirm the appointment in the Patient Portal.\n{PATIENT_PORTAL_URL}",
+                search_id,
+            )
+            return
+        if row["telephone"] or normalize(row["service"]) not in SUPPORTED_BOOKING_SERVICES:
+            self.state.queue_message(f"This visit type needs to be booked in the Patient Portal.\n{PATIENT_PORTAL_URL}", search_id)
+            return
+        if any(type(slot.get(key)) is not int for key in ("clinic_id", "doctor_id", "service_id")):
+            self.state.queue_message("This list lacks the exact slot ID needed to book. Start a fresh search.", search_id)
+            return
+        if self.state.unresolved_booking(row["patient"]):
+            self.state.queue_message(f"A prior booking for this patient is unverified. Check the Patient Portal before proceeding.\n{PATIENT_PORTAL_URL}", search_id)
+            return
+        slot_key = json.dumps([slot[key] for key in ("start", "clinic_id", "doctor_id", "service_id")])
+        booking = self.state.request_booking(search_id, number, row["patient"], slot_key)
+        status = booking["status"]
+        if status == "booked":
+            self.state.queue_message(f"{description}\nAlready booked in LUX MED.", search_id)
+        elif status == "approval":
+            self.send_booking_approval(booking, description, booking["reason"])
+        elif status == "queued":
+            due = next_search_time(now)
+            timing = "Checking the exact slot and booking conditions." if due == now else f"Queued for {local_time(due)} Warsaw time."
+            self.state.queue_message(f"{description}\nBooking request {booking['id']}. {timing}", search_id)
+        elif status in {"checking", "submitting", "verifying"}:
+            self.state.queue_message(f"{description}\nThis booking is already being processed.", search_id)
+        else:
+            self.state.queue_message(f"{description}\nThis booking request has ended. Use More or Continue for another slot.", search_id)
+
+    def send_booking_approval(self, booking, description: str, reason: str) -> None:
+        self.state.queue_message(
+            f"{description}\n{reason}\nReply Approve {booking['id']} to proceed or Stop booking {booking['id']} to drop this request.",
+            booking["search_id"],
+        )
 
     def confirm_search(self, search_id: int, number: int, criteria: Criteria, due: int, paused: bool, now: int, *, changed: bool = False) -> None:
         if paused:
@@ -402,6 +473,10 @@ class SearchBot:
         return self.state.search_for_message(message_id) if type(message_id) is int else None
 
     def stop(self, argument: str, reply: dict) -> None:
+        if match := re.fullmatch(r"booking ([1-9][0-9]{0,8})", argument):
+            stopped = self.state.stop_booking(int(match[1]))
+            self.state.queue_message("Booking request stopped." if stopped else "There’s no pending booking with that number.")
+            return
         row = self.replied_search(reply)
         number = None
         if row is not None:
@@ -452,6 +527,134 @@ class SearchBot:
     def close_portals(self) -> None:
         for patient in tuple(self.portals):
             self.close_portal(patient)
+
+    def booking_due(self) -> None:
+        now = int(self.clock())
+        if not self.booking_enabled or next_search_time(now) != now:
+            return
+        booking = self.state.claim_booking()
+        if booking is None:
+            return
+        row = self.state.results(booking["search_id"])
+        slot = json.loads(row["slots"])[booking["option_number"] - 1]
+        criteria = self.state.criteria(row)
+        heading = self.search_heading(row["display_number"], criteria)
+        description = f"{heading}\nOption {booking['option_number']}. {self.slot_details(slot)}"
+        reservation_id = None
+        try:
+            if slot["start"] <= now:
+                raise PortalError("slot-gone")
+            if self.state.unresolved_booking(criteria.patient):
+                raise PortalError("prior-booking-unverified")
+            if self.state.account_paused(criteria.patient):
+                raise PortalError("booking-account-paused")
+            portal = self.portal_for(criteria.patient)
+            if portal.is_booking_blocked_by_penalty(criteria.city_id, slot["service_id"]):
+                raise PortalError("booking-penalty")
+            portal.check_booking_eligibility(criteria.city_id, slot["service_id"])
+            locator = DoctorLocator(id=f"{criteria.city_id}*{slot['service_id']}*-1*{slot['doctor_id']}")
+            appointment = self.refresh_booking_slot(portal, locator, slot)
+            start = appointment.AppointmentDate.astimezone(dt.UTC)
+            end = appointment.booking_term["end"].astimezone(dt.UTC)
+            reasons = self.booking_approval_reasons(portal, start, end)
+            if slot["start"] <= int(self.clock()):
+                raise PortalError("slot-gone")
+            checked_at = int(self.clock())
+            if next_search_time(checked_at) != checked_at:
+                with self.state.db:
+                    self.state.booking_status(booking["id"], "queued", reason=booking["reason"])
+                return
+            if reasons and (not booking["approved"] or not set(reasons) <= set((booking["reason"] or "").splitlines())):
+                with self.state.db:
+                    reason = "\n".join(reasons)
+                    self.state.booking_status(booking["id"], "approval", reason=reason)
+                    self.send_booking_approval(booking, description, reason)
+                return
+            with self.state.db:
+                self.state.booking_status(booking["id"], "submitting")
+            reservation_id = portal.reserve_standard_visit(appointment, criteria.service)
+            with self.state.db:
+                self.state.booking_status(booking["id"], "verifying", reservation_id=reservation_id)
+            if reservation_id not in portal.booked_visit_ids():
+                raise PortalError("booking-outcome-unknown")
+        except PortalError as error:
+            self.report_booking_failure(booking, description, error, reservation_id)
+            return
+        with self.state.db:
+            self.state.booking_status(booking["id"], "booked", reservation_id=reservation_id)
+            self.state.queue_message(f"{description}\nBooked and verified in LUX MED.", row["id"])
+
+    @staticmethod
+    def refresh_booking_slot(portal, locator: DoctorLocator, slot: dict):
+        date = dt.datetime.fromtimestamp(slot["start"], WARSAW).date()
+        matches = [
+            item for item in portal.search(locator, date=date)
+            if int(item.AppointmentDate.timestamp()) == slot["start"]
+            and item.clinic_id == slot["clinic_id"] and item.doctor_id == slot["doctor_id"]
+            and item.service_id == slot["service_id"]
+        ]
+        if len(matches) != 1:
+            raise PortalError("slot-gone")
+        appointment = matches[0]
+        if appointment.booking_term is None or str(appointment.booking_term["cityId"]) != locator.city_id:
+            raise PortalError("booking-details-missing")
+        return appointment
+
+    def booking_approval_reasons(self, portal, start: dt.datetime, end: dt.datetime) -> list[str]:
+        if not start < end:
+            raise PortalError("booking-details-missing")
+        reasons = []
+        try:
+            if portal.has_booking_conflict(start, end):
+                reasons.append("This overlaps with another LUX MED appointment.")
+        except PortalError as error:
+            if error.suspend:
+                raise
+            reasons.append("I couldn’t verify other LUX MED appointments. Check for conflicts before approving.")
+        try:
+            if self.calendar is None:
+                raise CalendarUnavailable
+            if self.calendar.busy(start, end):
+                reasons.append("Your Google Calendar shows a conflict.")
+        except CalendarUnavailable:
+            reasons.append("I couldn’t check your Google Calendar. Check that the time works before approving.")
+        if start.timestamp() - self.clock() < SHORT_NOTICE_SECONDS:
+            reasons.append("This appointment starts within six hours.")
+        return reasons
+
+    def report_booking_failure(self, booking, description: str, error: PortalError, reservation_id: int | None) -> None:
+        code = str(error)
+        unknown = reservation_id is not None or code == "booking-outcome-unknown"
+        with self.state.db:
+            if error.suspend:
+                self.close_portal(booking["patient"])
+                self.state.suspend(booking["patient"])
+            self.state.booking_status(booking["id"], "unknown" if unknown else "ended", reservation_id=reservation_id)
+            if unknown:
+                message = (
+                    "LUX MED’s booking outcome is unclear. Check your appointments in the Patient Portal. "
+                    f"Once you've checked, reply Reviewed {booking['id']} to allow requests for other slots."
+                )
+            elif code == "booking-penalty":
+                message = "LUX MED reported a no-show restriction. Check the Patient Portal before booking."
+            elif code == "prior-booking-unverified":
+                message = "Check the earlier unverified booking in the Patient Portal first."
+            elif error.suspend or code == "booking-account-paused":
+                message = "LUX MED access is paused. Check the Patient Portal and complete any verification there."
+            else:
+                message = BOOKING_FAILURES.get(code, "The booking check failed. Check the Patient Portal.")
+            self.state.queue_message(f"{description}\n{message}\n{PATIENT_PORTAL_URL}", booking["search_id"])
+
+    def recover_bookings(self) -> None:
+        with self.state.db:
+            for booking in self.state.booking_recovery():
+                if booking["status"] == "checking":
+                    self.state.booking_status(booking["id"], "queued", reason=booking["reason"])
+                else:
+                    self.report_booking_failure(
+                        booking, f"Booking request {booking['id']}", PortalError("booking-outcome-unknown"),
+                        booking["reservation_id"],
+                    )
 
     def search_due(self) -> None:
         today = dt.datetime.fromtimestamp(self.clock(), WARSAW).date().isoformat()
@@ -522,6 +725,7 @@ class SearchBot:
                 "start": int(slot.AppointmentDate.timestamp()),
                 "clinic": str(slot.ClinicPublicName or "")[:160].strip(),
                 "doctor": str(slot.DoctorName or "")[:160].strip(),
+                "clinic_id": slot.clinic_id, "doctor_id": slot.doctor_id, "service_id": int(service_id),
             }
             key = self.slot_key(option)
             if key not in excluded:
@@ -559,7 +763,11 @@ def main() -> int:
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         key = settings.get("OPENAI_API_KEY", "").strip()
         interpreter = FreeText(key) if key else None
-        bot = SearchBot(Telegram(token, owner), SearchState(path / "telegram.sqlite3"), profiles, free_text=interpreter)
+        calendar_config = calendar_settings(settings)
+        calendar = CalendarAvailability(calendar_config) if calendar_config else None
+        bot = SearchBot(Telegram(token, owner), SearchState(path / "telegram.sqlite3"), profiles,
+                        free_text=interpreter, calendar=calendar,
+                        booking_enabled=settings.get("LUXMED_DIRECT_BOOKING") == "1")
     except (KeyError, ValueError, OSError):
         print("Telegram bot configuration is incomplete.", file=sys.stderr)
         return 2
@@ -571,11 +779,14 @@ def main() -> int:
 
 
 def run_worker(bot: SearchBot) -> int:
+    bot.recover_bookings()
     while True:
         try:
             updates = bot.telegram.poll(int(bot.state.get_setting("offset", "0")))
             for update in updates:
                 bot.accept(update)
+            bot.flush()
+            bot.booking_due()
             bot.flush()
             bot.search_due()
             bot.flush()

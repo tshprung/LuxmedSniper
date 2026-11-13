@@ -11,6 +11,7 @@ from nacl.public import PrivateKey, SealedBox
 
 from luxmed_sniper import WARSAW, Appointment, Luxmed, PortalError
 from telegram_bot import Profile, SearchBot, Telegram, TelegramError
+from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import SECRET_KEYS, package_settings
 from telegram_free_text import FreeText, redacted_request
 from telegram_state import SearchState, next_search_time
@@ -18,6 +19,27 @@ from telegram_state import SearchState, next_search_time
 
 def local_timestamp(day, hour, minute=0):
     return int(dt.datetime(2030, 3, day, hour, minute, tzinfo=WARSAW).timestamp())
+
+
+class CalendarTests(unittest.TestCase):
+    def test_free_busy_uses_only_intervals_and_checks_errors_for_each_calendar(self):
+        calendar = CalendarAvailability({
+            "client_id": "fixture", "client_secret": "fixture", "refresh_token": "fixture",
+            "calendar_ids": ["first", "second"],
+        })
+        start = dt.datetime(2030, 3, 31, 11, tzinfo=WARSAW)
+        end = start + dt.timedelta(minutes=15)
+        with patch.object(calendar, "post", side_effect=[
+            {"access_token": "fixture", "expires_in": 3600},
+            {"calendars": {"first": {"busy": []}, "second": {"busy": [{"start": start.isoformat(), "end": end.isoformat()}]}}},
+            {"calendars": {"first": {"busy": []}, "second": {"errors": [{"reason": "notFound"}]}}},
+        ]) as post:
+            self.assertTrue(calendar.busy(start, end))
+            with self.assertRaises(CalendarUnavailable):
+                calendar.busy(start, end)
+            self.assertEqual(post.call_args.kwargs["json"], {
+                "timeMin": start.isoformat(), "timeMax": end.isoformat(), "items": [{"id": "first"}, {"id": "second"}],
+            })
 
 
 class BotTests(unittest.TestCase):
@@ -36,7 +58,7 @@ class BotTests(unittest.TestCase):
             "patient2": Profile("Child", Luxmed(login="fixture2", password="dummy"), ("Dziecka",), True),
             "patient3": Profile("Other", Luxmed(login="fixture3", password="dummy"), child=True),
         }
-        self.bot = SearchBot(self.telegram, self.state, self.profiles, clock=lambda: self.now)
+        self.bot = SearchBot(self.telegram, self.state, self.profiles, clock=lambda: self.now, booking_enabled=True)
 
     def update(self, number, text, *, sender=100, chat_id=100, chat_type="private", reply_to=None):
         message = {
@@ -170,7 +192,8 @@ class BotTests(unittest.TestCase):
         self.update(1, "/find Child | sick kids")
         self.bot.flush()
         date = dt.datetime(2030, 3, 31, tzinfo=WARSAW)
-        slots = [Appointment(date.replace(hour=hour), 2, "Fixture clinic", f"Doctor {hour}", 12) for hour in range(9, 14)]
+        slots = [Appointment(date.replace(hour=hour), 2, "Fixture clinic", f"Doctor {hour}", 12, doctor_id=hour)
+                 for hour in range(9, 14)]
         with patch("telegram_bot.LuxMedPortal") as portal:
             portal.return_value.resolve_service.return_value = 12
             portal.return_value.search.return_value = slots
@@ -190,8 +213,7 @@ class BotTests(unittest.TestCase):
             self.bot.flush()
             self.update(4, "Book 4")
             self.assertIn("Option 4. 31.03 12:00", self.state.next_message()["text"])
-            self.assertIn("No appointment has been booked", self.state.next_message()["text"])
-            self.assertNotIn("within six hours", self.state.next_message()["text"])
+            self.assertIn("Checking the exact slot", self.state.next_message()["text"])
             self.bot.flush()
             self.update(5, "find something else", reply_to=43)
             self.update(6, "Continue", reply_to=43)
@@ -208,23 +230,89 @@ class BotTests(unittest.TestCase):
         self.assertIn("1. 31.03 14:00", final)
         self.assertNotIn("09:00", final)
 
-    def test_booking_handoff_warns_for_appointments_less_than_six_hours_away(self):
+    def test_booking_asks_for_approval_when_calendar_is_unavailable_or_short_notice(self):
         self.update(1, "/find Child | sick kids")
         self.bot.flush()
         with patch("telegram_bot.LuxMedPortal") as portal:
-            portal.return_value.resolve_service.return_value = 12
-            portal.return_value.search.return_value = [
-                Appointment(dt.datetime.fromtimestamp(self.now + hours * 3600, WARSAW),
-                            2, "Fixture clinic", "Fixture doctor", 12)
-                for hours in (5, 6)
+            client = portal.return_value
+            client.resolve_service.return_value = 12
+            start = dt.datetime.fromtimestamp(self.now + 5 * 3600, WARSAW)
+            slot = Appointment(start, 2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9,
+                               booking_term={"cityId": 5, "end": start + dt.timedelta(minutes=15)})
+            client.search.return_value = [slot]
+            client.is_booking_blocked_by_penalty.return_value = False
+            client.has_booking_conflict.return_value = False
+            client.reserve_standard_visit.return_value = 543
+            client.booked_visit_ids.return_value = {543}
+            self.bot.search_due()
+            self.bot.flush()
+            self.update(2, "Book 1")
+            self.bot.flush()
+            self.bot.booking_due()
+            prompt = self.state.next_message()["text"]
+            self.assertIn("within six hours", prompt)
+            self.assertIn("couldn’t check your Google Calendar", prompt)
+            self.assertIn("Approve 1", prompt)
+            client.reserve_standard_visit.assert_not_called()
+            self.bot.flush()
+            self.update(3, "Approve 1")
+            self.bot.flush()
+            self.bot.booking_due()
+            client.reserve_standard_visit.assert_called_once()
+            self.assertIn("Booked and verified in LUX MED", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(4, "Book 1")
+            self.bot.booking_due()
+            client.reserve_standard_visit.assert_called_once()
+            self.assertIn("Already booked", self.state.next_message()["text"])
+
+    def test_clear_booking_submits_once_and_verification_failure_is_not_retried(self):
+        self.bot.calendar = MagicMock()
+        self.bot.calendar.busy.return_value = False
+        self.update(1, "/find Child | sick kids")
+        self.bot.flush()
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            client = portal.return_value
+            start = dt.datetime.fromtimestamp(self.now + 8 * 3600, WARSAW)
+            slot = Appointment(start, 2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9,
+                               booking_term={"cityId": 5, "end": start + dt.timedelta(minutes=15)})
+            client.resolve_service.return_value = 12
+            client.search.return_value = [slot]
+            client.is_booking_blocked_by_penalty.return_value = False
+            client.has_booking_conflict.return_value = False
+            client.reserve_standard_visit.return_value = 543
+            client.booked_visit_ids.return_value = set()
+            self.bot.search_due()
+            self.bot.flush()
+            self.update(2, "Book 1")
+            self.bot.flush()
+            self.bot.booking_due()
+            client.reserve_standard_visit.assert_called_once()
+            self.assertIn("booking outcome is unclear", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(3, "Book 1")
+            self.bot.booking_due()
+            self.assertIn("prior booking for this patient is unverified", self.state.next_message()["text"])
+            client.reserve_standard_visit.assert_called_once()
+
+    def test_disabled_booking_returns_portal_link_without_accessing_luxmed(self):
+        self.bot.booking_enabled = False
+        self.update(1, "/find Child | sick kids")
+        self.bot.flush()
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            client = portal.return_value
+            client.resolve_service.return_value = 12
+            client.search.return_value = [
+                Appointment(dt.datetime(2030, 3, 31, 11, tzinfo=WARSAW),
+                            2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9),
             ]
             self.bot.search_due()
-        self.bot.flush()
-        self.update(2, "Book 1")
-        self.assertIn("within six hours", self.state.next_message()["text"])
-        self.bot.flush()
-        self.update(3, "Book 2")
-        self.assertNotIn("within six hours", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(2, "Book 1")
+            self.bot.booking_due()
+            self.assertIn("Direct booking is unavailable", self.state.next_message()["text"])
+            client.check_booking_eligibility.assert_not_called()
+            client.reserve_standard_visit.assert_not_called()
 
     def test_reply_to_previous_list_does_not_select_from_new_list_with_same_search_number(self):
         date = dt.datetime(2030, 3, 31, 11, tzinfo=WARSAW)
@@ -234,7 +322,9 @@ class BotTests(unittest.TestCase):
                 self.update(update_id, f"/find {patient} | routine visit")
                 self.telegram.send.return_value = 40 + update_id * 2
                 self.bot.flush()
-                portal.return_value.search.return_value = [Appointment(date, 2, "Fixture clinic", doctor, 12)]
+                portal.return_value.search.return_value = [
+                    Appointment(date, 2, "Fixture clinic", doctor, 12, doctor_id=update_id),
+                ]
                 self.bot.search_due()
                 self.telegram.send.return_value += 1
                 self.bot.flush()
@@ -456,7 +546,7 @@ class BotTests(unittest.TestCase):
 
     def test_english_help_and_portal_service_names(self):
         self.update(1, "/start")
-        self.assertIn("Read-only appointment search", self.state.next_message()["text"])
+        self.assertIn("LUX MED appointment assistant", self.state.next_message()["text"])
         self.assertNotIn("/szukaj", self.state.next_message()["text"])
         self.update(2, "/find Adult | Dermatolog | Wrocław")
         row, = self.state.active()

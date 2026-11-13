@@ -99,17 +99,43 @@ After-hours requests queue until the next opening. An access restriction or
 unconfirmed login pauses that account. Check the official Patient Portal
 before using `/resume <patient>`. Availability is returned in the private
 chat. The first completed check reports whether it found a match. Later
-checks with no matches update `/active` quietly. The worker does not write
-appointments or calendar events.
+checks with no matches update `/active` quietly.
 
 Results are numbered in groups of three. Reply `More` for more options from
-the same check, or `Book 2` for the details of option 2 and the Patient
+the same check, or `Details 2` for the details of option 2 and the Patient
 Portal link. The bot flags selections within six hours of the appointment.
 Confirm availability and book in the portal. `Continue`
 or `Find something else` starts a follow-up with the same filters, skipping
 slots already shown and respecting the search's next hourly check.
 Reply to a result message to select that list. Standalone commands use the
 latest list.
+
+### Direct Telegram booking pilot
+
+Direct booking defaults to off. The live audit of the worker's session
+encountered a sign-in redirect at the booking limit check. Enable the pilot
+only after the worker has an authorized session that passes the portal's
+booking checks. The configuration package accepts the environment variable
+`LUXMED_DIRECT_BOOKING=1` for that rollout.
+
+With the pilot enabled, reply `Book 2` to a fresh list to request that exact
+slot. The initial scope is covered in-person internist and standard sick
+or routine pediatric visits. The bot rechecks the slot and asks for
+approval when it starts in less than six hours, it detects a scheduling
+conflict, or a conflict check is unavailable. Use `Approve 1` with the
+request number shown, or `Stop booking 1` to drop a pending request.
+The bot hands off to the Patient Portal for charges, referrals, changes
+to an existing visit, or a booking restriction. If confirmation is
+unclear, check the Patient Portal and reply `Reviewed 1` to allow new
+booking requests for that patient. The worker never retries an uncertain
+reservation.
+
+For calendar conflict checks, add the optional environment secret
+`LUXMED_BOOKING_CALENDAR` as a JSON object with `client_id`, `client_secret`,
+`refresh_token`, and a list of `calendar_ids`. Use a Google Calendar
+free/busy scope and run the encrypted configuration handoff again. The
+worker requests busy time ranges only. Without this configuration it
+asks you to check your calendar before approving.
 
 ### Read-only booking feasibility
 

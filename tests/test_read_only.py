@@ -96,6 +96,61 @@ class SearchTests(unittest.TestCase):
                 self.assertEqual(portal.booked_visit_ids(), {11, 12})
         self.assertEqual(request.call_args.args, ("GET", LuxMedPortal.UPCOMING_VISITS_URL))
 
+    def test_booking_holds_and_confirms_the_exact_covered_slot(self):
+        locator = DoctorLocator(id="5*30*-1*-1")
+        term = dict(slot("2030-04-01T10:00:00+02:00"), cityId=5, city="Fixture city",
+                    dateTimeTo="2030-04-01T10:15:00+02:00", roomId=19, scheduleId=20,
+                    isTelemedicine=False, isAdditional=False, isImpediment=False)
+        result = {"correlationId": "fixture", "termsForService": {"termsForDays": [{"terms": [term]}]}}
+        appointment, = LuxMedPortal._parse_visits_new_portal(result, locator)
+        valuation = {"valuationType": 1, "price": 0, "isReferralRequired": False}
+        hold = {"hasErrors": False, "hasWarnings": False,
+                "value": {"temporaryReservationId": 135, "askForReferral": False, "valuations": [valuation]}}
+        confirmed = {"hasErrors": False, "value": {"reservationId": 246}}
+        with patch.object(requests.Session, "request", side_effect=[
+            response({"token": "fixture-token"}), response(hold), response(confirmed),
+        ]) as request:
+            portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
+            with portal.session:
+                self.assertEqual(portal.reserve_standard_visit(appointment, "Fixture service"), 246)
+        lock, confirm = request.call_args_list[1:]
+        self.assertTrue(lock.args[1].endswith("/Reservation/LockTerm"))
+        self.assertEqual(lock.kwargs["json"]["doctorId"], 9)
+        self.assertEqual(lock.kwargs["json"]["timeFrom"], "10:00")
+        self.assertTrue(confirm.args[1].endswith("/Reservation/Confirm"))
+        self.assertEqual(confirm.kwargs["json"]["temporaryReservationId"], 135)
+        self.assertEqual(confirm.kwargs["json"]["valuation"], valuation)
+
+    def test_booking_warning_or_fee_releases_hold_without_confirmation(self):
+        locator = DoctorLocator(id="5*30*-1*-1")
+        term = dict(slot("2030-04-01T10:00:00"), cityId=5, dateTimeTo="2030-04-01T10:15:00",
+                    roomId=19, scheduleId=20, isTelemedicine=False, isAdditional=False, isImpediment=False)
+        result = {"correlationId": "fixture", "termsForService": {"termsForDays": [{"terms": [term]}]}}
+        appointment, = LuxMedPortal._parse_visits_new_portal(result, locator)
+        for warning, price in ((True, 0), (False, 25)):
+            with self.subTest(warning=warning, price=price):
+                hold = {"hasErrors": False, "hasWarnings": warning, "value": {
+                    "temporaryReservationId": 135, "askForReferral": False,
+                    "valuations": [{"valuationType": 1, "price": price, "isReferralRequired": False}],
+                }}
+                with patch.object(requests.Session, "request", side_effect=[
+                    response({"token": "fixture-token"}), response(hold), response({}),
+                ]) as request:
+                    portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
+                    with portal.session, self.assertRaisesRegex(Exception, "booking-needs-portal"):
+                        portal.reserve_standard_visit(appointment, "Fixture service")
+                self.assertTrue(request.call_args.args[1].endswith("/Reservation/ReleaseTerm"))
+                self.assertEqual(request.call_args.kwargs["params"], {"reservationId": 135})
+
+    def test_booking_eligibility_redirect_stops_before_other_requests(self):
+        with patch.object(requests.Session, "request", side_effect=[
+            response({"token": "fixture-token"}), response(status=302),
+        ]) as request:
+            portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
+            with portal.session, self.assertRaisesRegex(Exception, "session-unconfirmed"):
+                portal.check_booking_eligibility(5, 30)
+        self.assertEqual(request.call_count, 2)
+
 
 class AuditCliTests(unittest.TestCase):
     def run_audit(self, profile, environment, replies, *, hour=10, options=()):
