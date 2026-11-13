@@ -57,9 +57,13 @@ class BotTests(unittest.TestCase):
 
     def test_pediatric_clarification_survives_restart_and_queues_after_hours(self):
         self.now = local_timestamp(30, 23, 15)
-        self.update(1, "Znajdź pediatrę dla Dziecka we Wroclaw")
-        self.assertIn("Który rodzaj wizyty?", self.state.next_message()["text"])
+        self.update(1, "Find a pediatrician for Child in Wroclaw")
+        self.assertIn("Which type of pediatric visit?", self.state.next_message()["text"])
         self.assertEqual(self.state.active(), [])
+        with self.state.db:
+            pending = json.loads(self.state.get_setting("pending"))
+            pending["polish"] = True
+            self.state.set_setting("pending", json.dumps(pending))
         self.state.db.close()
         self.state = SearchState(self.path)
         self.bot = SearchBot(self.telegram, self.state, self.profiles, clock=lambda: self.now)
@@ -78,7 +82,7 @@ class BotTests(unittest.TestCase):
         self.update(3, "Stop", reply_to=42)
         row, = self.state.active()
         self.assertEqual(row["patient"], "patient2")
-        self.update(4, f"Zatrzymaj {row['id']}")
+        self.update(4, f"Stop {row['id']}")
         self.assertEqual(self.state.active(), [])
 
     def test_scheduled_batch_uses_one_login_per_patient_per_hour(self):
@@ -175,16 +179,16 @@ class BotTests(unittest.TestCase):
         response = MagicMock(status_code=200)
         response.json.return_value = {
             "status": "completed",
-            "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"intent":"search","language":"pl"}'}]}],
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"intent":"search"}'}]}],
         }
         with patch.object(self.bot.free_text.session, "post", return_value=response) as api:
-            self.update(1, "Czy możesz sprawdzić dostępność pediatry dla Dziecka we Wrocławiu?")
+            self.update(1, "Could you check whether a pediatrician is available for Child in Wrocław?")
             payload = api.call_args.kwargs["json"]
-            self.assertEqual(payload["input"], "czy mozesz sprawdzic dostepnosc SERVICE dla PERSON we CITY")
+            self.assertEqual(payload["input"], "could you check whether a SERVICE is available for PERSON in CITY")
             self.assertFalse(payload["store"])
             self.assertTrue(payload["text"]["format"]["strict"])
             self.assertEqual(self.state.active(), [])
-            self.assertIn("Który rodzaj wizyty?", self.state.next_message()["text"])
+            self.assertIn("Which type of pediatric visit?", self.state.next_message()["text"])
             self.update(2, "4")
             self.update(3, "/active")
             api.assert_called_once()
@@ -199,9 +203,18 @@ class BotTests(unittest.TestCase):
             "Please book an internist for Adult",
             "Please find an internist for Adult or Child",
             "Could you find a pediatric visit for Child with details unknown-private-note?",
+            "Czy możesz sprawdzić dostępność pediatry dla Dziecka we Wrocławiu?",
         ):
             with self.subTest(text=text):
                 self.assertIsNone(redacted_request(text, self.bot.aliases, self.bot.cities))
+
+    def test_english_help_and_portal_service_names(self):
+        self.update(1, "/start")
+        self.assertIn("Read-only appointment search", self.state.next_message()["text"])
+        self.assertNotIn("/szukaj", self.state.next_message()["text"])
+        self.update(2, "/find Adult | Dermatolog | Wrocław")
+        row, = self.state.active()
+        self.assertEqual((row["service"], row["city"]), ("Dermatolog", "Wrocław"))
 
 
 class TelegramTransportTests(unittest.TestCase):

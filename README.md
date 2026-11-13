@@ -59,14 +59,14 @@ credentials. The smoke check has no scheduler.
 
 ## Private Telegram availability worker
 
-The worker accepts messages only from its configured owner's private chat.
+The worker accepts English messages from its configured owner's private chat.
 Example requests include `Find an internist for <patient>`,
-`Znajdź pediatrę dla <pacjent>`, and
+`Find a pediatrician for <patient>`, and
 `/find patient | exact portal service | city`. Wrocław is the default city.
 A generic pediatric request asks which visit type to use. Use `/active` to
 list searches with their last result and next check. Use `Stop 123` to stop
 one, or reply `Stop` to a search's message. Use
-`/change 123 | service | city` or `/zmień 123 | usługa | miasto` to update
+`/change 123 | service | city` to update
 an active search. You can leave the service blank to change only the city.
 An update keeps the search ID, patient and hourly account limit.
 Appointment-time, doctor and clinic preferences are outside this first
@@ -113,15 +113,15 @@ notification.
 
 Set `OPENAI_API_KEY` as a secret in the same GitHub environment and repeat
 the encrypted configuration handoff. Use an OpenAI API project key. The
-worker uses the Responses API for short English or Polish requests that the
+worker uses the Responses API for short English requests that the
 built-in parser could not interpret, such as “Could you check whether there’s
 an internist available for [patient] in Wrocław?”
 
 The worker recognizes the patient, service, and city locally. Only a small
 set of scheduling words and placeholders leave the VM. It sends no chat
 history, patient labels, service labels, results, or portal credentials.
-Messages with unrecognized details stay local. The model classifies intent
-and language. The worker validates the search criteria and controls all
+Messages with unrecognized details stay local. The model classifies intent.
+The worker validates the search criteria and controls all
 account access and scheduling.
 
 How to use LuxmedSniper?

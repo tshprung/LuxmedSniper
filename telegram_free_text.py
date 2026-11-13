@@ -23,26 +23,22 @@ SCHEDULING_WORDS = frozenset("""
     can check could d do does find for get have help i if in is just look looking
     me my need of please request s search see slots slot some the there to visit
     want what with would you able show like
-    czy da dasz dla dostepne dostepnosc jest jakie jakis jakies mam mozesz
-    moze mozna o odbyc od poprosze poszukaj potrzebuje prosze sa sie sprawdz
-    sprawdzic sprawdzisz szukam szukaj termin terminu terminy usluge w we
-    wizyta wizyte znajdz znalezc chcialbym chcialabym chce
+    whether
 """.split())
 
 SCHEMA = {
     "type": "object",
     "properties": {
         "intent": {"type": "string", "enum": ["search", "clarify"]},
-        "language": {"type": "string", "enum": ["en", "pl"]},
     },
-    "required": ["intent", "language"],
+    "required": ["intent"],
     "additionalProperties": False,
 }
 INSTRUCTIONS = (
-    "Classify a redacted English or Polish Telegram request. PERSON, SERVICE and CITY stand for "
+    "Classify a redacted English Telegram request. PERSON, SERVICE and CITY stand for "
     "a patient, portal service and city already validated locally. Return search only when the "
     "user clearly wants to check appointment availability. Return clarify for statements, unclear "
-    "requests or any request to book, cancel or change appointments. Identify the request language."
+    "requests or any request to book, cancel or change appointments."
 )
 
 
@@ -60,7 +56,6 @@ def redacted_request(text: str, aliases: dict, cities: dict):
             services[normalize(alias)] = label
 
     locations = {name: city[1] for name, city in cities.items()}
-    locations["wroclawiu"] = "Wrocław"
     terms = {
         **{clean(name): ("CITY", city) for name, city in locations.items()},
         **{clean(name): ("SERVICE", service) for name, service in services.items()},
@@ -125,10 +120,9 @@ class FreeText:
             if len(items) != 1:
                 return None
             parsed = json.loads(items[0])
-            if parsed["intent"] != "search" or parsed["language"] not in {"en", "pl"}:
+            if parsed["intent"] != "search":
                 return None
         except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError):
-            raise RequestError(False, "Free-text interpretation is unavailable. Try /find patient | service | city or /szukaj pacjent | usługa | miasto.", "") from None
+            raise RequestError("Free-text interpretation is unavailable. Try /find patient | service | city.") from None
 
-        command = "/szukaj" if parsed["language"] == "pl" else "/find"
-        return parse_search(f"{command} {patient} | {service} | {city}", aliases, children, cities)
+        return parse_search(f"/find {patient} | {service} | {city}", aliases, children, cities)

@@ -80,7 +80,7 @@ class SearchState:
         row = self.db.execute(
             """INSERT INTO searches (patient, service, city_id, city, polish, telephone, next_due)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (criteria.patient, criteria.service, criteria.city_id, criteria.city, criteria.polish, criteria.telephone, due),
+            (criteria.patient, criteria.service, criteria.city_id, criteria.city, 0, criteria.telephone, due),
         )
         return row.lastrowid, due, bool(account["suspended"])
 
@@ -98,7 +98,7 @@ class SearchState:
             """UPDATE searches SET service = ?, city_id = ?, city = ?, polish = ?, telephone = ?,
                    next_due = ?, last_checked = NULL, last_result = NULL, first_result_sent = 0
                WHERE id = ? AND status = 'active' AND patient = ?""",
-            (criteria.service, criteria.city_id, criteria.city, criteria.polish, criteria.telephone,
+            (criteria.service, criteria.city_id, criteria.city, 0, criteria.telephone,
              due, search_id, criteria.patient),
         )
         return due, bool(account["suspended"])
