@@ -58,7 +58,7 @@ class BotTests(unittest.TestCase):
     def test_pediatric_clarification_survives_restart_and_queues_after_hours(self):
         self.now = local_timestamp(30, 23, 15)
         self.update(1, "Find a pediatrician for Child in Wroclaw")
-        self.assertIn("Which type of pediatric visit?", self.state.next_message()["text"])
+        self.assertIn("Which type of pediatric visit should I search for Child?", self.state.next_message()["text"])
         self.assertEqual(self.state.active(), [])
         with self.state.db:
             pending = json.loads(self.state.get_setting("pending"))
@@ -185,6 +185,57 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.state.criteria(edited).preferences.start_minute, 1020)
         self.assertEqual(self.state.criteria(edited).preferences.clinic, "Dominikańska")
 
+    def test_pediatric_search_for_adult_requires_a_new_request(self):
+        self.update(1, "Find a pediatrician for Adult next week, after 16:00, near Dominikańska.")
+        self.assertIn("Adult is configured as an adult, and pediatrics is for children.", self.state.next_message()["text"])
+        self.assertIn("Please send a new request", self.state.next_message()["text"])
+        self.assertEqual(self.state.active(), [])
+        self.assertEqual(self.state.get_setting("pending"), "")
+        self.bot.flush()
+        self.update(2, "4")
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            self.bot.search_due()
+            portal.assert_not_called()
+        self.assertEqual(self.state.active(), [])
+
+    def test_service_mismatch_applies_to_exact_portal_labels_and_edits(self):
+        self.update(1, "/find Adult | Konsultacja pediatryczna - gabinet dzieci zdrowych")
+        self.assertEqual(self.state.active(), [])
+        self.assertIn("pediatrics is for children", self.state.next_message()["text"])
+        self.bot.flush()
+        self.update(2, "Find an internist for Child")
+        self.assertEqual(self.state.active(), [])
+        self.assertIn("Child is configured as a child", self.state.next_message()["text"])
+        self.bot.flush()
+        self.update(3, "Find an internist for Adult")
+        self.update(4, "/change 1 | pediatrician")
+        row, = self.state.active()
+        self.assertEqual((row["patient"], row["service"]), ("patient1", "Internista"))
+
+    def test_numbers_reset_when_queue_is_empty_and_old_replies_are_safe(self):
+        self.update(1, "Find an internist for Adult")
+        self.bot.flush()
+        with self.state.db:
+            self.state.suspend("patient1")
+        self.update(2, "/find Child | health check")
+        self.assertEqual([row["display_number"] for row in self.state.active()], [1, 2])
+        self.update(3, "Stop 1")
+        self.update(4, "/find Other | routine visit")
+        self.assertEqual([row["display_number"] for row in self.state.active()], [2, 3])
+        self.update(5, "Stop 2")
+        self.update(6, "Stop 3")
+        self.update(7, "/find Other | routine visit")
+        row, = self.state.active()
+        self.assertEqual((row["id"], row["display_number"]), (4, 1))
+        self.update(8, "Stop 1", reply_to=42)
+        self.update(9, "Change 1 to after 17:00", reply_to=42)
+        self.assertEqual(self.state.active()[0]["id"], 4)
+        self.assertIsNone(self.state.criteria(self.state.active()[0]).preferences.time_rule)
+        self.update(10, "Change 1 to after 16:00")
+        self.assertEqual(self.state.criteria(self.state.active()[0]).preferences.start_minute, 960)
+        self.update(11, "Stop 1")
+        self.assertEqual(self.state.active(), [])
+
     def test_preferences_filter_returned_slots_and_expire_without_portal_call(self):
         self.update(1, "Find an internist for Adult tomorrow after 16:00 with Dr Anna Smith, near Dominikańska")
         self.bot.flush()
@@ -247,7 +298,7 @@ class BotTests(unittest.TestCase):
             self.assertFalse(payload["store"])
             self.assertTrue(payload["text"]["format"]["strict"])
             self.assertEqual(self.state.active(), [])
-            self.assertIn("Which type of pediatric visit?", self.state.next_message()["text"])
+            self.assertIn("Which type of pediatric visit should I search for Child?", self.state.next_message()["text"])
             self.update(2, "4")
             self.update(3, "/active")
             api.assert_called_once()

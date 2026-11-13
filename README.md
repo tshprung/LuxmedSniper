@@ -69,6 +69,10 @@ one, or reply `Stop` to a search's message. Use
 `/change 123 | service | city | filters` to update
 an active search. You can leave the service blank to change only the city.
 An update keeps the search ID, patient and hourly account limit.
+If the requested service conflicts with the named patient's age group, the
+worker asks for a corrected request. When every search has ended, the next
+search is numbered #1. A reply to an older message stays tied to that
+message's original search.
 
 For example, send “Find a pediatrician for <patient> next week, after 16:00,
 near Dominikańska” and then choose the visit type. The worker shows the
