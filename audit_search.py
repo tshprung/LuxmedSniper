@@ -1,4 +1,4 @@
-"""Run one private, read-only availability check for one configured account."""
+"""Run private, read-only portal checks for one configured account."""
 
 import argparse
 import datetime
@@ -12,6 +12,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile", choices=("patient1", "patient2", "patient3"))
     parser.add_argument("--status-only", action="store_true", help="Omit the slot count from output")
+    parser.add_argument(
+        "--booking-check", action="store_true",
+        help="Check the upcoming visit and no-show restriction responses without printing their contents",
+    )
     args = parser.parse_args()
 
     now = datetime.datetime.now(WARSAW)
@@ -43,12 +47,18 @@ def main() -> int:
                 city, service_name, clinics, doctors = locator_id.split("*")
                 service_id = portal.resolve_in_person_service(service_name)
                 locator = DoctorLocator(id=f"{city}*{service_id}*{clinics}*{doctors}")
-            slots = portal.search(locator)
+            if args.booking_check:
+                portal.booked_visit_ids()
+                portal.is_booking_blocked_by_penalty(int(locator.city_id), int(locator.service_id))
+            else:
+                slots = portal.search(locator)
     except PortalError as error:
         print(error)
         return 1
 
-    if args.status_only:
+    if args.booking_check:
+        print("booking-check-completed")
+    elif args.status_only:
         print("search-completed")
     else:
         print(f"search-completed, matching-slots={len(slots)}")

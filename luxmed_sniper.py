@@ -134,6 +134,8 @@ class LuxMedPortal:
     DICTIONARY_CITIES_URL = f'{DICTIONARY_URL}/cities'
     DICTIONARY_SERVICES_URL = f'{DICTIONARY_URL}/serviceVariantsGroups'
     DICTIONARY_FACILITIES_AND_DOCTORS = f'{DICTIONARY_URL}/facilitiesAndDoctors'
+    UPCOMING_VISITS_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/DashboardMedicalSection/GetUpcomingVisits'
+    NON_SHOW_PENALTIES_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Reservation/CheckUserNonShowPenalties'
 
     def __init__(self, credentials: Luxmed):
         self.session = requests.Session()
@@ -235,6 +237,41 @@ class LuxMedPortal:
 
     def get_cities(self) -> list[dict]:
         return self._portal_json("GET", self.DICTIONARY_CITIES_URL)
+
+    def booked_visit_ids(self) -> set[int]:
+        """Return IDs of reserved or confirmed in-person visits shown on the dashboard."""
+        content = self._portal_json("GET", self.UPCOMING_VISITS_URL)
+        events = content.get("events") if isinstance(content, dict) else None
+        if not isinstance(events, list):
+            raise PortalError("unexpected-upcoming-visits", suspend=True)
+
+        booked = set()
+        for event in events:
+            if not isinstance(event, dict) or type(event.get("eventType")) is not int:
+                raise PortalError("unexpected-upcoming-visits", suspend=True)
+            if event["eventType"] != 1:  # Visit in the portal's event type enum.
+                continue
+            status = event.get("status")
+            if type(status) is not int or not 0 <= status <= 6:
+                raise PortalError("unexpected-upcoming-visits", suspend=True)
+            if status in (1, 2):  # Reserved, Confirmed.
+                visit_id = event.get("eventId")
+                if type(visit_id) is not int or visit_id <= 0:
+                    raise PortalError("unexpected-upcoming-visits", suspend=True)
+                booked.add(visit_id)
+        return booked
+
+    def is_booking_blocked_by_penalty(self, city_id: int, service_variant_id: int) -> bool:
+        """Check the portal's no-show restriction for a search without a referral."""
+        content = self._portal_json(
+            "GET",
+            self.NON_SHOW_PENALTIES_URL,
+            params={"cityId": city_id, "serviceVariantId": service_variant_id, "referralId": ""},
+        )
+        can_reserve = content.get("canReserve") if isinstance(content, dict) else None
+        if type(can_reserve) is not bool:
+            raise PortalError("unexpected-penalty-status", suspend=True)
+        return not can_reserve
 
     def get_services(self) -> list[dict]:
         return self._portal_json("GET", self.DICTIONARY_SERVICES_URL)
