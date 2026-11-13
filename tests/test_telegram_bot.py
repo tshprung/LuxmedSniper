@@ -150,6 +150,20 @@ class BotTests(unittest.TestCase):
         self.assertEqual([row["patient"] for row in child_batch], ["patient2"])
         self.assertEqual(self.state.claim_batch(self.now), [])
 
+    def test_portal_session_is_replaced_at_token_expiry(self):
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            first, replacement = MagicMock(), MagicMock()
+            first.token_expires_at = self.now + 60
+            replacement.token_expires_at = None
+            portal.side_effect = [first, replacement]
+            self.assertIs(self.bot.portal_for("patient1"), first)
+            self.now += 59
+            self.assertIs(self.bot.portal_for("patient1"), first)
+            self.now += 1
+            self.assertIs(self.bot.portal_for("patient1"), replacement)
+            first.session.close.assert_called_once()
+            self.assertEqual(portal.call_count, 2)
+
     def test_found_slots_complete_search_and_deliver_once(self):
         self.update(1, "/find Child | routine visit by phone")
         self.bot.flush()

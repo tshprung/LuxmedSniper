@@ -12,9 +12,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile", choices=("patient1", "patient2", "patient3"))
     parser.add_argument("--status-only", action="store_true", help="Omit the slot count from output")
-    parser.add_argument(
+    checks = parser.add_mutually_exclusive_group()
+    checks.add_argument(
         "--booking-check", action="store_true",
         help="Check the upcoming visit and no-show restriction responses without printing their contents",
+    )
+    checks.add_argument(
+        "--booking-preflight", action="store_true",
+        help="Check booking prerequisites without placing a hold",
     )
     args = parser.parse_args()
 
@@ -47,16 +52,28 @@ def main() -> int:
                 city, service_name, clinics, doctors = locator_id.split("*")
                 service_id = portal.resolve_in_person_service(service_name)
                 locator = DoctorLocator(id=f"{city}*{service_id}*{clinics}*{doctors}")
-            if args.booking_check:
+            if args.booking_preflight:
+                portal.check_booking_eligibility(int(locator.city_id), int(locator.service_id))
+                if portal.is_booking_blocked_by_penalty(int(locator.city_id), int(locator.service_id)):
+                    raise PortalError("booking-penalty")
+                portal.booked_visit_ids()
+            elif args.booking_check:
                 portal.booked_visit_ids()
                 portal.is_booking_blocked_by_penalty(int(locator.city_id), int(locator.service_id))
             else:
                 slots = portal.search(locator)
     except PortalError as error:
-        print(error)
+        details = [str(error)]
+        if args.booking_preflight and error.stage:
+            details.append(error.stage)
+            if error.http_status is not None:
+                details.append(f"HTTP {error.http_status}")
+        print(" · ".join(details))
         return 1
 
-    if args.booking_check:
+    if args.booking_preflight:
+        print("booking-preflight-completed")
+    elif args.booking_check:
         print("booking-check-completed")
     elif args.status_only:
         print("search-completed")
