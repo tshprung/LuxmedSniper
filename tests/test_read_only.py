@@ -129,6 +129,7 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(lock.kwargs["json"]["doctorId"], 9)
         self.assertEqual(lock.kwargs["json"]["date"], "2030-04-01T08:00:00.000Z")
         self.assertEqual(lock.kwargs["json"]["timeFrom"], "10:00")
+        self.assertIsNone(lock.kwargs["json"]["referralTypeId"])
         self.assertTrue(confirm.args[1].endswith("/Reservation/Confirm"))
         self.assertEqual(confirm.kwargs["json"]["temporaryReservationId"], 135)
         self.assertEqual(confirm.kwargs["json"]["date"], "2030-04-01T08:00:00.000Z")
@@ -143,21 +144,29 @@ class SearchTests(unittest.TestCase):
         self.assertIsNone(preparation_slot.booking_term)
         self.assertNotIn("private-fixture", repr(preparation_slot))
 
-    def test_booking_warning_or_fee_releases_hold_without_confirmation(self):
+    def test_booking_hold_releases_without_confirmation_if_portal_requires_review(self):
         locator = DoctorLocator(id="5*30*-1*-1")
         term = dict(slot("2030-04-01T10:00:00"), cityId=5, dateTimeTo="2030-04-01T10:15:00",
                     roomId=19, scheduleId=20, isTelemedicine=False, isAdditional=False, isImpediment=False)
         result = {"correlationId": "fixture", "termsForService": {"termsForDays": [{"terms": [term]}]}}
         appointment, = LuxMedPortal._parse_visits_new_portal(result, locator)
-        for warning, price, alternative_price in ((True, 0, None), (False, 25, None), (False, 0, 25)):
-            with self.subTest(warning=warning, price=price, alternative_price=alternative_price):
-                hold = {"hasErrors": False, "hasWarnings": warning, "value": {
-                    "temporaryReservationId": 135, "askForReferral": False,
-                    "valuations": [{
-                        "valuationType": 1, "price": price, "alternativePrice": alternative_price,
-                        "isReferralRequired": False,
-                    }],
-                }}
+        for case in ("warning", "price", "alternative price", "conflict", "change", "portal referral"):
+            with self.subTest(case=case):
+                valuation = {
+                    "valuationType": 1,
+                    "price": 25 if case == "price" else 0,
+                    "alternativePrice": 25 if case == "alternative price" else None,
+                    "isReferralRequired": False,
+                    "requireReferralForPP": case == "portal referral",
+                }
+                hold = {
+                    "hasErrors": False, "hasWarnings": case == "warning",
+                    "value": {
+                        "temporaryReservationId": 135, "askForReferral": False, "valuations": [valuation],
+                        "conflictedVisit": {"eventId": 246} if case == "conflict" else None,
+                        "changeTermAvailable": case == "change",
+                    },
+                }
                 with patch.object(requests.Session, "request", side_effect=[
                     response({"token": "fixture-token"}), response(hold), response({}),
                 ]) as request:
@@ -192,20 +201,23 @@ class AuditCliTests(unittest.TestCase):
         return status, out.getvalue().strip(), request
 
     def test_booking_preflight_reports_the_failed_step_and_stops(self):
-        status, output, request = self.run_audit("patient1", {
-            "LUXMED_PATIENT1_LOGIN": "fixture",
-            "LUXMED_PATIENT1_PASSWORD": "fixture",
-            "LUXMED_PATIENT1_LOCATOR": "8*20*-1*-1",
-        }, [
-            response({"token": "fixture-token"}),
-            response({"canReserve": True}),
-            response({"referrals": []}),
-            response(raw="private-fixture", status=302),
-        ], options=("--booking-preflight",))
-        self.assertEqual((status, output), (1, "session-unconfirmed · questionnaire · HTTP 302"))
-        self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", "GET", "GET", "GET"])
-        self.assertTrue(request.call_args.args[1].endswith("/PNM/Index"))
-        self.assertFalse(request.call_args.kwargs["allow_redirects"])
+        for http_status, error in ((302, "session-unconfirmed"), (401, "access-denied")):
+            with self.subTest(http_status=http_status):
+                status, output, request = self.run_audit("patient1", {
+                    "LUXMED_PATIENT1_LOGIN": "fixture",
+                    "LUXMED_PATIENT1_PASSWORD": "fixture",
+                    "LUXMED_PATIENT1_LOCATOR": "8*20*-1*-1",
+                }, [
+                    response({"token": "fixture-token"}),
+                    response({"canReserve": True}),
+                    response({"referrals": []}),
+                    response(raw="private-fixture", status=http_status),
+                ], options=("--booking-preflight",))
+                self.assertEqual((status, output), (1, f"{error} · questionnaire · HTTP {http_status}"))
+                self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", "GET", "GET", "GET"])
+                self.assertTrue(request.call_args.args[1].endswith("/PNM/Index"))
+                self.assertFalse(request.call_args.kwargs["allow_redirects"])
+                self.assertEqual(request.call_args.kwargs["headers"], {"X-Requested-With": "XMLHttpRequest"})
 
     def test_booking_preflight_checks_eligibility_penalty_and_verification_without_holding(self):
         status, output, request = self.run_audit("patient1", {
