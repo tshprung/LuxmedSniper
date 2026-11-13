@@ -1,3 +1,4 @@
+import base64
 import datetime
 import io
 import json
@@ -82,6 +83,16 @@ class SearchTests(unittest.TestCase):
                 self.assertNotIn("fixture-cookie", second.session.cookies)
                 self.assertEqual(first.session.headers["authorization-token"], "Bearer first-fixture")
                 self.assertEqual(second.session.headers["authorization-token"], "Bearer second-fixture")
+
+    def test_login_records_token_expiry_as_a_cache_hint(self):
+        expiry = int(NOW.timestamp())
+        for claims, expected in (({"exp": expiry}, expiry), ({"exp": True}, None), ({"exp": "invalid"}, None)):
+            with self.subTest(claims=claims):
+                encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+                with patch.object(requests.Session, "request", return_value=response({"token": f"fixture.{encoded}.fixture"})):
+                    portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
+                    with portal.session:
+                        self.assertEqual(portal.token_expires_at, expected)
 
     def test_booking_verification_uses_only_reserved_and_confirmed_visit_ids(self):
         events = [
@@ -179,6 +190,44 @@ class AuditCliTests(unittest.TestCase):
             clock.now.return_value = NOW.replace(hour=hour, minute=0)
             status = audit_search.main()
         return status, out.getvalue().strip(), request
+
+    def test_booking_preflight_reports_the_failed_step_and_stops(self):
+        status, output, request = self.run_audit("patient1", {
+            "LUXMED_PATIENT1_LOGIN": "fixture",
+            "LUXMED_PATIENT1_PASSWORD": "fixture",
+            "LUXMED_PATIENT1_LOCATOR": "8*20*-1*-1",
+        }, [
+            response({"token": "fixture-token"}),
+            response({"canReserve": True}),
+            response({"referrals": []}),
+            response(raw="private-fixture", status=302),
+        ], options=("--booking-preflight",))
+        self.assertEqual((status, output), (1, "session-unconfirmed · questionnaire · HTTP 302"))
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", "GET", "GET", "GET"])
+        self.assertTrue(request.call_args.args[1].endswith("/PNM/Index"))
+        self.assertFalse(request.call_args.kwargs["allow_redirects"])
+
+    def test_booking_preflight_checks_eligibility_penalty_and_verification_without_holding(self):
+        status, output, request = self.run_audit("patient1", {
+            "LUXMED_PATIENT1_LOGIN": "fixture",
+            "LUXMED_PATIENT1_PASSWORD": "fixture",
+            "LUXMED_PATIENT1_LOCATOR": "8*20*-1*-1",
+        }, [
+            response({"token": "fixture-token"}),
+            response({"canReserve": True}),
+            response({"referrals": []}),
+            response({"questions": []}),
+            response({
+                "isNotAvailableInCity": False, "isNotAvailableInContract": False,
+                "isNotAvailableInAreaOfCare": False, "blockedByAccountLevel": False,
+            }),
+            response({"canReserve": True}),
+            response({"events": []}),
+        ], options=("--booking-preflight",))
+        self.assertEqual((status, output), (0, "booking-preflight-completed"))
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", *["GET"] * 6])
+        self.assertEqual(request.call_args_list[-2].args[1], LuxMedPortal.NON_SHOW_PENALTIES_URL)
+        self.assertEqual(request.call_args.args[1], LuxMedPortal.UPCOMING_VISITS_URL)
 
     def test_all_three_profiles_use_only_their_own_configuration(self):
         profiles = ("patient1", "patient2", "patient3")

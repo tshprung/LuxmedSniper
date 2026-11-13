@@ -118,7 +118,8 @@ as requiring preparation, the bot points you to the portal instructions.
 ### Direct Telegram booking pilot
 
 Direct booking defaults to off. The live audit of the worker's session
-encountered a sign-in redirect at the booking limit check. Enable the pilot
+encountered a sign-in redirect at the questionnaire check, after the
+booking limit and referral checks succeeded. Enable the pilot
 only after the worker has an authorized session that passes the portal's
 booking checks. The configuration package accepts the environment variable
 `LUXMED_DIRECT_BOOKING=1` for that rollout.
@@ -152,6 +153,12 @@ only. The upcoming visits response can verify a reservation by its ID when
 the dashboard shows the visit as reserved or confirmed. An absent ID leaves
 the result unknown. A clear no-show restriction check does not establish
 eligibility, payment terms, or calendar availability.
+
+Use `--booking-preflight` to check booking eligibility, no-show restrictions,
+and reservation verification in a fresh session. When the portal rejects
+a booking prerequisite request, the audit reports the check and HTTP status.
+The Telegram worker also discards a cached session when its token's
+expiration is reached, if the portal supplied an expiry timestamp.
 
 The [LUX MED booking guide](https://www.luxmed.pl/dla-pacjenta/portal-pacjenta/rezerwacja-i-zarzadzanie-uslugami)
 describes the reservation summary and timeline. The portal's reservation

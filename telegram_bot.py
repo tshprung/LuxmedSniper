@@ -534,7 +534,13 @@ class SearchBot:
             return cached[1]
         self.close_portal(patient)
         portal = LuxMedPortal(self.profiles[patient].credentials)
-        self.portals[patient] = (now + PORTAL_REUSE_SECONDS, portal)
+        reuse_until = now + PORTAL_REUSE_SECONDS
+        if type(portal.token_expires_at) is int:
+            reuse_until = min(reuse_until, portal.token_expires_at)
+            if reuse_until <= self.clock():
+                portal.session.close()
+                raise PortalError("session-expired", suspend=True)
+        self.portals[patient] = (reuse_until, portal)
         return portal
 
     def close_portal(self, patient: str) -> None:

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import base64
 import copy
 import datetime
 import json
@@ -153,32 +154,50 @@ class LuxMedPortal:
             token = data.get("token") if isinstance(data, dict) else None
             if not isinstance(token, str) or not token or any(not 33 <= ord(char) <= 126 for char in token):
                 raise PortalError("login-unconfirmed", suspend=True)
+            self.token_expires_at = self._token_expiry(token)
             self.session.headers["authorization-token"] = f"Bearer {token}"
         except BaseException:
             self.session.close()
             raise
 
-    def _portal_json(self, method: str, url: str, *, authenticating: bool = False, **kwargs: Any) -> Any:
+    @staticmethod
+    def _token_expiry(token: str) -> int | None:
+        # This hint only shortens reuse. The portal still verifies the session.
+        if token.count(".") != 2:
+            return None
+        _, payload, _ = token.split(".")
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        except (ValueError, RecursionError):
+            return None
+        expires_at = claims.get("exp") if isinstance(claims, dict) else None
+        return expires_at if type(expires_at) is int and expires_at > 0 else None
+
+    def _portal_json(self, method: str, url: str, *, authenticating: bool = False,
+                     stage: str | None = None, **kwargs: Any) -> Any:
         try:
             response = self.session.request(
                 method, url, timeout=PORTAL_TIMEOUT, allow_redirects=False, **kwargs,
             )
         except requests.RequestException:
-            raise PortalError("network-error") from None
-        if response.status_code == 429:
-            raise PortalError("rate-limited", suspend=True)
-        if response.status_code in (401, 403):
-            raise PortalError("access-denied", suspend=True)
-        if 300 <= response.status_code < 400:
-            raise PortalError("login-unconfirmed" if authenticating else "session-unconfirmed", suspend=True)
-        if response.status_code != 200:
-            raise PortalError("portal-error", suspend=authenticating and response.status_code < 500)
+            raise PortalError("network-error", stage=stage) from None
+        status = response.status_code
+        error_context = {"stage": stage, "http_status": status}
+        if status == 429:
+            raise PortalError("rate-limited", suspend=True, **error_context)
+        if status in (401, 403):
+            raise PortalError("access-denied", suspend=True, **error_context)
+        if 300 <= status < 400:
+            raise PortalError("login-unconfirmed" if authenticating else "session-unconfirmed", suspend=True, **error_context)
+        if status != 200:
+            raise PortalError("portal-error", suspend=authenticating and status < 500, **error_context)
         try:
             return response.json()
         except ValueError:
             raise PortalError(
                 "login-unconfirmed" if authenticating else "unexpected-response",
                 suspend=True,
+                **error_context,
             ) from None
 
     def search(self, locator: DoctorLocator, *, days: int = 14, date: datetime.date | None = None) -> list[Appointment]:
@@ -343,22 +362,25 @@ class LuxMedPortal:
 
     def check_booking_eligibility(self, city_id: int, service_variant_id: int) -> None:
         """Check the normal portal prerequisites for an in-person visit without a referral."""
-        limits = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/Reservation/GetLimits")
+        limits = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/Reservation/GetLimits", stage="booking-limits")
         if not isinstance(limits, dict) or limits.get("canReserve") is not True:
             raise PortalError("booking-limit")
-        referrals = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/Reservation/GetReferralsForReservation")
+        referrals = self._portal_json(
+            "GET", f"{self.NEW_PORTAL_URL}/Reservation/GetReferralsForReservation", stage="referrals",
+        )
         if not isinstance(referrals, dict) or not isinstance(referrals.get("referrals"), list) or any(
             not isinstance(referral, dict) or referral.get("serviceVariantId") == service_variant_id
             for referral in referrals["referrals"]
         ):
             raise PortalError("booking-needs-portal")
         params = {"locationId": city_id, "serviceVariantId": service_variant_id, "process": 4}
-        triage = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/PNM/Index", params=params)
+        triage = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/PNM/Index", params=params, stage="questionnaire")
         if not isinstance(triage, dict) or triage.get("questions") not in (None, []):
             raise PortalError("portal-questions")
         availability = self._portal_json(
             "GET", f"{self.NEW_PORTAL_URL}/Reservation/serviceVariantAvailabilityDetails",
             params={"cityId": city_id, "serviceVariantId": service_variant_id, "reservationId": ""},
+            stage="service-eligibility",
         )
         if not isinstance(availability, dict) or any(
             availability.get(key) is not False for key in
@@ -694,9 +716,12 @@ class LuxmedSniperError(Exception):
 
 
 class PortalError(LuxmedSniperError):
-    def __init__(self, status: str, *, suspend: bool = False):
+    def __init__(self, status: str, *, suspend: bool = False,
+                 stage: str | None = None, http_status: int | None = None):
         super().__init__(status)
         self.suspend = suspend
+        self.stage = stage
+        self.http_status = http_status
 
 
 def setup_logging() -> None:
