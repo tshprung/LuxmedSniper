@@ -18,6 +18,8 @@ from telegram_preferences import PreferenceError, Preferences, matching_slots, p
 from telegram_requests import Criteria, PatientServiceMismatch, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
 from telegram_state import SearchState, next_search_time
 
+PORTAL_REUSE_SECONDS = 3600
+
 
 class TelegramError(Exception):
     def __init__(self, *, retry_after: int = 5, stop: bool = False):
@@ -93,6 +95,7 @@ class SearchBot:
         self.profiles = profiles
         self.clock = clock
         self.free_text = free_text
+        self.portals: dict[str, tuple[float, LuxMedPortal]] = {}
         self.cities = city_catalog()
         self.children = {key for key, profile in profiles.items() if profile.child}
         self.aliases = {}
@@ -339,6 +342,25 @@ class SearchBot:
             sent = self.telegram.send(message["text"])
             self.state.sent(message, sent)
 
+    def portal_for(self, patient: str) -> LuxMedPortal:
+        now = self.clock()
+        cached = self.portals.get(patient)
+        if cached is not None and now < cached[0]:
+            return cached[1]
+        self.close_portal(patient)
+        portal = LuxMedPortal(self.profiles[patient].credentials)
+        self.portals[patient] = (now + PORTAL_REUSE_SECONDS, portal)
+        return portal
+
+    def close_portal(self, patient: str) -> None:
+        cached = self.portals.pop(patient, None)
+        if cached is not None:
+            cached[1].session.close()
+
+    def close_portals(self) -> None:
+        for patient in tuple(self.portals):
+            self.close_portal(patient)
+
     def search_due(self) -> None:
         today = dt.datetime.fromtimestamp(self.clock(), WARSAW).date().isoformat()
         with self.state.db:
@@ -350,24 +372,25 @@ class SearchBot:
         if not batch:
             return
         first = batch[0]
-        profile = self.profiles[first["patient"]]
+        patient = first["patient"]
+        profile = self.profiles[patient]
         index = 0
         try:
-            portal = LuxMedPortal(profile.credentials)
-            with portal.session:
-                catalog = portal.get_services()
-                for index, row in enumerate(batch):
-                    now = int(self.clock())
-                    if next_search_time(now) != now:
-                        break
-                    self.search_one(portal, catalog, row)
+            portal = self.portal_for(patient)
+            catalog = portal.get_services()
+            for index, row in enumerate(batch):
+                now = int(self.clock())
+                if next_search_time(now) != now:
+                    break
+                self.search_one(portal, catalog, row)
         except PortalError as error:
             with self.state.db:
                 result = "paused" if error.suspend else "temporary-error"
                 for row in batch[index:]:
                     self.state.record_result(row["id"], int(self.clock()), result)
                 if error.suspend:
-                    self.state.suspend(first["patient"])
+                    self.close_portal(patient)
+                    self.state.suspend(patient)
                     status = "Searches paused. Check the official portal before using /resume."
                 else:
                     status = "LUX MED check failed. The next attempt will be in an eligible hour."
@@ -441,6 +464,13 @@ def main() -> int:
         print("Telegram bot configuration is incomplete.", file=sys.stderr)
         return 2
 
+    try:
+        return run_worker(bot)
+    finally:
+        bot.close_portals()
+
+
+def run_worker(bot: SearchBot) -> int:
     while True:
         try:
             updates = bot.telegram.poll(int(bot.state.get_setting("offset", "0")))

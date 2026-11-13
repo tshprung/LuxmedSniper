@@ -68,7 +68,8 @@ list searches with their last result and next check. Use `Stop 123` to stop
 one, or reply `Stop` to a search's message. Use
 `/change 123 | service | city | filters` to update
 an active search. You can leave the service blank to change only the city.
-An update keeps the search ID, patient and hourly account limit.
+An update keeps the search ID and patient and checks the new criteria at
+the next eligible time.
 If the requested service conflicts with the named patient's age group, the
 worker asks for a corrected request. When every search has ended, the next
 search is numbered #1. A reply to an older message stays tied to that
@@ -89,8 +90,11 @@ Use `Change 123 to after 17:00` or `Change 123 to clear filters` to update
 an active search in plain English. A search for a fixed date window ends
 once those dates have passed.
 
-Searches use a rolling 14-day window and repeat at most hourly during
-06:00–22:00 Europe/Warsaw until slots are found or the search is stopped.
+Searches use a rolling 14-day window. A new search gets its first check
+as soon as the worker can run it during 06:00–22:00 Europe/Warsaw, even
+when another search for the same patient is already running. Each search
+then repeats hourly until slots are found or the search is stopped. The
+worker can reuse a recent signed-in session for that patient's searches.
 After-hours requests queue until the next opening. An access restriction or
 unconfirmed login pauses that account. Check the official Patient Portal
 before using `/resume <patient>`. Availability is returned in the private

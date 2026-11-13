@@ -85,24 +85,34 @@ class BotTests(unittest.TestCase):
         self.update(4, f"Stop {row['id']}")
         self.assertEqual(self.state.active(), [])
 
-    def test_scheduled_batch_uses_one_login_per_patient_per_hour(self):
+    def test_each_new_search_checks_immediately_and_reuses_the_patient_session(self):
         self.update(1, "Find an internist for Adult")
-        self.update(2, "/find Adult | Dermatolog")
-        self.update(3, "/find Child | health check")
         with patch("telegram_bot.LuxMedPortal") as portal:
             portal.return_value.resolve_service.side_effect = [12, 13, 14]
             portal.return_value.search.return_value = []
             self.bot.search_due()
             portal.assert_called_once_with(self.profiles["patient1"].credentials)
-            portal.return_value.get_services.assert_called_once()
+            self.assertEqual(portal.return_value.search.call_count, 1)
+            self.now += 300
+            self.update(2, "/find Adult | Dermatolog")
+            self.bot.search_due()
+            portal.assert_called_once_with(self.profiles["patient1"].credentials)
             self.assertEqual(portal.return_value.search.call_count, 2)
-            self.update(4, "/find Adult | Alergolog")
+            self.now += 300
+            with self.state.db:
+                self.state.db.execute(
+                    "INSERT INTO accounts (patient, next_attempt) VALUES (?, ?)", ("patient2", self.now + 3000),
+                )
+            self.update(3, "/find Child | health check")
             self.bot.search_due()
             self.assertEqual(portal.call_count, 2)
             portal.assert_called_with(self.profiles["patient2"].credentials)
             self.bot.search_due()
             self.assertEqual(portal.call_count, 2)
-        self.assertTrue(all(row["next_due"] >= self.now + 3600 for row in self.state.active()))
+            self.assertEqual(portal.return_value.search.call_count, 3)
+        self.assertEqual([row["next_due"] for row in self.state.active()], [
+            self.now + 3000, self.now + 3300, self.now + 3600,
+        ])
 
     def test_verification_pauses_only_affected_account(self):
         self.update(1, "Find an internist for Adult")
@@ -156,7 +166,7 @@ class BotTests(unittest.TestCase):
         self.assertIn("Last check 30.03 11:00: no matching slots", message)
         self.assertIn("Next check 30.03 12:00 Warsaw time", message)
 
-    def test_change_keeps_id_patient_and_account_cooldown(self):
+    def test_change_keeps_id_and_patient_and_checks_the_new_criteria(self):
         self.update(1, "Find an internist for Adult")
         with patch("telegram_bot.LuxMedPortal") as portal:
             portal.return_value.resolve_service.return_value = 12
@@ -165,9 +175,35 @@ class BotTests(unittest.TestCase):
         self.update(2, "/change 1 | Dermatolog | Kraków")
         row, = self.state.active()
         self.assertEqual((row["id"], row["patient"], row["service"], row["city"]), (1, "patient1", "Dermatolog", "Kraków"))
-        self.assertEqual(row["next_due"], self.now + 3600)
+        self.assertEqual(row["next_due"], self.now)
         self.assertIsNone(row["last_checked"])
         self.assertFalse(row["first_result_sent"])
+
+    def test_migration_releases_unchecked_searches_and_preserves_recurring_times(self):
+        self.update(1, "Find an internist for Adult")
+        self.update(2, "/find Adult | Dermatolog")
+        with self.state.db:
+            self.state.db.execute("DELETE FROM settings WHERE key = 'search_schedule_per_search'")
+            self.state.db.execute("UPDATE searches SET next_due = ?", (self.now + 3600,))
+            self.state.record_result(1, self.now, "no-slots")
+        self.state.db.close()
+        self.state = SearchState(self.path, clock=lambda: self.now + 300)
+        first, second = self.state.active()
+        self.assertEqual(first["next_due"], self.now + 3600)
+        self.assertEqual(second["next_due"], self.now + 300)
+        self.assertEqual([row["id"] for row in self.state.claim_batch(self.now + 300)], [2])
+
+    def test_paused_account_cannot_run_a_new_search(self):
+        self.update(1, "/find Child | health check")
+        with patch("telegram_bot.LuxMedPortal", side_effect=PortalError("rate-limited", suspend=True)):
+            self.bot.search_due()
+        self.update(2, "/find Child | routine visit")
+        self.update(3, "/find Other | routine visit")
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            portal.return_value.search.return_value = []
+            self.bot.search_due()
+            self.bot.search_due()
+            portal.assert_called_once_with(self.profiles["patient3"].credentials)
 
     def test_pediatric_selection_keeps_date_time_and_clinic_preferences(self):
         self.update(1, "Find a pediatrician for Child next week, after 16:00, near Dominikańska.")

@@ -3,6 +3,7 @@
 import datetime as dt
 import json
 import sqlite3
+import time
 from dataclasses import asdict
 
 from luxmed_sniper import WARSAW
@@ -20,7 +21,7 @@ def next_search_time(timestamp: int) -> int:
 
 
 class SearchState:
-    def __init__(self, path):
+    def __init__(self, path, *, clock=time.time):
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -57,6 +58,13 @@ class SearchState:
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS active_search_number ON searches (display_number) WHERE status = 'active'"
             )
+            if not self.get_setting("search_schedule_per_search"):
+                self.db.execute(
+                    """UPDATE searches SET next_due = min(next_due, ?)
+                       WHERE status = 'active' AND last_checked IS NULL AND first_result_sent = 0""",
+                    (next_search_time(int(clock())),),
+                )
+                self.set_setting("search_schedule_per_search", "1")
 
     def get_setting(self, key: str, default: str = "") -> str:
         row = self.db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -87,8 +95,8 @@ class SearchState:
 
     def add(self, criteria: Criteria, now: int) -> tuple[int, int, int, bool]:
         self.db.execute("INSERT OR IGNORE INTO accounts (patient) VALUES (?)", (criteria.patient,))
-        account = self.db.execute("SELECT * FROM accounts WHERE patient = ?", (criteria.patient,)).fetchone()
-        due = next_search_time(max(now, account["next_attempt"]))
+        account = self.db.execute("SELECT suspended FROM accounts WHERE patient = ?", (criteria.patient,)).fetchone()
+        due = next_search_time(now)
         number = self.db.execute(
             """SELECT CASE WHEN EXISTS (SELECT 1 FROM searches WHERE status = 'active')
                THEN (SELECT display_number + 1 FROM searches ORDER BY id DESC LIMIT 1)
@@ -109,7 +117,7 @@ class SearchState:
 
     def active(self) -> list[sqlite3.Row]:
         return self.db.execute(
-            """SELECT searches.*, accounts.suspended, max(next_due, next_attempt) AS next_check
+            """SELECT searches.*, accounts.suspended, next_due AS next_check
                FROM searches JOIN accounts USING (patient)
                WHERE status = 'active' ORDER BY id""",
         ).fetchall()
@@ -121,8 +129,8 @@ class SearchState:
         ).fetchall()
 
     def revise(self, search_id: int, criteria: Criteria, now: int) -> tuple[int, bool]:
-        account = self.db.execute("SELECT * FROM accounts WHERE patient = ?", (criteria.patient,)).fetchone()
-        due = next_search_time(max(now, account["next_attempt"]))
+        account = self.db.execute("SELECT suspended FROM accounts WHERE patient = ?", (criteria.patient,)).fetchone()
+        due = next_search_time(now)
         self.db.execute(
             """UPDATE searches SET service = ?, city_id = ?, city = ?, polish = ?, telephone = ?,
                    next_due = ?, preferences = ?, last_checked = NULL, last_result = NULL, first_result_sent = 0
@@ -174,9 +182,9 @@ class SearchState:
             self.db.execute("BEGIN IMMEDIATE")
             patient = self.db.execute(
                 """SELECT patient FROM searches JOIN accounts USING (patient)
-                   WHERE status = 'active' AND next_due <= ? AND next_attempt <= ? AND suspended = 0
+                   WHERE status = 'active' AND next_due <= ? AND suspended = 0
                    ORDER BY next_due, id LIMIT 1""",
-                (now, now),
+                (now,),
             ).fetchone()
             if patient is None:
                 return []
@@ -186,6 +194,5 @@ class SearchState:
                 (patient["patient"], now),
             ).fetchall()
             retry_at = next_search_time(now + 3600)
-            self.db.execute("UPDATE accounts SET next_attempt = ? WHERE patient = ?", (retry_at, patient["patient"]))
             self.db.executemany("UPDATE searches SET next_due = ? WHERE id = ?", ((retry_at, row["id"]) for row in rows))
             return rows
