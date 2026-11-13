@@ -81,10 +81,6 @@ def configured_profiles(settings: dict, metadata: dict) -> dict[str, Profile]:
     return profiles
 
 
-def localized(polish: bool, english: str, translated: str) -> str:
-    return translated if polish else english
-
-
 def local_time(timestamp: int) -> str:
     return dt.datetime.fromtimestamp(timestamp, WARSAW).strftime("%d.%m %H:%M")
 
@@ -131,20 +127,19 @@ class SearchBot:
         text = message["text"].strip()
         key = normalize(text)
         command, _, argument = key.partition(" ")
-        polish = command in {"/szukaj", "znajdz", "szukaj", "poszukaj", "zatrzymaj", "/zatrzymaj", "aktywne", "/aktywne", "wznow", "/wznow", "/zmien", "zmien"}
-        if command in {"stop", "/stop", "zatrzymaj", "/zatrzymaj"}:
-            self.stop(argument, polish, message.get("reply_to_message") or {})
-        elif key in {"/active", "active", "show active searches", "show running searches", "/aktywne", "aktywne", "pokaz aktywne"}:
-            self.show_active(polish or key == "pokaz aktywne")
-        elif command in {"/change", "change", "/zmien", "zmien"}:
-            self.change(text, polish)
-        elif command in {"/resume", "resume", "/wznow", "wznow"}:
+        if command in {"stop", "/stop"}:
+            self.stop(argument, message.get("reply_to_message") or {})
+        elif key in {"/active", "active", "show active searches", "show running searches"}:
+            self.show_active()
+        elif command in {"/change", "change"}:
+            self.change(text)
+        elif command in {"/resume", "resume"}:
             patient = self.aliases.get(argument)
             if patient and self.state.resume(patient):
-                self.state.queue_message(localized(polish, "Searches resumed for the next eligible hour.", "Wznowiono wyszukiwania na najbliższą dostępną godzinę."))
+                self.state.queue_message("Searches resumed for the next eligible hour.")
             else:
-                self.state.queue_message(localized(polish, "Use /resume followed by a paused patient's name.", "Użyj /wznow i podaj pacjenta ze wstrzymanym wyszukiwaniem."))
-        elif len(text) <= 600 and key not in {"/start", "/help", "help", "/pomoc", "pomoc"}:
+                self.state.queue_message("Use /resume followed by a paused patient's name.")
+        elif len(text) <= 600 and key not in {"/start", "/help", "help"}:
             self.handle_search(text)
         else:
             self.help()
@@ -158,8 +153,10 @@ class SearchBot:
             error_message = str(error)
         pending = self.state.get_setting("pending")
         if criteria is None and pending and error_message is None:
-            candidate = Criteria(**json.loads(pending))
-            if service := pediatric_choice(text, candidate.polish):
+            fields = json.loads(pending)
+            fields.pop("polish", None)  # Pending choices saved by the bilingual worker.
+            candidate = Criteria(**fields)
+            if service := pediatric_choice(text):
                 criteria = replace(candidate, service=service, telephone="telefonicz" in normalize(service))
         if criteria is None and self.free_text is not None and not text.startswith("/"):
             try:
@@ -168,24 +165,24 @@ class SearchBot:
                 error_message = str(error)
         if criteria and not criteria.service:
             self.state.set_setting("pending", json.dumps(asdict(criteria)))
-            self.state.queue_message(pediatric_menu(criteria.polish))
+            self.state.queue_message(pediatric_menu())
         elif criteria:
             self.state.set_setting("pending", "")
             self.start(criteria)
         elif error_message:
             self.state.queue_message(error_message)
         elif pending:
-            self.state.queue_message(pediatric_menu(Criteria(**json.loads(pending)).polish))
+            self.state.queue_message(pediatric_menu())
         else:
             self.help()
 
     def help(self) -> None:
         self.state.queue_message(
-            "Read-only availability / Wyszukiwanie terminów\n"
-            "Find an internist for <patient>\nZnajdź pediatrę dla <pacjent>\n"
-            "/find patient | portal service | city\n/szukaj pacjent | usługa | miasto\n"
-            "/active /aktywne · Stop <number> / Zatrzymaj <numer>\n"
-            "/change number | service | city\n/zmień numer | usługa | miasto",
+            "Read-only appointment search\n"
+            "Find an internist for <patient>\nFind a pediatrician for <patient>\n"
+            "/find patient | portal service | city\n"
+            "/active · Stop <number>\n"
+            "/change number | service | city",
         )
 
     def start(self, criteria: Criteria) -> None:
@@ -196,69 +193,68 @@ class SearchBot:
     def confirm_search(self, search_id: int, criteria: Criteria, due: int, paused: bool, now: int, *, changed: bool = False) -> None:
         profile = self.profiles[criteria.patient]
         if paused:
-            status = localized(criteria.polish, "Paused. Check the portal, then use /resume.", "Wstrzymano. Sprawdź Portal Pacjenta, a potem użyj /wznow.")
+            status = "Paused. Check the portal, then use /resume."
         elif due > now:
-            status = localized(criteria.polish, f"Queued for {local_time(due)} Warsaw time.", f"W kolejce na {local_time(due)} czasu polskiego.")
+            status = f"Queued for {local_time(due)} Warsaw time."
         else:
-            status = localized(criteria.polish, "Checking availability. I’ll send the first result when the check finishes.", "Sprawdzam dostępność. Wyślę pierwszy wynik po zakończeniu sprawdzania.")
-        prefix = localized(criteria.polish, "Updated\n", "Zmieniono\n") if changed else ""
+            status = "Checking availability. I’ll send the first result when the check finishes."
+        prefix = "Updated\n" if changed else ""
         self.state.queue_message(f"{prefix}#{search_id} · {profile.name} · {criteria.service} · {criteria.city}\n{status}", search_id)
 
-    def change(self, text: str, polish: bool) -> None:
+    def change(self, text: str) -> None:
         parts = [part.strip() for part in text.split("|")]
         number = parts[0].split(maxsplit=1)
         if len(text) > 600 or len(parts) not in (2, 3) or len(number) != 2 or not re.fullmatch(r"#?[0-9]{1,18}", number[1]):
-            self.state.queue_message(localized(polish, "Use /change number | service | city.", "Użyj /zmień numer | usługa | miasto."))
+            self.state.queue_message("Use /change number | service | city.")
             return
         search_id = int(number[1].lstrip("#"))
         row = next((item for item in self.state.active() if item["id"] == search_id), None)
         if row is None:
-            self.state.queue_message(localized(polish, f"Search #{search_id} is inactive.", f"Wyszukiwanie #{search_id} jest nieaktywne."))
+            self.state.queue_message(f"Search #{search_id} is inactive.")
             return
         service = parts[1] or row["service"]
         city = parts[2] if len(parts) == 3 and parts[2] else row["city"]
-        command = "/szukaj" if polish else "/find"
         try:
-            criteria = parse_search(f"{command} {row['patient']} | {service} | {city}", self.aliases, self.children, self.cities)
+            criteria = parse_search(f"/find {row['patient']} | {service} | {city}", self.aliases, self.children, self.cities)
         except RequestError as error:
             self.state.queue_message(str(error))
             return
         if not criteria.service:
-            self.state.queue_message(localized(polish, "Choose a specific pediatric visit type in /change, such as routine visit.", "Podaj konkretny rodzaj wizyty pediatrycznej w /zmień, np. bilans."))
+            self.state.queue_message("Choose a specific pediatric visit type in /change, such as routine visit.")
             return
         if (criteria.service, criteria.city_id, criteria.telephone) == (row["service"], row["city_id"], bool(row["telephone"])):
-            self.state.queue_message(localized(polish, f"Search #{search_id} already uses those settings.", f"Wyszukiwanie #{search_id} ma już te ustawienia."))
+            self.state.queue_message(f"Search #{search_id} already uses those settings.")
             return
         now = int(self.clock())
         due, paused = self.state.revise(search_id, criteria, now)
         self.confirm_search(search_id, criteria, due, paused, now, changed=True)
 
-    def show_active(self, polish: bool) -> None:
+    def show_active(self) -> None:
         rows = self.state.active()
         if not rows:
-            self.state.queue_message(localized(polish, "No active searches.", "Brak aktywnych wyszukiwań."))
+            self.state.queue_message("No active searches.")
             return
         for index in range(0, len(rows), 10):
             lines = []
             for row in rows[index:index + 10]:
                 heading = f"#{row['id']} · {self.profiles[row['patient']].name} · {row['service']} · {row['city']}"
                 if row["last_checked"] is None:
-                    last = localized(polish, "Awaiting a recorded result", "Oczekuję na zapisany wynik")
+                    last = "Awaiting a recorded result"
                 else:
                     result = {
-                        "no-slots": localized(polish, "no matching slots", "brak pasujących terminów"),
-                        "paused": localized(polish, "paused", "wstrzymano"),
-                        "temporary-error": localized(polish, "temporary error", "błąd tymczasowy"),
-                    }.get(row["last_result"], localized(polish, "checked", "sprawdzono"))
-                    last = localized(polish, f"Last check {local_time(row['last_checked'])}: {result}", f"Ostatnie sprawdzenie {local_time(row['last_checked'])}: {result}")
+                        "no-slots": "no matching slots",
+                        "paused": "paused",
+                        "temporary-error": "temporary error",
+                    }.get(row["last_result"], "checked")
+                    last = f"Last check {local_time(row['last_checked'])}: {result}"
                 next_at = local_time(row["next_check"])
-                upcoming = localized(polish, f"Next check {next_at} Warsaw time", f"Następne sprawdzenie {next_at} czasu polskiego")
+                upcoming = f"Next check {next_at} Warsaw time"
                 if row["suspended"]:
-                    upcoming = localized(polish, "Paused. Use /resume after checking the portal.", "Wstrzymano. Sprawdź portal i użyj /wznow.")
+                    upcoming = "Paused. Use /resume after checking the portal."
                 lines.append(f"{heading}\n{last}\n{upcoming}")
             self.state.queue_message("\n\n".join(lines))
 
-    def stop(self, argument: str, polish: bool, reply: dict) -> None:
+    def stop(self, argument: str, reply: dict) -> None:
         search_id = None
         if argument:
             if re.fullmatch(r"#?[0-9]{1,18}", argument):
@@ -267,18 +263,18 @@ class SearchBot:
             search_id = self.state.search_for_message(reply["message_id"])
         elif self.state.get_setting("pending"):
             self.state.set_setting("pending", "")
-            self.state.queue_message(localized(polish, "Pending selection cleared.", "Anulowano wybór rodzaju wizyty."))
+            self.state.queue_message("Pending selection cleared.")
             return
         else:
             rows = self.state.active()
             if len(rows) == 1:
                 search_id = rows[0]["id"]
         if search_id is None:
-            self.state.queue_message(localized(polish, "Use Stop with a search number from /active.", "Użyj Zatrzymaj z numerem z /aktywne."))
+            self.state.queue_message("Use Stop with a search number from /active.")
         elif self.state.finish(search_id, "stopped"):
-            self.state.queue_message(localized(polish, f"Stopped search #{search_id}.", f"Zatrzymano wyszukiwanie #{search_id}."))
+            self.state.queue_message(f"Stopped search #{search_id}.")
         else:
-            self.state.queue_message(localized(polish, f"Search #{search_id} is inactive.", f"Wyszukiwanie #{search_id} jest nieaktywne."))
+            self.state.queue_message(f"Search #{search_id} is inactive.")
 
     def flush(self) -> None:
         while (message := self.state.next_message()) is not None:
@@ -308,9 +304,9 @@ class SearchBot:
                     self.state.record_result(row["id"], int(self.clock()), result)
                 if error.suspend:
                     self.state.suspend(first["patient"])
-                    status = localized(first["polish"], "Searches paused. Check the official portal before using /resume.", "Wstrzymano wyszukiwania. Sprawdź Portal Pacjenta przed użyciem /wznow.")
+                    status = "Searches paused. Check the official portal before using /resume."
                 else:
-                    status = localized(first["polish"], "LUX MED check failed. The next attempt will be in an eligible hour.", "Wyszukiwanie w LUX MED nie powiodło się. Ponowię próbę w najbliższym dostępnym oknie.")
+                    status = "LUX MED check failed. The next attempt will be in an eligible hour."
                 self.state.queue_message(f"{profile.name} · {status}")
 
     def search_one(self, portal: LuxMedPortal, catalog: list, row) -> None:
@@ -322,7 +318,7 @@ class SearchBot:
                 raise
             with self.state.db:
                 if self.state.finish(search_id, "service-unresolved"):
-                    status = localized(row["polish"], "I couldn't match a unique service. Try its exact portal label.", "Nie udało się dopasować jednej usługi. Podaj dokładną nazwę z Portalu Pacjenta.")
+                    status = "I couldn't match a unique service. Try its exact portal label."
                     self.state.queue_message(f"#{search_id} · {status}", search_id)
             return
 
@@ -334,24 +330,20 @@ class SearchBot:
                 if next_check is not None and self.state.mark_first_result(search_id):
                     name = self.profiles[row["patient"]].name
                     due = local_time(next_check)
-                    status = localized(
-                        row["polish"],
-                        f"No matching slots in the next 14 days. I’ll check hourly from 06:00 to 22:00 Warsaw time and message you if I find one. Next check: {due}.",
-                        f"Brak pasujących terminów w ciągu 14 dni. Będę sprawdzać co godzinę od 06:00 do 22:00 czasu polskiego i dam znać, gdy coś znajdę. Następne sprawdzenie: {due}.",
-                    )
+                    status = f"No matching slots in the next 14 days. I’ll check hourly from 06:00 to 22:00 Warsaw time and message you if I find one. Next check: {due}."
                     self.state.queue_message(f"#{search_id} · {name} · {row['service']} · {row['city']}\n{status}", search_id)
             return
         with self.state.db:
             if not self.state.finish(search_id, "found"):
                 return
             name = self.profiles[row["patient"]].name
-            heading = localized(row["polish"], "Available slots", "Dostępne terminy")
+            heading = "Available slots"
             lines = [f"#{search_id} · {name} · {row['service']} · {row['city']}", heading]
             for slot in sorted(slots, key=lambda item: item.AppointmentDate)[:3]:
                 start = slot.AppointmentDate.astimezone(WARSAW).strftime("%d.%m %H:%M")
                 details = [start, slot.ClinicPublicName, slot.DoctorName]
                 lines.append(" · ".join(str(value)[:160].strip() for value in details if value))
-            lines.append(localized(row["polish"], "Search finished. Use the Patient Portal to book.", "Wyszukiwanie zakończone. Rezerwację wykonasz w Portalu Pacjenta."))
+            lines.append("Search finished. Use the Patient Portal to book.")
             self.state.queue_message("\n".join(lines), search_id)
 
 
