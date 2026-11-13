@@ -13,14 +13,14 @@ DATE = r"(?:today|tomorrow|this week|next week|(?:on\s+)?(?:[0-9]{4}-[0-9]{2}-[0
 FILTER = re.compile(
     rf"\s*(?:,\s*)?(?:(?P<date>{DATE})|"
     rf"(?P<between>between\s+{TIME}\s+and\s+{TIME})|"
-    rf"(?P<time>(?:at|around|after|before)\s+{TIME})|"
+    rf"(?P<time>any\s+time|(?:at|around|after|before)\s+{TIME})|"
     r"(?P<doctor>with\s+(?:dr\.?\s+|doctor\s+)?[^,]+?)|"
     r"(?P<clinic>(?:clinic|near|preferably\s+at|only\s+at|at)\s+[^,]+?))"
-    rf"(?=\s*(?:,|$)|\s+(?:{DATE}|between\b|after\b|before\b|around\b|at\b|with\b|clinic\b|near\b|preferably\b|only\b))",
+    rf"(?=\s*(?:,|$)|\s+(?:{DATE}|any\s+time\b|between\b|after\b|before\b|around\b|at\b|with\b|clinic\b|near\b|preferably\b|only\b))",
     re.IGNORECASE,
 )
 FILTER_START = re.compile(
-    rf"(?:,\s*|\s+)(?={DATE}(?:\s|,|$)|(?:between|after|before|around|at|with|clinic|near|preferably|only)\s)",
+    rf"(?:,\s*|\s+)(?=(?:{DATE}|any\s+time)(?:\s|[,?.]|$)|(?:between|after|before|around|at|with|clinic|near|preferably|only)\s)",
     re.IGNORECASE,
 )
 
@@ -100,6 +100,7 @@ def date_range(value: str, today: dt.date) -> tuple[str, str]:
 
 
 def split_preferences(text: str) -> tuple[str, str]:
+    text = text.rstrip("?.")
     boundary = FILTER_START.search(text)
     if boundary is None:
         return text, ""
@@ -131,6 +132,10 @@ def parse_preferences(text: str, today: dt.date, base: Preferences = Preferences
             base = replace(base, time_rule="between", start_minute=lower, end_minute=upper)
         elif kind == "time":
             rule, time = value.split(maxsplit=1)
+            if rule.casefold() == "any":
+                base = replace(base, time_rule=None, start_minute=None, end_minute=None)
+                text = text[match.end():]
+                continue
             rule = "at" if rule.casefold() == "around" else rule.casefold()
             minute = clock_minutes(time)
             if (rule == "before" and minute == 0) or (rule == "after" and minute == 1439):

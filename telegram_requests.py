@@ -45,6 +45,12 @@ GENERAL_SERVICES = {
     "laryngologa": "Laryngolog",
 }
 PEDIATRIC_REQUESTS = {"pediatrician", "paediatrician", "pediatric consultation", "pediatric visit", "pediatra", "pediatre", "pediatry"}
+PEDIATRIC_ALIASES = {
+    "sick child": "sick visit",
+    "sick kids": "sick visit",
+    "sick child nfz": "sick visit NFZ",
+    "sick kids nfz": "sick visit NFZ",
+}
 GENERAL_REQUESTS = {"doctor", "lekarz", "lekarza"}
 
 
@@ -104,6 +110,16 @@ def parse_search(text: str, aliases: dict[str, str], children: set[str], cities:
         service, patient_name, city_name = phrase.groups()
         service = re.sub(r"^(?:a|an)\s+", "", service, flags=re.IGNORECASE)
         city_name = city_name or "Wrocław"
+        if normalize(service) in PEDIATRIC_REQUESTS and normalize(patient_name) not in aliases:
+            patient_phrase = normalize(patient_name)
+            for alias in sorted(aliases, key=len, reverse=True):
+                if patient_phrase.startswith(alias + " "):
+                    visit_type = patient_phrase[len(alias):].strip(" ,")
+                    service = pediatric_choice(visit_type, allow_number=False)
+                    if service is None:
+                        raise RequestError("I couldn't match that pediatric visit type. Try “sick kids NFZ” or use the exact portal label.")
+                    patient_name = alias
+                    break
 
     patient = aliases.get(normalize(patient_name))
     if patient is None:
@@ -135,6 +151,11 @@ def parse_search(text: str, aliases: dict[str, str], children: set[str], cities:
 
 def pediatric_choice(text: str, *, allow_number: bool = True) -> str | None:
     key = normalize(text)
+    for prefix in sorted(PEDIATRIC_REQUESTS, key=len, reverse=True):
+        if key.startswith(prefix + " "):
+            key = key[len(prefix):].strip()
+            break
+    key = normalize(PEDIATRIC_ALIASES.get(key, key))
     if allow_number and key.isascii() and key.isdecimal() and len(key) <= 2:
         index = int(key) - 1
         if 0 <= index < len(PEDIATRIC_SERVICES):

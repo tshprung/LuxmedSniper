@@ -185,6 +185,28 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.state.criteria(edited).preferences.start_minute, 1020)
         self.assertEqual(self.state.criteria(edited).preferences.clinic, "Dominikańska")
 
+    def test_sick_kids_nfz_after_patient_and_any_time(self):
+        self.update(1, "Find a pediatrician for child sick kids nfz next week any time")
+        row, = self.state.active()
+        criteria = self.state.criteria(row)
+        self.assertEqual(criteria.patient, "patient2")
+        self.assertEqual(criteria.service, "Konsultacja pediatryczna - gabinet dzieci chorych NFZ (POZ)")
+        self.assertFalse(criteria.telephone)
+        self.assertEqual((criteria.preferences.first_date, criteria.preferences.last_date), ("2030-04-01", "2030-04-07"))
+        self.assertIsNone(criteria.preferences.time_rule)
+        self.assertIn("gabinet dzieci chorych NFZ (POZ)", self.state.next_message()["text"])
+        self.assertEqual(self.state.get_setting("pending"), "")
+        self.update(2, "Change 1 to after 16:00")
+        self.update(3, "Change 1 to any time")
+        edited = self.state.criteria(self.state.active()[0])
+        self.assertIsNone(edited.preferences.time_rule)
+        self.assertEqual(edited.preferences.first_date, "2030-04-01")
+
+    def test_unknown_pediatric_visit_type_does_not_start_a_generic_search(self):
+        self.update(1, "Find a pediatrician for Child sick kids NFZ by video next week")
+        self.assertEqual(self.state.active(), [])
+        self.assertIn("couldn't match that pediatric visit type", self.state.next_message()["text"])
+
     def test_pediatric_search_for_adult_requires_a_new_request(self):
         self.update(1, "Find a pediatrician for Adult next week, after 16:00, near Dominikańska.")
         self.assertIn("Adult is configured as an adult, and pediatrics is for children.", self.state.next_message()["text"])

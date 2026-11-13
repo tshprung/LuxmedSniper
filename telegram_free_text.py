@@ -8,6 +8,7 @@ import requests
 from telegram_requests import (
     GENERAL_REQUESTS,
     GENERAL_SERVICES,
+    PEDIATRIC_ALIASES,
     PEDIATRIC_PREFIX,
     PEDIATRIC_REQUESTS,
     PEDIATRIC_SERVICES,
@@ -54,6 +55,8 @@ def redacted_request(text: str, aliases: dict, cities: dict):
         label = PEDIATRIC_PREFIX + suffix
         for alias in (english, polish, label):
             services[normalize(alias)] = label
+    for alias, service in PEDIATRIC_ALIASES.items():
+        services[alias] = services[normalize(service)]
 
     locations = {name: city[1] for name, city in cities.items()}
     terms = {
@@ -71,6 +74,9 @@ def redacted_request(text: str, aliases: dict, cities: dict):
         return kind
 
     redacted = re.sub(rf"(?<!\w)(?:{known})(?!\w)", replace_term, clean(text))
+    # A generic pediatrician mention can accompany one specific visit type.
+    if len(matches["SERVICE"]) > 1 and any(service.startswith(PEDIATRIC_PREFIX) for service in matches["SERVICE"]):
+        matches["SERVICE"].difference_update(PEDIATRIC_REQUESTS)
     if len(matches["PERSON"]) != 1 or len(matches["SERVICE"]) != 1 or len(matches["CITY"]) > 1:
         return None
     if any(word not in SCHEDULING_WORDS and word not in matches for word in redacted.split()):
