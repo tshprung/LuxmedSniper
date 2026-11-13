@@ -11,7 +11,7 @@ import time
 import typing
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
@@ -89,6 +89,8 @@ class Appointment:
     DoctorName: str
     service_id: int
     doctor_search_name: str = ""
+    doctor_id: int | None = None
+    booking_term: dict | None = field(default=None, repr=False)
 
 
 class Luxmed(BaseModel):
@@ -127,6 +129,7 @@ class LuxmedSniper(BaseModel):
 
 
 class LuxMedPortal:
+    NEW_PORTAL_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal'
     LUXMED_LOGIN_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/Account/LogIn'
     NEW_PORTAL_RESERVATION_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/terms/index'
 
@@ -177,7 +180,7 @@ class LuxMedPortal:
                 suspend=True,
             ) from None
 
-    def search(self, locator: DoctorLocator, *, days: int = 14) -> list[Appointment]:
+    def search(self, locator: DoctorLocator, *, days: int = 14, date: datetime.date | None = None) -> list[Appointment]:
         now = datetime.datetime.now(tz=datetime.UTC)
         end = now + datetime.timedelta(days=days)
         params = {
@@ -185,9 +188,9 @@ class LuxMedPortal:
             "searchPlace.type": 0,
             "serviceVariantId": locator.service_id.split(",")[0],
             "languageId": 10,
-            "searchDateFrom": now.astimezone(WARSAW).date().isoformat(),
-            "searchDateTo": end.astimezone(WARSAW).date().isoformat(),
-            "searchDatePreset": days,
+            "searchDateFrom": (date or now.astimezone(WARSAW).date()).isoformat(),
+            "searchDateTo": (date or end.astimezone(WARSAW).date()).isoformat(),
+            "searchDatePreset": 1 if date else days,
             "delocalized": "false",
             "processId": str(uuid.uuid4()),
         }
@@ -200,12 +203,17 @@ class LuxMedPortal:
             appointments = self._parse_visits_new_portal(content, locator)
         except (KeyError, TypeError, ValueError, OverflowError):
             raise PortalError("unexpected-response", suspend=True) from None
-        return [appointment for appointment in appointments if now <= appointment.AppointmentDate <= end]
+        return [
+            appointment for appointment in appointments
+            if now <= appointment.AppointmentDate <= end
+            and (date is None or appointment.AppointmentDate.date() == date)
+        ]
 
     @staticmethod
     def _parse_visits_new_portal(content: Any, locator: DoctorLocator) -> list[Appointment]:
         appointments = []
-        days = content["termsForService"]["termsForDays"]
+        terms_for_service = content["termsForService"]
+        days = terms_for_service["termsForDays"]
         if not isinstance(days, list):
             raise ValueError("Expected a list of days")
         for day in days:
@@ -231,9 +239,37 @@ class LuxMedPortal:
                         f"{doctor['academicTitle']} {doctor['firstName']} {doctor['lastName']}",
                         term["serviceId"],
                         doctor_search_name=f"{doctor['firstName']} {doctor['lastName']}",
+                        doctor_id=doctor_id,
+                        booking_term=LuxMedPortal._booking_term(term, terms_for_service, content.get("correlationId")),
                     ),
                 )
         return appointments
+
+    @staticmethod
+    def _booking_term(term: dict, service: dict, correlation_id) -> dict | None:
+        """Keep the fields the standard in-person reservation flow needs in memory."""
+        if (
+            not isinstance(correlation_id, str) or not correlation_id
+            or term.get("isTelemedicine") is not False
+            or any(term.get(key) is not False for key in ("isAdditional", "isImpediment"))
+            or any(type(term.get(key)) is not int or term[key] <= 0
+                   for key in ("cityId", "serviceId", "clinicId", "roomId", "scheduleId"))
+        ):
+            return None
+        additional = service.get("additionalData") or {}
+        if not isinstance(additional, dict) or additional.get("isPreparationRequired", False) is not False:
+            return None
+        try:
+            start, end = (datetime.datetime.fromisoformat(term[key]) for key in ("dateTimeFrom", "dateTimeTo"))
+        except (KeyError, TypeError, ValueError):
+            return None
+        return {
+            "correlationId": correlation_id, "roomId": term["roomId"], "scheduleId": term["scheduleId"],
+            "cityId": term["cityId"], "cityName": term.get("city"),
+            "doctor": {key: term["doctor"][key] for key in ("id", "academicTitle", "firstName", "lastName")},
+            "start": start.astimezone(WARSAW) if start.tzinfo else start.replace(tzinfo=WARSAW),
+            "end": end.astimezone(WARSAW) if end.tzinfo else end.replace(tzinfo=WARSAW),
+        }
 
     def get_cities(self) -> list[dict]:
         return self._portal_json("GET", self.DICTIONARY_CITIES_URL)
@@ -261,6 +297,34 @@ class LuxMedPortal:
                 booked.add(visit_id)
         return booked
 
+    def has_booking_conflict(self, start: datetime.datetime, end: datetime.datetime) -> bool:
+        """Check overlaps against the upcoming events used on the portal search page."""
+        content = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/terms/getevents")
+        events = content.get("events") if isinstance(content, dict) else None
+        if not isinstance(events, list):
+            raise PortalError("booking-conflicts-unknown")
+        try:
+            for event in events:
+                begins = datetime.datetime.fromisoformat(event["date"])
+                begins = begins if begins.tzinfo else begins.replace(tzinfo=WARSAW)
+                if begins >= end:
+                    continue
+                if start <= begins:
+                    return True
+                if begins.astimezone(WARSAW).date() != start.astimezone(WARSAW).date():
+                    continue
+                if event.get("dateTo") is None:
+                    raise PortalError("booking-conflicts-unknown")
+                finishes = datetime.datetime.fromisoformat(event["dateTo"])
+                finishes = finishes if finishes.tzinfo else finishes.replace(tzinfo=WARSAW)
+                if finishes <= begins:
+                    raise PortalError("booking-conflicts-unknown")
+                if finishes > start:
+                    return True
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise PortalError("booking-conflicts-unknown") from None
+        return False
+
     def is_booking_blocked_by_penalty(self, city_id: int, service_variant_id: int) -> bool:
         """Check the portal's no-show restriction for a search without a referral."""
         content = self._portal_json(
@@ -272,6 +336,99 @@ class LuxMedPortal:
         if type(can_reserve) is not bool:
             raise PortalError("unexpected-penalty-status", suspend=True)
         return not can_reserve
+
+    def check_booking_eligibility(self, city_id: int, service_variant_id: int) -> None:
+        """Check the normal portal prerequisites for an in-person visit without a referral."""
+        limits = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/Reservation/GetLimits")
+        if not isinstance(limits, dict) or limits.get("canReserve") is not True:
+            raise PortalError("booking-limit")
+        referrals = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/Reservation/GetReferralsForReservation")
+        if not isinstance(referrals, dict) or not isinstance(referrals.get("referrals"), list) or any(
+            not isinstance(referral, dict) or referral.get("serviceVariantId") == service_variant_id
+            for referral in referrals["referrals"]
+        ):
+            raise PortalError("booking-needs-portal")
+        params = {"locationId": city_id, "serviceVariantId": service_variant_id, "process": 4}
+        triage = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/PNM/Index", params=params)
+        if not isinstance(triage, dict) or triage.get("questions") not in (None, []):
+            raise PortalError("portal-questions")
+        availability = self._portal_json(
+            "GET", f"{self.NEW_PORTAL_URL}/Reservation/serviceVariantAvailabilityDetails",
+            params={"cityId": city_id, "serviceVariantId": service_variant_id, "reservationId": ""},
+        )
+        if not isinstance(availability, dict) or any(
+            availability.get(key) is not False for key in
+            ("isNotAvailableInCity", "isNotAvailableInContract", "isNotAvailableInAreaOfCare", "blockedByAccountLevel")
+        ):
+            raise PortalError("booking-eligibility")
+
+    def reserve_standard_visit(self, appointment: Appointment, service_name: str) -> int:
+        """Hold and confirm one routine covered visit. Return its reservation ID."""
+        term = appointment.booking_term
+        if term is None or appointment.doctor_id is None:
+            raise PortalError("booking-details-missing")
+        payload = {
+            "cityId": term["cityId"], "cityName": term["cityName"], "serviceVariantId": appointment.service_id,
+            "serviceVariantName": service_name,
+            "facilityId": appointment.clinic_id, "facilityName": appointment.ClinicPublicName,
+            "doctorId": appointment.doctor_id, "doctor": term["doctor"],
+            "roomId": term["roomId"], "scheduleId": term["scheduleId"],
+            "date": term["start"].isoformat(), "timeFrom": term["start"].strftime("%H:%M"),
+            "timeTo": term["end"].strftime("%H:%M"), "correlationId": term["correlationId"],
+            "isTelemedicine": False, "isPoz": False, "isRehabilitation": False, "isVideoConsultation": False,
+            "isAdditional": False, "isImpediment": False, "isPreparationRequired": False,
+            "parentReservationId": None, "referralId": None, "eReferralId": None, "executedTriageId": None,
+        }
+        base = f"{self.NEW_PORTAL_URL}/Reservation"
+        hold = self._portal_json("POST", f"{base}/LockTerm", json=payload)
+        value = hold.get("value") if isinstance(hold, dict) else None
+        if not isinstance(value, dict):
+            raise PortalError("booking-hold-unavailable")
+        hold_id = value.get("temporaryReservationId")
+        if type(hold_id) is not int or hold_id <= 0:
+            raise PortalError("booking-hold-unavailable")
+        valuations = value.get("valuations")
+        valuation = valuations[0] if isinstance(valuations, list) and len(valuations) == 1 else None
+        can_confirm = (
+            hold.get("hasErrors") is False and hold.get("hasWarnings") is False
+            and hold.get("errors", []) == [] and hold.get("warnings", []) == []
+            and value.get("askForReferral") is False and value.get("relatedVisits") in (None, [])
+            and isinstance(valuation, dict)
+            and type(valuation.get("valuationType")) is int and valuation["valuationType"] == 1  # InPackage.
+            and type(valuation.get("price")) in (int, float) and valuation["price"] == 0
+            and valuation.get("alternativePrice", 0) == 0
+            and valuation.get("isReferralRequired") is False
+        )
+        if not can_confirm:
+            self.release_booking_hold(hold_id)
+            raise PortalError("booking-needs-portal")
+        confirmation = {key: payload[key] for key in (
+            "cityId", "serviceVariantId", "doctorId", "facilityId", "roomId", "scheduleId",
+            "date", "timeFrom", "parentReservationId", "referralId", "eReferralId", "executedTriageId",
+        )}
+        confirmation.update(temporaryReservationId=hold_id, referralRequired=False, valuationId=None, valuation=valuation)
+        try:
+            result = self._portal_json("POST", f"{base}/Confirm", json=confirmation)
+        except PortalError as error:
+            raise PortalError("booking-outcome-unknown", suspend=error.suspend) from None
+        if isinstance(result, dict) and result.get("hasErrors") is True:
+            self.release_booking_hold(hold_id)
+            raise PortalError("booking-rejected")
+        value = result.get("value") if isinstance(result, dict) and result.get("hasErrors") is False else None
+        reservation_id = value.get("reservationId") if isinstance(value, dict) else None
+        if type(reservation_id) is not int or reservation_id <= 0:
+            raise PortalError("booking-outcome-unknown")
+        return reservation_id
+
+    def release_booking_hold(self, hold_id: int) -> None:
+        try:
+            self._portal_json(
+                "POST", f"{self.NEW_PORTAL_URL}/Reservation/ReleaseTerm",
+                params={"reservationId": hold_id}, json={},
+            )
+        except PortalError as error:
+            if error.suspend:
+                raise
 
     def get_services(self) -> list[dict]:
         return self._portal_json("GET", self.DICTIONARY_SERVICES_URL)

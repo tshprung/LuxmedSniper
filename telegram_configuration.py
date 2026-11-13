@@ -15,7 +15,23 @@ SECRET_KEYS = (
     "LUXMED_TELEGRAM_PROFILES",
     *(f"LUXMED_{key.upper()}_{field}" for key in PROFILE_KEYS for field in ("LOGIN", "PASSWORD")),
 )
-OPTIONAL_SECRET_KEYS = ("OPENAI_API_KEY",)
+OPTIONAL_SECRET_KEYS = ("OPENAI_API_KEY", "LUXMED_BOOKING_CALENDAR", "LUXMED_DIRECT_BOOKING")
+
+
+def calendar_settings(settings: dict) -> dict | None:
+    value = settings.get("LUXMED_BOOKING_CALENDAR", "").strip()
+    if not value:
+        return None
+    data = json.loads(value)
+    if (
+        not isinstance(data, dict)
+        or any(not isinstance(data.get(key), str) or not data[key].strip()
+               for key in ("client_id", "client_secret", "refresh_token"))
+        or not isinstance(data.get("calendar_ids"), list) or not 1 <= len(data["calendar_ids"]) <= 50
+        or any(not isinstance(key, str) or not key.strip() for key in data["calendar_ids"])
+    ):
+        raise ValueError("Invalid booking calendar configuration")
+    return data
 
 
 def validate(settings) -> dict:
@@ -41,6 +57,7 @@ def validate(settings) -> dict:
             or not isinstance(aliases, list) or any(not isinstance(alias, str) or len(alias) > 40 for alias in aliases)
         ):
             raise ValueError("Invalid profile configuration")
+    calendar_settings(settings)
     return profiles
 
 
