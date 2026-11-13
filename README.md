@@ -118,10 +118,10 @@ as requiring preparation, the bot points you to the portal instructions.
 ### Direct Telegram booking pilot
 
 Direct booking defaults to off. The live audit of the worker's session
-received HTTP 401 at the questionnaire check with the portal's standard
-request header, after the booking limit and referral checks succeeded. Enable the pilot
-only after the worker has an authorized session that passes the portal's
-booking checks. The configuration package accepts the environment variable
+received HTTP 401 at the questionnaire check after the booking limit,
+referral, and anti-forgery token requests succeeded. Enable the pilot only
+after the worker has a session that passes the portal's booking checks.
+The configuration package accepts the environment variable
 `LUXMED_DIRECT_BOOKING=1` for that rollout.
 
 With the pilot enabled, reply `Book 2` to a fresh list to request that exact

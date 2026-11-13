@@ -119,12 +119,19 @@ class SearchTests(unittest.TestCase):
                 "value": {"temporaryReservationId": 135, "askForReferral": False, "valuations": [valuation]}}
         confirmed = {"hasErrors": False, "value": {"reservationId": 246}}
         with patch.object(requests.Session, "request", side_effect=[
-            response({"token": "fixture-token"}), response(hold), response(confirmed),
+            response({"token": "fixture-token"}), response({"token": "fixture-request-token"}),
+            response(hold), response(confirmed),
         ]) as request:
             portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
             with portal.session:
                 self.assertEqual(portal.reserve_standard_visit(appointment, "Fixture service"), 246)
-        lock, confirm = request.call_args_list[1:]
+        request_token, lock, confirm = request.call_args_list[1:]
+        self.assertTrue(request_token.args[1].endswith("/security/getforgerytoken"))
+        self.assertEqual(request_token.args[0], "GET")
+        for call in (lock, confirm):
+            self.assertEqual(call.kwargs["headers"], {
+                "X-Requested-With": "XMLHttpRequest", "XSRF-TOKEN": "fixture-request-token",
+            })
         self.assertTrue(lock.args[1].endswith("/Reservation/LockTerm"))
         self.assertEqual(lock.kwargs["json"]["doctorId"], 9)
         self.assertEqual(lock.kwargs["json"]["date"], "2030-04-01T08:00:00.000Z")
@@ -168,13 +175,15 @@ class SearchTests(unittest.TestCase):
                     },
                 }
                 with patch.object(requests.Session, "request", side_effect=[
-                    response({"token": "fixture-token"}), response(hold), response({}),
+                    response({"token": "fixture-token"}), response({"token": "fixture-request-token"}),
+                    response(hold), response({}),
                 ]) as request:
                     portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
                     with portal.session, self.assertRaisesRegex(Exception, "booking-needs-portal"):
                         portal.reserve_standard_visit(appointment, "Fixture service")
                 self.assertTrue(request.call_args.args[1].endswith("/Reservation/ReleaseTerm"))
                 self.assertEqual(request.call_args.kwargs["params"], {"reservationId": 135})
+                self.assertEqual(request.call_args.kwargs["headers"]["XSRF-TOKEN"], "fixture-request-token")
 
     def test_booking_eligibility_redirect_stops_before_other_requests(self):
         with patch.object(requests.Session, "request", side_effect=[
@@ -211,13 +220,30 @@ class AuditCliTests(unittest.TestCase):
                     response({"token": "fixture-token"}),
                     response({"canReserve": True}),
                     response({"referrals": []}),
+                    response({"token": "fixture-request-token"}),
                     response(raw="private-fixture", status=http_status),
                 ], options=("--booking-preflight",))
                 self.assertEqual((status, output), (1, f"{error} · questionnaire · HTTP {http_status}"))
-                self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", "GET", "GET", "GET"])
+                self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", *["GET"] * 4])
                 self.assertTrue(request.call_args.args[1].endswith("/PNM/Index"))
                 self.assertFalse(request.call_args.kwargs["allow_redirects"])
-                self.assertEqual(request.call_args.kwargs["headers"], {"X-Requested-With": "XMLHttpRequest"})
+                self.assertEqual(request.call_args.kwargs["headers"], {
+                    "X-Requested-With": "XMLHttpRequest", "XSRF-TOKEN": "fixture-request-token",
+                })
+
+    def test_booking_preflight_stops_when_portal_omits_request_token(self):
+        status, output, request = self.run_audit("patient1", {
+            "LUXMED_PATIENT1_LOGIN": "fixture",
+            "LUXMED_PATIENT1_PASSWORD": "fixture",
+            "LUXMED_PATIENT1_LOCATOR": "8*20*-1*-1",
+        }, [
+            response({"token": "fixture-token"}),
+            response({"canReserve": True}),
+            response({"referrals": []}),
+            response({}),
+        ], options=("--booking-preflight",))
+        self.assertEqual((status, output), (1, "unexpected-response · booking-request-token"))
+        self.assertTrue(request.call_args.args[1].endswith("/security/getforgerytoken"))
 
     def test_booking_preflight_checks_eligibility_penalty_and_verification_without_holding(self):
         status, output, request = self.run_audit("patient1", {
@@ -228,6 +254,7 @@ class AuditCliTests(unittest.TestCase):
             response({"token": "fixture-token"}),
             response({"canReserve": True}),
             response({"referrals": []}),
+            response({"token": "fixture-request-token"}),
             response({"questions": []}),
             response({
                 "isNotAvailableInCity": False, "isNotAvailableInContract": False,
@@ -237,7 +264,7 @@ class AuditCliTests(unittest.TestCase):
             response({"events": []}),
         ], options=("--booking-preflight",))
         self.assertEqual((status, output), (0, "booking-preflight-completed"))
-        self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", *["GET"] * 6])
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", *["GET"] * 7])
         self.assertEqual(request.call_args_list[-2].args[1], LuxMedPortal.NON_SHOW_PENALTIES_URL)
         self.assertEqual(request.call_args.args[1], LuxMedPortal.UPCOMING_VISITS_URL)
 
