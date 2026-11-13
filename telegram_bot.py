@@ -19,6 +19,8 @@ from telegram_requests import Criteria, PatientServiceMismatch, RequestError, ci
 from telegram_state import SearchState, next_search_time
 
 PORTAL_REUSE_SECONDS = 3600
+RESULTS_PER_PAGE = 3
+PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
 
 
 class TelegramError(Exception):
@@ -138,6 +140,10 @@ class SearchBot:
             self.show_active()
         elif command in {"/change", "change"}:
             self.change(text, reply)
+        elif command in {"book", "/book"} or key in {
+            "more", "/more", "continue", "/continue", "find something else",
+        }:
+            self.handle_results(command, argument, reply)
         elif command in {"/resume", "resume"}:
             patient = self.aliases.get(argument)
             if patient and self.state.resume(patient):
@@ -211,13 +217,94 @@ class SearchBot:
             "Find an internist for <patient> next week after 16:00\n"
             "/find patient | portal service | city | optional filters\n"
             "/active · Stop <number>\n"
-            "Change 123 to after 16:00\n/change number | service | city | optional filters",
+            "Change 123 to after 16:00\n/change number | service | city | optional filters\n"
+            "From a result list: Book 2 · More · Continue",
         )
 
-    def start(self, criteria: Criteria) -> None:
+    def start(self, criteria: Criteria, *, excluded_slots=(), not_before: int = 0) -> None:
         now = int(self.clock())
-        search_id, number, due, paused = self.state.add(criteria, now)
+        search_id, number, due, paused = self.state.add(
+            criteria, now, excluded_slots=excluded_slots, not_before=not_before,
+        )
         self.confirm_search(search_id, number, criteria, due, paused, now)
+
+    @staticmethod
+    def slot_details(slot: dict) -> str:
+        starts = dt.datetime.fromtimestamp(slot["start"], WARSAW).strftime("%d.%m %H:%M")
+        return " · ".join(value for value in (starts, slot["clinic"], slot["doctor"]) if value)
+
+    @staticmethod
+    def slot_key(slot: dict) -> tuple[int, str, str]:
+        return slot["start"], slot["clinic"], slot["doctor"]
+
+    def show_results(self, search_id: int) -> None:
+        row = self.state.results(search_id)
+        slots = json.loads(row["slots"])
+        now = int(self.clock())
+        page = []
+        for index in range(row["shown"], len(slots)):
+            if slots[index]["start"] > now:
+                page.append((index + 1, slots[index]))
+                if len(page) == RESULTS_PER_PAGE:
+                    break
+        if not page:
+            self.state.queue_message("No more upcoming options in this list. Use Continue to look for other slots.", search_id)
+            return
+        self.state.mark_shown(search_id, page[-1][0])
+        self.state.set_setting("latest_result", str(search_id))
+        heading = self.search_heading(row["display_number"], self.state.criteria(row))
+        lines = [heading, "Available slots (Warsaw time)"]
+        lines.extend(f"{number}. {self.slot_details(slot)}" for number, slot in page)
+        if any(slot["start"] > now for slot in slots[page[-1][0]:]):
+            lines.append("Reply More to see the next options.")
+        lines.append("Reply Book <option number> for booking steps, or Continue to search for different slots.")
+        self.state.queue_message("\n".join(lines), search_id)
+
+    def handle_results(self, command: str, argument: str, reply: dict) -> None:
+        action = command.lstrip("/")
+        if action == "book" and not re.fullmatch(r"[1-9][0-9]{0,8}", argument):
+            self.state.queue_message("Use Book followed by an option number, for example Book 2.")
+            return
+        original = self.replied_search(reply)
+        row = self.state.results(original["id"]) if original else None
+        if not reply:
+            row = self.state.results()
+        if row is None:
+            self.state.queue_message("I don’t have a numbered list for that search. Start a search to get a fresh list.")
+            return
+        search_id = row["id"]
+        slots = json.loads(row["slots"])
+        now = int(self.clock())
+        if action == "book":
+            number = int(argument)
+            if number > row["shown"]:
+                self.state.queue_message("Choose an option number shown in this list, or use More.", search_id)
+                return
+            slot = slots[number - 1]
+            if slot["start"] <= now:
+                self.state.queue_message("That appointment time has passed. Use More or Continue for other options.", search_id)
+                return
+            heading = self.search_heading(row["display_number"], self.state.criteria(row))
+            self.state.queue_message(
+                f"{heading}\nOption {number}. {self.slot_details(slot)}\n"
+                "No appointment has been booked. Open the Patient Portal under the selected patient, "
+                "search for the same service, and confirm the slot if it is still available.\n"
+                f"{PATIENT_PORTAL_URL}",
+                search_id,
+            )
+        elif action == "more":
+            self.show_results(search_id)
+        elif row["status"] == "continued":
+            self.state.queue_message("This list already has a follow-up search. Use /active to see what’s running.", search_id)
+        else:
+            criteria = self.state.criteria(row)
+            today = dt.datetime.fromtimestamp(now, WARSAW).date().isoformat()
+            if criteria.preferences.last_date and criteria.preferences.last_date < today:
+                self.state.queue_message("The original date window has ended. Start a search with new dates.", search_id)
+                return
+            exclusions = json.loads(row["excluded_slots"]) + slots[:row["shown"]]
+            self.state.mark_continued(search_id)
+            self.start(criteria, excluded_slots=[slot for slot in exclusions if slot["start"] > now], not_before=row["next_due"])
 
     def confirm_search(self, search_id: int, number: int, criteria: Criteria, due: int, paused: bool, now: int, *, changed: bool = False) -> None:
         if paused:
@@ -423,14 +510,27 @@ class SearchBot:
                 if self.state.mark_first_result(search_id):
                     self.state.queue_message(f"{heading}\n{error}", search_id)
             return
-        if not slots:
+        excluded = {self.slot_key(slot) for slot in json.loads(row["excluded_slots"])}
+        options = []
+        for slot in slots:
+            option = {
+                "start": int(slot.AppointmentDate.timestamp()),
+                "clinic": str(slot.ClinicPublicName or "")[:160].strip(),
+                "doctor": str(slot.DoctorName or "")[:160].strip(),
+            }
+            key = self.slot_key(option)
+            if key not in excluded:
+                excluded.add(key)
+                options.append(option)
+        if not options:
             with self.state.db:
                 result = "outside-preferred-clinic" if outside_clinic else "no-slots"
                 next_check = self.state.record_result(search_id, int(self.clock()), result)
                 if next_check is not None and self.state.mark_first_result(search_id):
                     due = local_time(next_check)
                     window = "the requested dates" if criteria.preferences.first_date else "the next 14 days"
-                    status = f"No matching slots in {window}."
+                    kind = "new matching" if row["excluded_slots"] != "[]" else "matching"
+                    status = f"No {kind} slots in {window}."
                     if outside_clinic:
                         status += " Other clinics have matches. Use /change to adjust the clinic filter."
                     status += f" I’ll check hourly from 06:00 to 22:00 Warsaw time and message you if I find one. Next check: {due}."
@@ -439,13 +539,8 @@ class SearchBot:
         with self.state.db:
             if not self.state.finish(search_id, "found"):
                 return
-            lines = [heading, "Available slots"]
-            for slot in slots[:3]:
-                start = slot.AppointmentDate.astimezone(WARSAW).strftime("%d.%m %H:%M")
-                details = [start, slot.ClinicPublicName, slot.DoctorName]
-                lines.append(" · ".join(str(value)[:160].strip() for value in details if value))
-            lines.append("Search finished. Use the Patient Portal to book.")
-            self.state.queue_message("\n".join(lines), search_id)
+            self.state.save_results(search_id, options)
+            self.show_results(search_id)
 
 
 def main() -> int:

@@ -41,6 +41,9 @@ class SearchState:
             CREATE TABLE IF NOT EXISTS message_searches (
                 message_id INTEGER PRIMARY KEY, search_id INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS search_results (
+                search_id INTEGER PRIMARY KEY, slots TEXT NOT NULL, shown INTEGER NOT NULL DEFAULT 0
+            );
         """)
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -51,6 +54,7 @@ class SearchState:
                 ("first_result_sent", "INTEGER NOT NULL DEFAULT 0"),
                 ("preferences", "TEXT NOT NULL DEFAULT '{}'"),
                 ("display_number", "INTEGER"),
+                ("excluded_slots", "TEXT NOT NULL DEFAULT '[]'"),
             ):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE searches ADD COLUMN {name} {declaration}")
@@ -93,20 +97,21 @@ class SearchState:
             (message_id,),
         ).fetchone()
 
-    def add(self, criteria: Criteria, now: int) -> tuple[int, int, int, bool]:
+    def add(self, criteria: Criteria, now: int, *, excluded_slots=(), not_before: int = 0) -> tuple[int, int, int, bool]:
         self.db.execute("INSERT OR IGNORE INTO accounts (patient) VALUES (?)", (criteria.patient,))
         account = self.db.execute("SELECT suspended FROM accounts WHERE patient = ?", (criteria.patient,)).fetchone()
-        due = next_search_time(now)
+        due = next_search_time(max(now, not_before))
         number = self.db.execute(
             """SELECT CASE WHEN EXISTS (SELECT 1 FROM searches WHERE status = 'active')
                THEN (SELECT display_number + 1 FROM searches ORDER BY id DESC LIMIT 1)
                ELSE 1 END""",
         ).fetchone()[0]
         row = self.db.execute(
-            """INSERT INTO searches (patient, service, city_id, city, polish, telephone, next_due, preferences, display_number)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO searches (patient, service, city_id, city, polish, telephone, next_due, preferences,
+                                     display_number, excluded_slots)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (criteria.patient, criteria.service, criteria.city_id, criteria.city, 0, criteria.telephone,
-             due, json.dumps(asdict(criteria.preferences), ensure_ascii=False), number),
+             due, json.dumps(asdict(criteria.preferences), ensure_ascii=False), number, json.dumps(excluded_slots)),
         )
         return row.lastrowid, number, due, bool(account["suspended"])
 
@@ -114,6 +119,25 @@ class SearchState:
         return self.db.execute(
             "SELECT * FROM searches WHERE status = 'active' AND display_number = ?", (number,),
         ).fetchone()
+
+    def save_results(self, search_id: int, slots: list[dict]) -> None:
+        self.db.execute("INSERT INTO search_results (search_id, slots) VALUES (?, ?)", (search_id, json.dumps(slots)))
+
+    def mark_shown(self, search_id: int, shown: int) -> None:
+        self.db.execute("UPDATE search_results SET shown = ? WHERE search_id = ?", (shown, search_id))
+
+    def results(self, search_id: int | None = None) -> sqlite3.Row | None:
+        if search_id is None:
+            search_id = int(self.get_setting("latest_result", "0"))
+        return self.db.execute(
+            """SELECT searches.*, search_results.slots, search_results.shown
+               FROM searches JOIN search_results ON searches.id = search_results.search_id
+               WHERE searches.id = ?""",
+            (search_id,),
+        ).fetchone()
+
+    def mark_continued(self, search_id: int) -> None:
+        self.db.execute("UPDATE searches SET status = 'continued' WHERE id = ? AND status = 'found'", (search_id,))
 
     def active(self) -> list[sqlite3.Row]:
         return self.db.execute(

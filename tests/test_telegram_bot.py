@@ -166,6 +166,65 @@ class BotTests(unittest.TestCase):
         self.assertIn("Last check 30.03 11:00: no matching slots", message)
         self.assertIn("Next check 30.03 12:00 Warsaw time", message)
 
+    def test_numbered_options_support_booking_steps_more_and_continue(self):
+        self.update(1, "/find Child | sick kids")
+        self.bot.flush()
+        date = dt.datetime(2030, 3, 31, tzinfo=WARSAW)
+        slots = [Appointment(date.replace(hour=hour), 2, "Fixture clinic", f"Doctor {hour}", 12) for hour in range(9, 14)]
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            portal.return_value.resolve_service.return_value = 12
+            portal.return_value.search.return_value = slots
+            self.bot.search_due()
+            first = self.state.next_message()["text"]
+            self.assertIn("1. 31.03 09:00", first)
+            self.assertIn("3. 31.03 11:00", first)
+            self.assertNotIn("4. 31.03", first)
+            self.telegram.send.return_value = 43
+            self.bot.flush()
+            self.update(2, "Book 4", reply_to=43)
+            self.assertIn("Choose an option number shown", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(3, "More", reply_to=43)
+            self.assertIn("4. 31.03 12:00", self.state.next_message()["text"])
+            self.assertIn("5. 31.03 13:00", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(4, "Book 4")
+            self.assertIn("Option 4. 31.03 12:00", self.state.next_message()["text"])
+            self.assertIn("No appointment has been booked", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(5, "find something else", reply_to=43)
+            self.update(6, "Continue", reply_to=43)
+            continued, = self.state.active()
+            self.assertEqual(continued["patient"], "patient2")
+            self.assertEqual(continued["next_due"], self.now + 3600)
+            self.bot.search_due()
+            portal.return_value.search.assert_called_once()
+            self.now += 3600
+            self.bot.flush()
+            portal.return_value.search.return_value = [*slots, Appointment(date.replace(hour=14), 2, "New clinic", "New doctor", 12)]
+            self.bot.search_due()
+        final = self.state.next_message()["text"]
+        self.assertIn("1. 31.03 14:00", final)
+        self.assertNotIn("09:00", final)
+
+    def test_reply_to_previous_list_does_not_select_from_new_list_with_same_search_number(self):
+        date = dt.datetime(2030, 3, 31, 11, tzinfo=WARSAW)
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            portal.return_value.resolve_service.return_value = 12
+            for update_id, patient, doctor in ((1, "Child", "First doctor"), (2, "Other", "Second doctor")):
+                self.update(update_id, f"/find {patient} | routine visit")
+                self.telegram.send.return_value = 40 + update_id * 2
+                self.bot.flush()
+                portal.return_value.search.return_value = [Appointment(date, 2, "Fixture clinic", doctor, 12)]
+                self.bot.search_due()
+                self.telegram.send.return_value += 1
+                self.bot.flush()
+        self.update(3, "Book 1", reply_to=43)
+        self.assertIn("First doctor", self.state.next_message()["text"])
+        self.bot.flush()
+        self.update(4, "Book 1")
+        self.assertIn("Second doctor", self.state.next_message()["text"])
+
     def test_change_keeps_id_and_patient_and_checks_the_new_criteria(self):
         self.update(1, "Find an internist for Adult")
         with patch("telegram_bot.LuxMedPortal") as portal:
