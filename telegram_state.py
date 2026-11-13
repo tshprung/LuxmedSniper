@@ -49,9 +49,14 @@ class SearchState:
                 ("last_result", "TEXT"),
                 ("first_result_sent", "INTEGER NOT NULL DEFAULT 0"),
                 ("preferences", "TEXT NOT NULL DEFAULT '{}'"),
+                ("display_number", "INTEGER"),
             ):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE searches ADD COLUMN {name} {declaration}")
+            self.db.execute("UPDATE searches SET display_number = id WHERE display_number IS NULL")
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS active_search_number ON searches (display_number) WHERE status = 'active'"
+            )
 
     def get_setting(self, key: str, default: str = "") -> str:
         row = self.db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -72,21 +77,35 @@ class SearchState:
                 self.db.execute("INSERT OR IGNORE INTO message_searches VALUES (?, ?)", (telegram_id, message["search_id"]))
             self.db.execute("DELETE FROM outbox WHERE id = ?", (message["id"],))
 
-    def search_for_message(self, message_id: int) -> int | None:
-        row = self.db.execute("SELECT search_id FROM message_searches WHERE message_id = ?", (message_id,)).fetchone()
-        return row["search_id"] if row else None
+    def search_for_message(self, message_id: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            """SELECT searches.id, searches.display_number FROM searches
+               JOIN message_searches ON searches.id = message_searches.search_id
+               WHERE message_id = ?""",
+            (message_id,),
+        ).fetchone()
 
-    def add(self, criteria: Criteria, now: int) -> tuple[int, int, bool]:
+    def add(self, criteria: Criteria, now: int) -> tuple[int, int, int, bool]:
         self.db.execute("INSERT OR IGNORE INTO accounts (patient) VALUES (?)", (criteria.patient,))
         account = self.db.execute("SELECT * FROM accounts WHERE patient = ?", (criteria.patient,)).fetchone()
         due = next_search_time(max(now, account["next_attempt"]))
+        number = self.db.execute(
+            """SELECT CASE WHEN EXISTS (SELECT 1 FROM searches WHERE status = 'active')
+               THEN (SELECT display_number + 1 FROM searches ORDER BY id DESC LIMIT 1)
+               ELSE 1 END""",
+        ).fetchone()[0]
         row = self.db.execute(
-            """INSERT INTO searches (patient, service, city_id, city, polish, telephone, next_due, preferences)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO searches (patient, service, city_id, city, polish, telephone, next_due, preferences, display_number)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (criteria.patient, criteria.service, criteria.city_id, criteria.city, 0, criteria.telephone,
-             due, json.dumps(asdict(criteria.preferences), ensure_ascii=False)),
+             due, json.dumps(asdict(criteria.preferences), ensure_ascii=False), number),
         )
-        return row.lastrowid, due, bool(account["suspended"])
+        return row.lastrowid, number, due, bool(account["suspended"])
+
+    def active_by_number(self, number: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM searches WHERE status = 'active' AND display_number = ?", (number,),
+        ).fetchone()
 
     def active(self) -> list[sqlite3.Row]:
         return self.db.execute(

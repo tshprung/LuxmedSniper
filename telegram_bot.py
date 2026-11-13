@@ -15,7 +15,7 @@ from luxmed_sniper import WARSAW, DoctorLocator, Luxmed, LuxMedPortal, PortalErr
 from telegram_configuration import PROFILE_KEYS, validate, worker_settings
 from telegram_free_text import FreeText
 from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences, split_preferences
-from telegram_requests import Criteria, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
+from telegram_requests import Criteria, PatientServiceMismatch, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
 from telegram_state import SearchState, next_search_time
 
 
@@ -128,12 +128,13 @@ class SearchBot:
         text = message["text"].strip()
         key = normalize(text)
         command, _, argument = key.partition(" ")
+        reply = message.get("reply_to_message") or {}
         if command in {"stop", "/stop"}:
-            self.stop(argument, message.get("reply_to_message") or {})
+            self.stop(argument, reply)
         elif key in {"/active", "active", "show active searches", "show running searches"}:
             self.show_active()
         elif command in {"/change", "change"}:
-            self.change(text)
+            self.change(text, reply)
         elif command in {"/resume", "resume"}:
             patient = self.aliases.get(argument)
             if patient and self.state.resume(patient):
@@ -150,6 +151,9 @@ class SearchBot:
         today = dt.datetime.fromtimestamp(self.clock(), WARSAW).date()
         try:
             criteria = parse_search(text, self.aliases, self.children, self.cities, today=today)
+        except PatientServiceMismatch as error:
+            self.reject_mismatch(error)
+            return
         except PreferenceError as error:
             self.state.queue_message(str(error))
             return
@@ -171,6 +175,9 @@ class SearchBot:
                 criteria = self.free_text.criteria(request, self.aliases, self.children, self.cities)
                 if criteria is not None:
                     criteria = replace(criteria, preferences=preferences)
+            except PatientServiceMismatch as error:
+                self.reject_mismatch(error)
+                return
             except PreferenceError as error:
                 self.state.queue_message(str(error))
                 return
@@ -178,16 +185,21 @@ class SearchBot:
                 error_message = str(error)
         if criteria and not criteria.service:
             self.state.set_setting("pending", json.dumps(asdict(criteria)))
-            self.state.queue_message(pediatric_menu())
+            self.state.queue_message(pediatric_menu(self.profiles[criteria.patient].name))
         elif criteria:
             self.state.set_setting("pending", "")
             self.start(criteria)
         elif error_message:
             self.state.queue_message(error_message)
         elif pending:
-            self.state.queue_message(pediatric_menu())
+            self.state.queue_message(pediatric_menu(self.profiles[json.loads(pending)["patient"]].name))
         else:
             self.help()
+
+    def reject_mismatch(self, error: PatientServiceMismatch) -> None:
+        self.state.set_setting("pending", "")
+        name = self.profiles[error.patient].name
+        self.state.queue_message(f"{name} {error} Please send a new request with the patient and service you intended.")
 
     def help(self) -> None:
         self.state.queue_message(
@@ -201,10 +213,10 @@ class SearchBot:
 
     def start(self, criteria: Criteria) -> None:
         now = int(self.clock())
-        search_id, due, paused = self.state.add(criteria, now)
-        self.confirm_search(search_id, criteria, due, paused, now)
+        search_id, number, due, paused = self.state.add(criteria, now)
+        self.confirm_search(search_id, number, criteria, due, paused, now)
 
-    def confirm_search(self, search_id: int, criteria: Criteria, due: int, paused: bool, now: int, *, changed: bool = False) -> None:
+    def confirm_search(self, search_id: int, number: int, criteria: Criteria, due: int, paused: bool, now: int, *, changed: bool = False) -> None:
         if paused:
             status = "Paused. Check the portal, then use /resume."
         elif due > now:
@@ -212,25 +224,30 @@ class SearchBot:
         else:
             status = "Checking availability. I’ll send the first result when the check finishes."
         prefix = "Updated\n" if changed else ""
-        self.state.queue_message(f"{prefix}{self.search_heading(search_id, criteria)}\n{status}", search_id)
+        self.state.queue_message(f"{prefix}{self.search_heading(number, criteria)}\n{status}", search_id)
 
-    def search_heading(self, search_id: int, criteria: Criteria) -> str:
-        heading = f"#{search_id} · {self.profiles[criteria.patient].name} · {criteria.service} · {criteria.city}"
+    def search_heading(self, number: int, criteria: Criteria) -> str:
+        heading = f"#{number} · {self.profiles[criteria.patient].name} · {criteria.service} · {criteria.city}"
         if filters := criteria.preferences.describe():
             heading += f"\n{filters}"
         return heading
 
-    def change(self, text: str) -> None:
+    def change(self, text: str, reply: dict) -> None:
         parts = [part.strip() for part in text.split("|")]
         match = re.fullmatch(r"/?change\s+#?([0-9]{1,18})(?:\s+to\s+(.+))?", parts[0], re.IGNORECASE)
         if len(text) > 600 or match is None or len(parts) > 4 or (len(parts) == 1) != bool(match[2]):
             self.state.queue_message("Try Change 123 to after 16:00 or /change 123 | service | city | filters.")
             return
-        search_id = int(match[1])
-        row = next((item for item in self.state.active() if item["id"] == search_id), None)
+        number = int(match[1])
+        row = self.state.active_by_number(number)
         if row is None:
-            self.state.queue_message(f"Search #{search_id} is inactive.")
+            self.state.queue_message(f"Search #{number} is inactive.")
             return
+        original = self.replied_search(reply)
+        if original is not None and original["id"] != row["id"]:
+            self.state.queue_message("That message refers to a different search. Use /active to see current searches.")
+            return
+        search_id = row["id"]
         current = self.state.criteria(row)
         filters = match[2] or (parts[3] if len(parts) == 4 else "")
         now = int(self.clock())
@@ -243,6 +260,9 @@ class SearchBot:
                 city = parts[2] if len(parts) >= 3 and parts[2] else current.city
                 criteria = parse_search(f"/find {current.patient} | {service} | {city}", self.aliases, self.children, self.cities)
             criteria = replace(criteria, preferences=parse_preferences(filters, today, current.preferences))
+        except PatientServiceMismatch as error:
+            self.reject_mismatch(error)
+            return
         except (RequestError, PreferenceError) as error:
             self.state.queue_message(str(error))
             return
@@ -250,10 +270,10 @@ class SearchBot:
             self.state.queue_message("Choose a specific pediatric visit type in /change, such as routine visit.")
             return
         if criteria == current:
-            self.state.queue_message(f"Search #{search_id} already uses those settings.")
+            self.state.queue_message(f"Search #{number} already uses those settings.")
             return
         due, paused = self.state.revise(search_id, criteria, now)
-        self.confirm_search(search_id, criteria, due, paused, now, changed=True)
+        self.confirm_search(search_id, number, criteria, due, paused, now, changed=True)
 
     def show_active(self) -> None:
         rows = self.state.active()
@@ -263,7 +283,7 @@ class SearchBot:
         for index in range(0, len(rows), 6):
             lines = []
             for row in rows[index:index + 6]:
-                heading = self.search_heading(row["id"], self.state.criteria(row))
+                heading = self.search_heading(row["display_number"], self.state.criteria(row))
                 if row["last_checked"] is None:
                     last = "Awaiting a recorded result"
                 else:
@@ -282,27 +302,37 @@ class SearchBot:
                 lines.append(f"{heading}\n{last}\n{upcoming}")
             self.state.queue_message("\n\n".join(lines))
 
+    def replied_search(self, reply: dict):
+        message_id = reply.get("message_id")
+        return self.state.search_for_message(message_id) if type(message_id) is int else None
+
     def stop(self, argument: str, reply: dict) -> None:
-        search_id = None
-        if argument:
+        row = self.replied_search(reply)
+        number = None
+        if row is not None:
+            number = row["display_number"]
+            if argument and argument not in {str(number), f"#{number}"}:
+                self.state.queue_message("That message refers to a different search. Use /active to see current searches.")
+                return
+        elif argument:
             if re.fullmatch(r"#?[0-9]{1,18}", argument):
-                search_id = int(argument.lstrip("#"))
-        elif type(reply.get("message_id")) is int:
-            search_id = self.state.search_for_message(reply["message_id"])
-        elif self.state.get_setting("pending"):
+                number = int(argument.lstrip("#"))
+                row = self.state.active_by_number(number)
+        elif not reply and self.state.get_setting("pending"):
             self.state.set_setting("pending", "")
             self.state.queue_message("Pending selection cleared.")
             return
-        else:
+        elif not reply:
             rows = self.state.active()
             if len(rows) == 1:
-                search_id = rows[0]["id"]
-        if search_id is None:
+                row = rows[0]
+                number = row["display_number"]
+        if number is None:
             self.state.queue_message("Use Stop with a search number from /active.")
-        elif self.state.finish(search_id, "stopped"):
-            self.state.queue_message(f"Stopped search #{search_id}.")
+        elif row is not None and self.state.finish(row["id"], "stopped"):
+            self.state.queue_message(f"Stopped search #{number}.")
         else:
-            self.state.queue_message(f"Search #{search_id} is inactive.")
+            self.state.queue_message(f"That search (#{number}) has already ended.")
 
     def flush(self) -> None:
         while (message := self.state.next_message()) is not None:
@@ -314,7 +344,7 @@ class SearchBot:
         with self.state.db:
             for row in self.state.expired(today):
                 if self.state.finish(row["id"], "date-window-ended"):
-                    heading = self.search_heading(row["id"], self.state.criteria(row))
+                    heading = self.search_heading(row["display_number"], self.state.criteria(row))
                     self.state.queue_message(f"{heading}\nThe requested date window has ended. Search finished.", row["id"])
         batch = self.state.claim_batch(int(self.clock()))
         if not batch:
@@ -346,7 +376,7 @@ class SearchBot:
     def search_one(self, portal: LuxMedPortal, catalog: list, row) -> None:
         search_id = row["id"]
         criteria = self.state.criteria(row)
-        heading = self.search_heading(search_id, criteria)
+        heading = self.search_heading(row["display_number"], criteria)
         try:
             service_id = portal.resolve_service(row["service"], catalog, telephone=bool(row["telephone"]))
         except PortalError as error:
@@ -354,8 +384,11 @@ class SearchBot:
                 raise
             with self.state.db:
                 if self.state.finish(search_id, "service-unresolved"):
-                    status = "I couldn't match a unique service. Try its exact portal label."
-                    self.state.queue_message(f"#{search_id} · {status}", search_id)
+                    if str(error) == "service-not-in-catalog":
+                        status = "I couldn't find that service in this patient's LUX MED catalog. Search finished."
+                    else:
+                        status = "More than one service matched. Try its exact portal label. Search finished."
+                    self.state.queue_message(f"{heading}\n{status}", search_id)
             return
 
         locator = DoctorLocator(id=f"{row['city_id']}*{service_id}*-1*-1")

@@ -75,6 +75,12 @@ class RequestError(ValueError):
     pass
 
 
+class PatientServiceMismatch(RequestError):
+    def __init__(self, patient: str, reason: str):
+        super().__init__(reason)
+        self.patient = patient
+
+
 def parse_search(text: str, aliases: dict[str, str], children: set[str], cities: dict, *, today: dt.date | None = None) -> Criteria | None:
     preference_text = ""
     if re.match(r"^/find(?:\s|$)", text, re.IGNORECASE):
@@ -108,18 +114,19 @@ def parse_search(text: str, aliases: dict[str, str], children: set[str], cities:
     city_id, city_name = city
     preferences = parse_preferences(preference_text, today) if today is not None else Preferences()
     key = normalize(service)
+    selected = pediatric_choice(service, allow_number=False)
+    if patient not in children and (key in PEDIATRIC_REQUESTS or selected or key.startswith("konsultacja pediatryczna")):
+        raise PatientServiceMismatch(patient, "is configured as an adult, and pediatrics is for children.")
+    if patient in children and normalize(GENERAL_SERVICES.get(key, service)) in {
+        "internista", "konsultacja internisty", "konsultacja internistyczna",
+    }:
+        raise PatientServiceMismatch(patient, "is configured as a child, and an internist is an adult service.")
     if key in PEDIATRIC_REQUESTS or (patient in children and key in GENERAL_REQUESTS):
-        if patient not in children:
-            raise RequestError("Which child is this for?")
         return Criteria(patient, "", city_id, city_name, preferences=preferences)
     if key in GENERAL_REQUESTS:
         raise RequestError("Which service or specialty?")
-    if patient in children:
-        if GENERAL_SERVICES.get(key, service).casefold() == "internista":
-            return Criteria(patient, "", city_id, city_name, preferences=preferences)
-        selected = pediatric_choice(service, allow_number=False)
-        if selected:
-            return Criteria(patient, selected, city_id, city_name, "telefonicz" in normalize(selected), preferences)
+    if selected:
+        return Criteria(patient, selected, city_id, city_name, "telefonicz" in normalize(selected), preferences)
     service = GENERAL_SERVICES.get(key, service)
     if len(service) > 130 or not service.strip():
         raise RequestError("Use a service name from the portal.")
@@ -139,7 +146,7 @@ def pediatric_choice(text: str, *, allow_number: bool = True) -> str | None:
     return None
 
 
-def pediatric_menu() -> str:
-    title = "Which type of pediatric visit? Reply with a number."
+def pediatric_menu(patient_name: str) -> str:
+    title = f"Which type of pediatric visit should I search for {patient_name}? Reply with a number."
     options = [f"{index}. {choice[0]}" for index, choice in enumerate(PEDIATRIC_SERVICES, 1)]
     return "\n".join([title, *options])
