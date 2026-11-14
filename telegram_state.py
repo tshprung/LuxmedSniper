@@ -164,18 +164,23 @@ class SearchState:
             (patient, slot_key),
         ).fetchone()
 
-    def approve_booking(self, booking_id: int) -> bool:
+    def approve_booking(self, booking_id: int, patients: frozenset[str]) -> bool:
+        eligible = ", ".join("?" for _ in patients)
         return self.db.execute(
-            "UPDATE booking_requests SET approved = 1, status = 'queued' WHERE id = ? AND status = 'approval'",
-            (booking_id,),
+            f"""UPDATE booking_requests SET approved = 1, status = 'queued'
+                WHERE id = ? AND status = 'approval' AND patient IN ({eligible})""",
+            (booking_id, *patients),
         ).rowcount == 1
 
-    def claim_booking(self):
+    def claim_booking(self, patients: frozenset[str]):
+        eligible = ", ".join("?" for _ in patients)
         with self.db:
             return self.db.execute(
-                """UPDATE booking_requests SET status = 'checking'
-                   WHERE id = (SELECT id FROM booking_requests WHERE status = 'queued' ORDER BY id LIMIT 1)
-                   RETURNING *""",
+                f"""UPDATE booking_requests SET status = 'checking'
+                    WHERE id = (SELECT id FROM booking_requests
+                                WHERE status = 'queued' AND patient IN ({eligible}) ORDER BY id LIMIT 1)
+                    RETURNING *""",
+                tuple(patients),
             ).fetchone()
 
     def booking_status(self, booking_id: int, status: str, *, reason=None, reservation_id=None) -> None:

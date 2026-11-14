@@ -122,7 +122,9 @@ received HTTP 401 at the questionnaire check after the booking limit,
 referral, and anti-forgery token requests succeeded. Enable the pilot only
 after the worker has a session that passes the portal's booking checks.
 The configuration package accepts the environment variable
-`LUXMED_DIRECT_BOOKING=1` for that rollout.
+`LUXMED_DIRECT_BOOKING_PATIENTS=patient1` for a rollout limited to that
+profile. Add more profile keys as a comma-separated list when ready.
+`LUXMED_DIRECT_BOOKING=1` enables all profiles when no list is configured.
 
 A read-only internist check in a temporary GCP session verified by email
 received HTTP 200 and a questionnaire. After the patient answered it in

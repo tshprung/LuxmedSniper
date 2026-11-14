@@ -13,7 +13,7 @@ import requests
 
 from luxmed_sniper import WARSAW, DoctorLocator, Luxmed, LuxMedPortal, PortalError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
-from telegram_configuration import PROFILE_KEYS, calendar_settings, trusted_devices, validate, worker_settings
+from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_settings, trusted_devices, validate, worker_settings
 from telegram_free_text import FreeText
 from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences, split_preferences
 from telegram_requests import PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria, PatientServiceMismatch, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
@@ -112,7 +112,8 @@ def local_time(timestamp: int) -> str:
 class SearchBot:
     def __init__(self, telegram: Telegram, state: SearchState, profiles: dict[str, Profile], *, clock=time.time,
                  free_text: FreeText | None = None, calendar: CalendarAvailability | None = None,
-                 booking_enabled: bool = False, device_credentials: dict | None = None):
+                 booking_enabled: bool = False, device_credentials: dict | None = None,
+                 allowed_booking_patients: frozenset[str] | None = None):
         self.telegram = telegram
         self.state = state
         self.profiles = profiles
@@ -120,6 +121,9 @@ class SearchBot:
         self.free_text = free_text
         self.calendar = calendar
         self.booking_enabled = booking_enabled
+        self.allowed_booking_patients = (
+            frozenset(profiles) if allowed_booking_patients is None else allowed_booking_patients
+        )
         self.device_credentials = device_credentials or {}
         self.portals: dict[str, tuple[float, LuxMedPortal]] = {}
         self.cities = city_catalog()
@@ -169,7 +173,10 @@ class SearchBot:
         }:
             self.handle_results(command, argument, reply)
         elif command in {"approve", "/approve"}:
-            if self.booking_enabled and re.fullmatch(r"[1-9][0-9]{0,8}", argument) and self.state.approve_booking(int(argument)):
+            if (
+                self.booking_enabled and re.fullmatch(r"[1-9][0-9]{0,8}", argument)
+                and self.state.approve_booking(int(argument), self.allowed_booking_patients)
+            ):
                 self.state.queue_message("Approved. I’ll recheck the selected appointment before booking.")
             else:
                 self.state.queue_message("Use Approve followed by the booking request number shown in my message.")
@@ -249,7 +256,8 @@ class SearchBot:
         self.state.queue_message(f"{name} {error} Please send a new request with the patient and service you intended.")
 
     def help(self) -> None:
-        title = "LUX MED appointment assistant" if self.booking_enabled else "Read-only appointment search"
+        booking_available = self.booking_enabled and bool(self.allowed_booking_patients)
+        title = "LUX MED appointment assistant" if booking_available else "Read-only appointment search"
         self.state.queue_message(
             f"{title}\n"
             "Find an internist for <patient>\nFind a pediatrician for <patient>\n"
@@ -259,7 +267,7 @@ class SearchBot:
             "Change 123 to after 16:00\n/change number | service | city | optional filters\n"
             "From a result list: Details 2 · More · Continue"
             + (" · Book 2\nFor booking approval: Approve <request number> · Stop booking <request number>"
-               if self.booking_enabled else ""),
+               if booking_available else ""),
         )
 
     def start(self, criteria: Criteria, *, excluded_slots=(), not_before: int = 0) -> None:
@@ -309,7 +317,7 @@ class SearchBot:
         if any(slot["start"] > now for slot in slots[page[-1][0]:]):
             lines.append("Reply More to see the next options.")
         can_book = (
-            self.booking_enabled and not notices and not row["telephone"]
+            self.can_book_for(row["patient"]) and not notices and not row["telephone"]
             and normalize(row["service"]) in SUPPORTED_BOOKING_SERVICES
             and not self.state.booking_paused(row["patient"])
         )
@@ -366,6 +374,9 @@ class SearchBot:
             self.state.mark_continued(search_id)
             self.start(criteria, excluded_slots=[slot for slot in exclusions if slot["start"] > now], not_before=row["next_due"])
 
+    def can_book_for(self, patient: str) -> bool:
+        return self.booking_enabled and patient in self.allowed_booking_patients
+
     def request_booking(self, row, number: int, slot: dict, now: int) -> None:
         search_id = row["id"]
         heading = self.search_heading(row["display_number"], self.state.criteria(row))
@@ -374,7 +385,7 @@ class SearchBot:
         if notices:
             self.state.queue_message("\n".join([description, *notices, "Book this visit in the Patient Portal.", PATIENT_PORTAL_URL]), search_id)
             return
-        if not self.booking_enabled:
+        if not self.can_book_for(row["patient"]):
             self.state.queue_message(
                 f"{description}\nDirect booking is unavailable. Confirm the appointment in the Patient Portal.\n{PATIENT_PORTAL_URL}",
                 search_id,
@@ -573,9 +584,9 @@ class SearchBot:
 
     def booking_due(self) -> None:
         now = int(self.clock())
-        if not self.booking_enabled or next_search_time(now) != now:
+        if not self.booking_enabled or not self.allowed_booking_patients or next_search_time(now) != now:
             return
-        booking = self.state.claim_booking()
+        booking = self.state.claim_booking(self.allowed_booking_patients)
         if booking is None:
             return
         row = self.state.results(booking["search_id"])
@@ -815,7 +826,10 @@ def main() -> int:
     os.umask(0o077)
     try:
         settings = worker_settings()
+        if "LUXMED_DIRECT_BOOKING_PATIENTS" in os.environ:
+            settings["LUXMED_DIRECT_BOOKING_PATIENTS"] = os.environ["LUXMED_DIRECT_BOOKING_PATIENTS"]
         profiles = configured_profiles(settings, validate(settings))
+        allowed_booking_patients = booking_patients(settings)
         token = settings["TELEGRAM_BOT_TOKEN"]
         owner = int(settings["TELEGRAM_OWNER_ID"])
         path = Path(os.environ.get("LUXMED_STATE_DIRECTORY", "./data"))
@@ -826,8 +840,9 @@ def main() -> int:
         calendar = CalendarAvailability(calendar_config) if calendar_config else None
         bot = SearchBot(Telegram(token, owner), SearchState(path / "telegram.sqlite3"), profiles,
                         free_text=interpreter, calendar=calendar,
-                        booking_enabled=settings.get("LUXMED_DIRECT_BOOKING") == "1",
-                        device_credentials=trusted_devices(profiles))
+                        booking_enabled=bool(allowed_booking_patients),
+                        device_credentials=trusted_devices(profiles),
+                        allowed_booking_patients=allowed_booking_patients)
     except (KeyError, ValueError, OSError):
         print("Telegram bot configuration is incomplete.", file=sys.stderr)
         return 2

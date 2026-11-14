@@ -12,7 +12,7 @@ from nacl.public import PrivateKey, SealedBox
 from luxmed_sniper import WARSAW, Appointment, Luxmed, PortalError
 from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
-from telegram_configuration import SECRET_KEYS, package_settings, trusted_devices
+from telegram_configuration import SECRET_KEYS, booking_patients, package_settings, trusted_devices
 from telegram_free_text import FreeText, redacted_request
 from telegram_state import SearchState, next_search_time
 
@@ -341,6 +341,37 @@ class BotTests(unittest.TestCase):
             client.check_booking_eligibility.assert_not_called()
             client.reserve_standard_visit.assert_not_called()
 
+    def test_booking_pilot_keeps_other_profiles_searchable_but_excludes_their_bookings(self):
+        self.bot.allowed_booking_patients = frozenset({"patient1"})
+        self.update(1, "/find Child | routine visit")
+        self.bot.flush()
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            client = portal.return_value
+            client.resolve_service.return_value = 12
+            client.search.return_value = [
+                Appointment(dt.datetime.fromtimestamp(self.now + 7 * 3600, WARSAW),
+                            2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9),
+            ]
+            self.bot.search_due()
+            self.assertIn("Details <option number>", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(2, "Book 1")
+            self.assertIn("Direct booking is unavailable", self.state.next_message()["text"])
+            self.bot.flush()
+            self.assertEqual(self.state.db.execute("SELECT COUNT(*) FROM booking_requests").fetchone()[0], 0)
+
+            with self.state.db:
+                request = self.state.request_booking(1, 1, "patient2", "older request")
+                self.state.booking_status(request["id"], "approval")
+            self.update(3, f"Approve {request['id']}")
+            self.assertEqual(self.state.db.execute("SELECT status FROM booking_requests").fetchone()[0], "approval")
+            with self.state.db:
+                self.state.booking_status(request["id"], "queued")
+            self.bot.booking_due()
+            self.assertEqual(self.state.db.execute("SELECT status FROM booking_requests").fetchone()[0], "queued")
+            client.check_booking_eligibility.assert_not_called()
+            client.reserve_standard_visit.assert_not_called()
+
     def test_questionnaire_denial_pauses_booking_and_preserves_searches(self):
         self.update(1, "/find Adult | Internista")
         self.bot.flush()
@@ -665,6 +696,15 @@ class TelegramTransportTests(unittest.TestCase):
 
 
 class DeploymentConfigTests(unittest.TestCase):
+    def test_direct_booking_patient_scope_overrides_the_legacy_switch(self):
+        self.assertEqual(booking_patients({}), frozenset())
+        self.assertEqual(booking_patients({"LUXMED_DIRECT_BOOKING": "1"}), {"patient1", "patient2", "patient3"})
+        self.assertEqual(booking_patients({
+            "LUXMED_DIRECT_BOOKING": "1", "LUXMED_DIRECT_BOOKING_PATIENTS": "patient1",
+        }), {"patient1"})
+        with self.assertRaisesRegex(ValueError, "Invalid direct booking patient list"):
+            booking_patients({"LUXMED_DIRECT_BOOKING_PATIENTS": "patient1,unknown"})
+
     def test_device_credentials_load_per_profile_and_require_secure_portal_scope(self):
         cookie = {"name": "FixtureDevice", "value": "fixture", "domain": "portalpacjenta.luxmed.pl",
                   "path": "/PatientPortal", "secure": True, "expires": 2000000000}
