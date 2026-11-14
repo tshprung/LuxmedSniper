@@ -124,6 +124,11 @@ after the worker has a session that passes the portal's booking checks.
 The configuration package accepts the environment variable
 `LUXMED_DIRECT_BOOKING=1` for that rollout.
 
+A read-only internist check in a temporary GCP session verified by email
+received HTTP 200 and a questionnaire. The bot stops when LUX MED returns
+questions or when it cannot recognize the questionnaire response. Complete
+any required questionnaire in the Patient Portal.
+
 With the pilot enabled, reply `Book 2` to a fresh list to request that exact
 slot. The initial scope is covered in-person internist and routine
 pediatric visits. The bot rechecks the slot and asks for

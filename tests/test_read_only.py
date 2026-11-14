@@ -245,6 +245,29 @@ class AuditCliTests(unittest.TestCase):
         self.assertEqual((status, output), (1, "unexpected-response · booking-request-token"))
         self.assertTrue(request.call_args.args[1].endswith("/security/getforgerytoken"))
 
+    def test_booking_preflight_distinguishes_questions_from_unrecognized_responses(self):
+        for payload, expected in (
+            ({"questions": [{"name": "private-fixture"}]}, "portal-questions"),
+            ({"questions": {"name": "private-fixture"}}, "questionnaire-response-unrecognized"),
+            ({"questions": ["private-fixture"]}, "questionnaire-response-unrecognized"),
+            (["private-fixture"], "questionnaire-response-unrecognized"),
+        ):
+            with self.subTest(expected=expected):
+                status, output, request = self.run_audit("patient1", {
+                    "LUXMED_PATIENT1_LOGIN": "fixture",
+                    "LUXMED_PATIENT1_PASSWORD": "fixture",
+                    "LUXMED_PATIENT1_LOCATOR": "8*20*-1*-1",
+                }, [
+                    response({"token": "fixture-token"}),
+                    response({"canReserve": True}),
+                    response({"referrals": []}),
+                    response({"token": "fixture-request-token"}),
+                    response(payload),
+                ], options=("--booking-preflight",))
+                self.assertEqual((status, output), (1, f"{expected} · questionnaire"))
+                self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", *["GET"] * 4])
+                self.assertTrue(request.call_args.args[1].endswith("/PNM/Index"))
+
     def test_booking_preflight_checks_eligibility_penalty_and_verification_without_holding(self):
         status, output, request = self.run_audit("patient1", {
             "LUXMED_PATIENT1_LOGIN": "fixture",

@@ -389,8 +389,15 @@ class LuxMedPortal:
             "GET", f"{self.NEW_PORTAL_URL}/PNM/Index",
             params=params, headers=self._booking_request_headers(), stage="questionnaire",
         )
-        if not isinstance(triage, dict) or triage.get("questions") not in (None, []):
-            raise PortalError("portal-questions")
+        if not isinstance(triage, dict):
+            raise PortalError("questionnaire-response-unrecognized", stage="questionnaire")
+        questions = triage.get("questions")
+        if questions is not None and (
+            not isinstance(questions, list) or any(not isinstance(question, dict) for question in questions)
+        ):
+            raise PortalError("questionnaire-response-unrecognized", stage="questionnaire")
+        if questions:
+            raise PortalError("portal-questions", stage="questionnaire")
         availability = self._portal_json(
             "GET", f"{self.NEW_PORTAL_URL}/Reservation/serviceVariantAvailabilityDetails",
             params={"cityId": city_id, "serviceVariantId": service_variant_id, "reservationId": ""},
