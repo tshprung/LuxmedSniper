@@ -142,9 +142,12 @@ class LuxMedPortal:
     UPCOMING_VISITS_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/DashboardMedicalSection/GetUpcomingVisits'
     NON_SHOW_PENALTIES_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Reservation/CheckUserNonShowPenalties'
 
-    def __init__(self, credentials: Luxmed):
+    def __init__(self, credentials: Luxmed, *, trusted_device: dict | None = None):
         self.session = requests.Session()
         try:
+            if trusted_device is not None:
+                self.session.cookies.set(**trusted_device)
+                self.session.headers["X-Requested-With"] = "XMLHttpRequest"
             data = self._portal_json(
                 "POST",
                 self.LUXMED_LOGIN_URL,
@@ -155,7 +158,8 @@ class LuxMedPortal:
             if not isinstance(token, str) or not token or any(not 33 <= ord(char) <= 126 for char in token):
                 raise PortalError("login-unconfirmed", suspend=True)
             self.token_expires_at = self._token_expiry(token)
-            self.session.headers["authorization-token"] = f"Bearer {token}"
+            if trusted_device is None:
+                self.session.headers["authorization-token"] = f"Bearer {token}"
         except BaseException:
             self.session.close()
             raise

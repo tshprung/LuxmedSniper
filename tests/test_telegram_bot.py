@@ -12,7 +12,7 @@ from nacl.public import PrivateKey, SealedBox
 from luxmed_sniper import WARSAW, Appointment, Luxmed, PortalError
 from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
-from telegram_configuration import SECRET_KEYS, package_settings
+from telegram_configuration import SECRET_KEYS, package_settings, trusted_devices
 from telegram_free_text import FreeText, redacted_request
 from telegram_state import SearchState, next_search_time
 
@@ -163,6 +163,19 @@ class BotTests(unittest.TestCase):
             self.assertIs(self.bot.portal_for("patient1"), replacement)
             first.session.close.assert_called_once()
             self.assertEqual(portal.call_count, 2)
+
+    def test_device_registration_is_used_only_for_its_patient_and_before_expiry(self):
+        device = {"expires": self.now + 60}
+        self.bot.device_credentials = {"patient1": device}
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            self.bot.portal_for("patient1")
+            portal.assert_called_with(self.profiles["patient1"].credentials, trusted_device=device)
+            self.bot.portal_for("patient2")
+            portal.assert_called_with(self.profiles["patient2"].credentials)
+            self.bot.close_portals()
+            self.now += 60
+            self.bot.portal_for("patient1")
+            portal.assert_called_with(self.profiles["patient1"].credentials)
 
     def test_found_slots_complete_search_and_deliver_once(self):
         self.update(1, "/find Child | routine visit by phone")
@@ -652,6 +665,17 @@ class TelegramTransportTests(unittest.TestCase):
 
 
 class DeploymentConfigTests(unittest.TestCase):
+    def test_device_credentials_load_per_profile_and_require_secure_portal_scope(self):
+        cookie = {"name": "FixtureDevice", "value": "fixture", "domain": "portalpacjenta.luxmed.pl",
+                  "path": "/PatientPortal", "secure": True, "expires": 2000000000}
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {"CREDENTIALS_DIRECTORY": directory}):
+            credential = Path(directory) / "luxmed-device-patient1"
+            credential.write_text(json.dumps(cookie), encoding="utf-8")
+            self.assertEqual(trusted_devices(("patient1", "patient2")), {"patient1": cookie})
+            credential.write_text(json.dumps({**cookie, "domain": "example.org"}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Invalid LUX MED device credential"):
+                trusted_devices(("patient1", "patient2"))
+
     def test_package_contains_only_allowlisted_settings_and_is_encrypted(self):
         config = {name: "fixture" for name in SECRET_KEYS}
         config.update({

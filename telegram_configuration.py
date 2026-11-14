@@ -68,6 +68,37 @@ def worker_settings() -> dict:
     return dict(os.environ)
 
 
+def trusted_devices(profiles) -> dict:
+    directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not directory:
+        return {}
+    devices = {}
+    for patient in profiles:
+        credential = Path(directory) / f"luxmed-device-{patient}"
+        try:
+            cookie = json.loads(credential.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        if (
+            not isinstance(cookie, dict)
+            or set(cookie) != {"name", "value", "domain", "path", "secure", "expires"}
+            or not isinstance(cookie["name"], str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", cookie["name"])
+            or not re.search(r"device|trust|mfa", cookie["name"], re.IGNORECASE)
+            or not isinstance(cookie["value"], str)
+            or not re.fullmatch(r"[!-~]{1,8192}", cookie["value"])
+            or ";" in cookie["value"]
+            or cookie["domain"] not in ("portalpacjenta.luxmed.pl", ".portalpacjenta.luxmed.pl", ".luxmed.pl", "luxmed.pl")
+            or cookie["path"] not in ("/", "/PatientPortal", "/PatientPortal/")
+            or cookie["secure"] is not True
+            or type(cookie["expires"]) is not int
+            or cookie["expires"] <= 0
+        ):
+            raise ValueError("Invalid LUX MED device credential")
+        devices[patient] = cookie
+    return devices
+
+
 def package_settings(settings: dict, public_key: str) -> bytes:
     from nacl.public import PublicKey, SealedBox
 

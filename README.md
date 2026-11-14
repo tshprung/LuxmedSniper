@@ -131,6 +131,14 @@ eligibility, no-show restriction, and reservation verification reads passed.
 The bot treats JSON `null` as an empty questionnaire. It stops when LUX MED
 returns questions or when it cannot recognize the response.
 
+For a registered device, load its server-issued device cookie as a separate
+encrypted systemd credential named `luxmed-device-patient1`,
+`luxmed-device-patient2`, or `luxmed-device-patient3` for the matching
+account. Use a service drop-in with `LoadCredentialEncrypted` to load it
+from the GCP host. The worker uses the registration for fresh direct API
+logins while it is valid. LUX MED can require verification again when
+device trust expires or is revoked.
+
 With the pilot enabled, reply `Book 2` to a fresh list to request that exact
 slot. The initial scope is covered in-person internist and routine
 pediatric visits. The bot rechecks the slot and asks for
