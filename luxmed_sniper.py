@@ -204,7 +204,8 @@ class LuxMedPortal:
                 **error_context,
             ) from None
 
-    def search(self, locator: DoctorLocator, *, days: int = 14, date: datetime.date | None = None) -> list[Appointment]:
+    def search(self, locator: DoctorLocator, *, days: int = 14, date: datetime.date | None = None,
+               nationwide_from: str | None = None) -> list[Appointment]:
         now = datetime.datetime.now(tz=datetime.UTC)
         end = now + datetime.timedelta(days=days)
         params = {
@@ -222,9 +223,18 @@ class LuxMedPortal:
             params["facilitiesIds"] = locator.clinic_ids
         if locator.doctor_ids:
             params["doctorsIds"] = locator.doctor_ids
+        if nationwide_from is not None:
+            # LUX MED uses the selected city with this service's default nationwide scope.
+            params.update({
+                "searchPlace.name": nationwide_from, "nextSearch": "false", "searchByMedicalSpecialist": "false",
+            })
         content = self._portal_json("GET", self.NEW_PORTAL_RESERVATION_URL, params=params)
         try:
             appointments = self._parse_visits_new_portal(content, locator)
+            if nationwide_from is not None:
+                appointments.extend(self._load_limited_days(locator, params, content, now))
+                if any(not appointment.DoctorName and appointment.doctor_id for appointment in appointments):
+                    self._fill_phone_doctors(appointments, params)
         except (KeyError, TypeError, ValueError, OverflowError):
             raise PortalError("unexpected-response", suspend=True) from None
         return [
@@ -232,6 +242,57 @@ class LuxMedPortal:
             if now <= appointment.AppointmentDate <= end
             and (date is None or appointment.AppointmentDate.date() == date)
         ]
+
+    def _load_limited_days(self, locator: DoctorLocator, params: dict, content: dict,
+                           now: datetime.datetime) -> list[Appointment]:
+        service = content["termsForService"]
+        appointments = []
+        daily_params = {key: value for key, value in params.items() if key not in ("searchDatePreset", "nextSearch")}
+        first_day = max(params["searchDateFrom"], now.astimezone(WARSAW).date().isoformat())
+        loaded_days = {day.get("day", "")[:10] for day in service["termsForDays"] if day["terms"]}
+        for summary in service.get("termsInfoForDays", []):
+            count = (summary.get("termsCounter") or {}).get("termsNumber")
+            if summary.get("isLimitedDay") is not True or type(count) is not int or count <= 0:
+                continue
+            day = datetime.date.fromisoformat(summary["day"][:10]).isoformat()
+            if day in loaded_days or not first_day <= day <= params["searchDateTo"]:
+                continue
+            daily = self._portal_json(
+                "GET", f"{self.NEW_PORTAL_URL}/terms/oneDayTerms",
+                params={**daily_params, "searchDateFrom": day, "searchDateTo": day, "expectedTermsNumber": count},
+                stage="phone-availability",
+            )
+            appointments.extend(self._parse_visits_new_portal({
+                "correlationId": daily["correlationId"],
+                "termsForService": {"termsForDays": [daily["termsForDay"]], "additionalData": service.get("additionalData")},
+            }, locator))
+            loaded_days.add(day)
+        return appointments
+
+    def _fill_phone_doctors(self, appointments: list[Appointment], params: dict) -> None:
+        doctors = self._portal_json(
+            "GET", f"{self.DICTIONARY_URL}/Doctors",
+            params={"serviceVariantId": params["serviceVariantId"], "visitLanguageId": params["languageId"]},
+            stage="phone-doctors",
+        )
+        if not isinstance(doctors, list):
+            raise ValueError("Expected a list of clinicians")
+        by_id = {int(doctor["id"]): doctor for doctor in doctors}
+        for appointment in appointments:
+            if appointment.DoctorName or appointment.doctor_id not in by_id:
+                continue
+            doctor = by_id[appointment.doctor_id]
+            title, first_name, last_name = (
+                (doctor.get(key) or "").strip() for key in ("academicTitle", "firstName", "lastName")
+            )
+            appointment.doctor_search_name = " ".join(filter(None, (first_name, last_name)))
+            if appointment.doctor_search_name:
+                appointment.DoctorName = " ".join(filter(None, (title, appointment.doctor_search_name)))
+            if appointment.booking_term:
+                appointment.booking_term["doctor"] = {
+                    "id": appointment.doctor_id,
+                    **{key: doctor.get(key) for key in ("academicTitle", "firstName", "lastName")},
+                }
 
     @staticmethod
     def _parse_visits_new_portal(content: Any, locator: DoctorLocator) -> list[Appointment]:
@@ -289,7 +350,7 @@ class LuxMedPortal:
             or term.get("isVideoConsultation", False) is not False
             or (telephone and term.get("isPoz", False) is not False)
             or any(term.get(key) is not False for key in ("isAdditional", "isImpediment"))
-            or not (valid_city or (telephone and "cityId" in term and city_id is None))
+            or not (valid_city or (telephone and city_id is None))
             or any(type(term.get(key)) is not int or term[key] <= 0
                    for key in ("serviceId", "clinicId", "roomId", "scheduleId"))
         ):

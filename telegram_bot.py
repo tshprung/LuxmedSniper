@@ -305,6 +305,10 @@ class SearchBot:
             return key == normalize(INTERNIST_PHONE_SERVICE)
         return key in SUPPORTED_BOOKING_SERVICES
 
+    @staticmethod
+    def is_nationwide_phone_search(criteria: Criteria) -> bool:
+        return criteria.telephone and normalize(criteria.service) == normalize(INTERNIST_PHONE_SERVICE)
+
     def show_results(self, search_id: int) -> None:
         row = self.state.results(search_id)
         slots = json.loads(row["slots"])
@@ -446,7 +450,8 @@ class SearchBot:
         self.state.queue_message(f"{prefix}{self.search_heading(number, criteria)}\n{status}", search_id)
 
     def search_heading(self, number: int, criteria: Criteria) -> str:
-        heading = f"#{number} · {self.profiles[criteria.patient].name} · {criteria.service} · {criteria.city}"
+        location = "Nationwide (phone)" if self.is_nationwide_phone_search(criteria) else criteria.city
+        heading = f"#{number} · {self.profiles[criteria.patient].name} · {criteria.service} · {location}"
         if filters := criteria.preferences.describe():
             heading += f"\n{filters}"
         return heading
@@ -631,7 +636,9 @@ class SearchBot:
                 raise PortalError("booking-penalty")
             portal.check_booking_eligibility(criteria.city_id, slot["service_id"])
             locator = DoctorLocator(id=f"{criteria.city_id}*{slot['service_id']}*-1*{slot['doctor_id']}")
-            appointment = self.refresh_booking_slot(portal, locator, slot, telephone=criteria.telephone)
+            appointment = self.refresh_booking_slot(
+                portal, locator, slot, nationwide_from=criteria.city if criteria.telephone else None,
+            )
             start = appointment.AppointmentDate.astimezone(dt.UTC)
             end = appointment.booking_term["end"].astimezone(dt.UTC)
             reasons = self.booking_approval_reasons(portal, start, end)
@@ -663,10 +670,12 @@ class SearchBot:
             self.state.queue_message(f"{description}\nBooked and verified in LUX MED.", row["id"])
 
     @staticmethod
-    def refresh_booking_slot(portal, locator: DoctorLocator, slot: dict, *, telephone: bool = False):
+    def refresh_booking_slot(portal, locator: DoctorLocator, slot: dict, *, nationwide_from: str | None = None):
         date = dt.datetime.fromtimestamp(slot["start"], WARSAW).date()
+        telephone = nationwide_from is not None
+        availability = portal.search(locator, date=date, nationwide_from=nationwide_from)
         matches = [
-            item for item in portal.search(locator, date=date)
+            item for item in availability
             if int(item.AppointmentDate.timestamp()) == slot["start"]
             and item.clinic_id == slot["clinic_id"] and item.doctor_id == slot["doctor_id"]
             and item.service_id == slot["service_id"]
@@ -801,7 +810,11 @@ class SearchBot:
 
         locator = DoctorLocator(id=f"{row['city_id']}*{service_id}*-1*-1")
         try:
-            slots, outside_clinic = matching_slots(portal.search(locator), criteria.preferences)
+            if self.is_nationwide_phone_search(criteria):
+                appointments = portal.search(locator, nationwide_from=criteria.city)
+            else:
+                appointments = portal.search(locator)
+            slots, outside_clinic = matching_slots(appointments, criteria.preferences)
         except PreferenceError as error:
             with self.state.db:
                 self.state.record_result(search_id, int(self.clock()), "ambiguous-doctor")
