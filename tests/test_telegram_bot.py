@@ -349,9 +349,9 @@ class BotTests(unittest.TestCase):
                     "isTelemedicine": True, "isVideoConsultation": False, "isPoz": False}]
         slot = {
             "dateTimeFrom": "2030-03-31T10:00:00+02:00", "dateTimeTo": "2030-03-31T10:15:00+02:00",
-            "clinicGroupId": 4, "clinicId": 12, "clinic": "Fixture clinic", "cityId": None,
+            "clinicGroupId": 4, "clinicId": 12, "clinic": None,
             "serviceId": 30, "roomId": 19, "scheduleId": 20,
-            "doctor": {"id": 9, "firstName": "Fixture", "lastName": "Doctor", "academicTitle": None},
+            "doctor": {"id": 9},
             "isTelemedicine": True, "isAdditional": False, "isImpediment": False,
         }
         availability = {
@@ -362,13 +362,22 @@ class BotTests(unittest.TestCase):
         hold = {"hasErrors": False, "hasWarnings": False, "value": {
             "temporaryReservationId": 135, "askForReferral": False, "valuations": [valuation],
         }}
-        terms = {"termsForService": {"termsForDays": [{"terms": [slot]}]}}
+        day = "2030-03-31"
+        terms = {"termsForService": {"termsForDays": [], "termsInfoForDays": [{
+            "day": day, "isLimitedDay": True, "termsCounter": {"termsNumber": 1},
+        }]}}
         portal = LuxMedPortal
         base = portal.NEW_PORTAL_URL
         replies = {
             ("POST", portal.LUXMED_LOGIN_URL): {"token": "fixture-token"},
             ("GET", portal.DICTIONARY_SERVICES_URL): catalog,
-            ("GET", portal.NEW_PORTAL_RESERVATION_URL): {**terms, "correlationId": "fixture-correlation"},
+            ("GET", f"{portal.DICTIONARY_URL}/Doctors"): [
+                {"id": 9, "firstName": "Fixture", "lastName": "Doctor", "academicTitle": None},
+            ],
+            ("GET", portal.NEW_PORTAL_RESERVATION_URL): {**terms, "correlationId": "index-correlation"},
+            ("GET", f"{base}/terms/oneDayTerms"): {
+                "termsForDay": {"day": day, "terms": [slot]}, "correlationId": "daily-correlation",
+            },
             ("GET", portal.NON_SHOW_PENALTIES_URL): {"canReserve": True},
             ("GET", f"{base}/Reservation/GetLimits"): {"canReserve": True},
             ("GET", f"{base}/Reservation/GetReferralsForReservation"): {"referrals": []},
@@ -395,6 +404,8 @@ class BotTests(unittest.TestCase):
             self.update(1, "Find an internist phone consultation for Adult in Wrocław")
             self.bot.flush()
             self.bot.search_due()
+            self.assertIn("Nationwide (phone)", self.state.next_message()["text"])
+            self.assertIn("Fixture Doctor", self.state.next_message()["text"])
             self.assertIn("Book <option number>", self.state.next_message()["text"])
             self.bot.flush()
             self.update(2, "Book 1")
@@ -414,9 +425,23 @@ class BotTests(unittest.TestCase):
         self.assertIs(lock.kwargs["json"]["isPoz"], False)
         self.assertIs(lock.kwargs["json"]["isVideoConsultation"], False)
         self.assertIsNone(lock.kwargs["json"]["cityId"])
+        self.assertEqual(lock.kwargs["json"]["doctor"]["lastName"], "Doctor")
+        self.assertEqual(lock.kwargs["json"]["correlationId"], "daily-correlation")
         self.assertEqual(lock.kwargs["json"]["timeFrom"], "10:00")
         self.assertEqual(confirm.kwargs["json"]["temporaryReservationId"], 135)
         self.assertEqual(http.call_args.args, ("GET", portal.UPCOMING_VISITS_URL))
+        indexes = [call.kwargs["params"] for call in http.call_args_list
+                   if call.args == ("GET", portal.NEW_PORTAL_RESERVATION_URL)]
+        daily_calls = [call.kwargs["params"] for call in http.call_args_list
+                       if call.args == ("GET", f"{base}/terms/oneDayTerms")]
+        self.assertEqual(len(indexes), 3)
+        self.assertEqual(len(daily_calls), 3)
+        for index, daily in zip(indexes, daily_calls, strict=True):
+            self.assertEqual(daily["processId"], index["processId"])
+            self.assertEqual(daily["delocalized"], "false")
+            self.assertEqual(daily["searchDateFrom"], daily["searchDateTo"])
+            self.assertEqual(daily["searchDateFrom"], day)
+        self.assertEqual(daily_calls[-1]["doctorsIds"], [9])
 
     def test_nfz_internist_phone_slot_remains_in_the_portal(self):
         self.bot.allowed_booking_patients = frozenset({"patient1"})
