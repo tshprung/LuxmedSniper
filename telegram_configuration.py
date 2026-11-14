@@ -15,7 +15,17 @@ SECRET_KEYS = (
     "LUXMED_TELEGRAM_PROFILES",
     *(f"LUXMED_{key.upper()}_{field}" for key in PROFILE_KEYS for field in ("LOGIN", "PASSWORD")),
 )
-OPTIONAL_SECRET_KEYS = ("OPENAI_API_KEY", "LUXMED_BOOKING_CALENDAR", "LUXMED_DIRECT_BOOKING")
+OPTIONAL_SECRET_KEYS = ("OPENAI_API_KEY", "LUXMED_BOOKING_CALENDAR", "LUXMED_DIRECT_BOOKING", "LUXMED_DIRECT_BOOKING_PATIENTS")
+
+
+def booking_patients(settings: dict) -> frozenset[str]:
+    scope = settings.get("LUXMED_DIRECT_BOOKING_PATIENTS", "").strip()
+    if not scope:
+        return frozenset(PROFILE_KEYS) if settings.get("LUXMED_DIRECT_BOOKING") == "1" else frozenset()
+    patients = frozenset(part.strip() for part in scope.split(","))
+    if not patients.issubset(PROFILE_KEYS):
+        raise ValueError("Invalid direct booking patient list")
+    return patients
 
 
 def calendar_settings(settings: dict) -> dict | None:
@@ -58,6 +68,7 @@ def validate(settings) -> dict:
         ):
             raise ValueError("Invalid profile configuration")
     calendar_settings(settings)
+    booking_patients(settings)
     return profiles
 
 
