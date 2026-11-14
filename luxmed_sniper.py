@@ -389,6 +389,9 @@ class LuxMedPortal:
             "GET", f"{self.NEW_PORTAL_URL}/PNM/Index",
             params=params, headers=self._booking_request_headers(), stage="questionnaire",
         )
+        # The portal can return JSON null after the patient completes the questions.
+        if triage is None:
+            triage = {}
         if not isinstance(triage, dict):
             raise PortalError("questionnaire-response-unrecognized", stage="questionnaire")
         questions = triage.get("questions")
