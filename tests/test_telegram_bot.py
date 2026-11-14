@@ -23,6 +23,40 @@ def local_timestamp(day, hour, minute=0):
 
 
 class CalendarTests(unittest.TestCase):
+    def test_primary_calendar_free_busy_accepts_the_resolved_calendar_id(self):
+        calendar = CalendarAvailability({"calendar_ids": ["primary"]})
+        start = dt.datetime(2030, 3, 31, 11, tzinfo=WARSAW)
+        with (
+            patch.object(calendar, "_headers", return_value={}),
+            patch.object(calendar, "post", return_value={"calendars": {"actual-id": {"busy": []}}}) as post,
+        ):
+            self.assertFalse(calendar.busy(start, start + dt.timedelta(minutes=15)))
+        self.assertEqual(post.call_args.kwargs["json"]["items"], [{"id": "primary"}])
+
+    def test_calendar_insert_recognizes_an_existing_event_after_retry(self):
+        calendar = CalendarAvailability({})
+        start = dt.datetime(2030, 3, 31, 11, tzinfo=WARSAW)
+        end = start + dt.timedelta(minutes=15)
+        key = "fixture123"
+        with (
+            patch.object(calendar, "_headers", return_value={}),
+            patch("telegram_calendar.requests.post") as insert,
+            patch("telegram_calendar.requests.get") as get,
+        ):
+            insert.return_value.__enter__.return_value.status_code = 409
+            existing = get.return_value.__enter__.return_value
+            existing.status_code = 200
+            existing.json.return_value = {"id": key, "status": "confirmed"}
+            calendar.add_booking("primary", key, start, end)
+            existing.json.return_value = {"id": key, "status": "cancelled"}
+            with self.assertRaises(CalendarUnavailable):
+                calendar.add_booking("primary", key, start, end)
+        self.assertEqual(insert.call_args.kwargs["json"], {
+            "id": key, "summary": "Appointment", "visibility": "private",
+            "start": {"dateTime": start.isoformat()}, "end": {"dateTime": end.isoformat()},
+        })
+        self.assertTrue(get.call_args.args[0].endswith(f"/calendars/primary/events/{key}"))
+
     def test_free_busy_uses_only_intervals_and_checks_errors_for_each_calendar(self):
         calendar = CalendarAvailability({
             "client_id": "fixture", "client_secret": "fixture", "refresh_token": "fixture",
@@ -316,6 +350,7 @@ class BotTests(unittest.TestCase):
 
     def test_clear_booking_submits_once_and_verification_failure_is_not_retried(self):
         self.bot.calendar = MagicMock()
+        self.bot.calendar_destination = "primary"
         self.bot.calendar.busy.return_value = False
         self.update(1, "/find Child | routine visit")
         self.bot.flush()
@@ -337,10 +372,50 @@ class BotTests(unittest.TestCase):
             self.bot.booking_due()
             client.reserve_standard_visit.assert_called_once()
             self.assertIn("booking outcome is unclear", self.state.next_message()["text"])
+            self.assertIsNone(self.state.due_calendar_event("primary", self.now))
             self.bot.flush()
             self.update(3, "Book 1")
             self.bot.booking_due()
             self.assertIn("prior booking for this patient is unverified", self.state.next_message()["text"])
+            client.reserve_standard_visit.assert_called_once()
+
+    def test_verified_booking_retries_calendar_delivery_with_same_event_id(self):
+        self.bot.calendar = MagicMock()
+        self.bot.calendar.busy.return_value = False
+        self.bot.calendar.add_booking.side_effect = [CalendarUnavailable, None]
+        self.bot.calendar_destination = "primary"
+        self.update(1, "/find Adult | Internista")
+        self.bot.flush()
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            client = portal.return_value
+            start = dt.datetime.fromtimestamp(self.now + 9 * 3600, WARSAW)
+            slot = Appointment(start, 2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9,
+                               booking_term={"cityId": 5, "end": start + dt.timedelta(minutes=15)})
+            client.resolve_service.return_value = 12
+            client.search.return_value = [slot]
+            client.is_booking_blocked_by_penalty.return_value = False
+            client.has_booking_conflict.return_value = False
+            client.reserve_standard_visit.return_value = 543
+            client.booked_visit_ids.return_value = {543}
+            self.bot.search_due()
+            self.bot.flush()
+            self.update(2, "Book 1")
+            self.bot.flush()
+            self.bot.booking_due()
+            self.assertIn("Booked and verified in LUX MED", self.state.next_message()["text"])
+            self.bot.flush()
+            self.bot.sync_calendar_due()
+            self.assertIsNone(self.state.next_message())
+            self.bot.sync_calendar_due()
+            self.bot.calendar.add_booking.assert_called_once()
+            self.now += 15 * 60
+            self.bot.sync_calendar_due()
+            self.assertIn("Added the appointment to Google Calendar", self.state.next_message()["text"])
+            self.bot.sync_calendar_due()
+            first, retry = self.bot.calendar.add_booking.call_args_list
+            self.assertEqual(first, retry)
+            self.assertEqual(retry.args[0], "primary")
+            self.assertEqual(retry.args[2], start)
             client.reserve_standard_visit.assert_called_once()
 
     def test_regular_phone_booking_from_search_to_verified_appointment(self):

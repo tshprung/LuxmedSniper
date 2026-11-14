@@ -167,6 +167,15 @@ free/busy scope and run the encrypted configuration handoff again. The
 worker requests busy time ranges only. Without this configuration it
 asks you to check your calendar before approving.
 
+To check the account's primary calendar, set `"calendar_ids": ["primary"]`.
+To also add new verified bookings there, set `"destination_calendar_id": "primary"`
+and authorize the OAuth credential with the Calendar availability and
+`calendar.events.owned` scopes. Each event is private with the title
+“Appointment” and the booked time. The worker retries event creation
+using the same event ID and keeps the appointment status in LUX MED
+independent of the calendar result. Cancelled appointments already in
+Google Calendar need to be removed there.
+
 ### Read-only booking feasibility
 
 Run `python audit_search.py patient1 --booking-check` with the same private

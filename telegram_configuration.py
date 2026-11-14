@@ -39,6 +39,9 @@ def calendar_settings(settings: dict) -> dict | None:
                for key in ("client_id", "client_secret", "refresh_token"))
         or not isinstance(data.get("calendar_ids"), list) or not 1 <= len(data["calendar_ids"]) <= 50
         or any(not isinstance(key, str) or not key.strip() for key in data["calendar_ids"])
+        or ("destination_calendar_id" in data and (
+            not isinstance(data["destination_calendar_id"], str) or not data["destination_calendar_id"].strip()
+        ))
     ):
         raise ValueError("Invalid booking calendar configuration")
     return data
