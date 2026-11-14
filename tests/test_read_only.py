@@ -269,27 +269,29 @@ class AuditCliTests(unittest.TestCase):
                 self.assertTrue(request.call_args.args[1].endswith("/PNM/Index"))
 
     def test_booking_preflight_checks_eligibility_penalty_and_verification_without_holding(self):
-        status, output, request = self.run_audit("patient1", {
-            "LUXMED_PATIENT1_LOGIN": "fixture",
-            "LUXMED_PATIENT1_PASSWORD": "fixture",
-            "LUXMED_PATIENT1_LOCATOR": "8*20*-1*-1",
-        }, [
-            response({"token": "fixture-token"}),
-            response({"canReserve": True}),
-            response({"referrals": []}),
-            response({"token": "fixture-request-token"}),
-            response({"questions": []}),
-            response({
-                "isNotAvailableInCity": False, "isNotAvailableInContract": False,
-                "isNotAvailableInAreaOfCare": False, "blockedByAccountLevel": False,
-            }),
-            response({"canReserve": True}),
-            response({"events": []}),
-        ], options=("--booking-preflight",))
-        self.assertEqual((status, output), (0, "booking-preflight-completed"))
-        self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", *["GET"] * 7])
-        self.assertEqual(request.call_args_list[-2].args[1], LuxMedPortal.NON_SHOW_PENALTIES_URL)
-        self.assertEqual(request.call_args.args[1], LuxMedPortal.UPCOMING_VISITS_URL)
+        for triage in (None, {"questions": []}):
+            with self.subTest(triage=triage):
+                status, output, request = self.run_audit("patient1", {
+                    "LUXMED_PATIENT1_LOGIN": "fixture",
+                    "LUXMED_PATIENT1_PASSWORD": "fixture",
+                    "LUXMED_PATIENT1_LOCATOR": "8*20*-1*-1",
+                }, [
+                    response({"token": "fixture-token"}),
+                    response({"canReserve": True}),
+                    response({"referrals": []}),
+                    response({"token": "fixture-request-token"}),
+                    response(triage),
+                    response({
+                        "isNotAvailableInCity": False, "isNotAvailableInContract": False,
+                        "isNotAvailableInAreaOfCare": False, "blockedByAccountLevel": False,
+                    }),
+                    response({"canReserve": True}),
+                    response({"events": []}),
+                ], options=("--booking-preflight",))
+                self.assertEqual((status, output), (0, "booking-preflight-completed"))
+                self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", *["GET"] * 7])
+                self.assertEqual(request.call_args_list[-2].args[1], LuxMedPortal.NON_SHOW_PENALTIES_URL)
+                self.assertEqual(request.call_args.args[1], LuxMedPortal.UPCOMING_VISITS_URL)
 
     def test_all_three_profiles_use_only_their_own_configuration(self):
         profiles = ("patient1", "patient2", "patient3")

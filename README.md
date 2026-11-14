@@ -125,9 +125,11 @@ The configuration package accepts the environment variable
 `LUXMED_DIRECT_BOOKING=1` for that rollout.
 
 A read-only internist check in a temporary GCP session verified by email
-received HTTP 200 and a questionnaire. The bot stops when LUX MED returns
-questions or when it cannot recognize the questionnaire response. Complete
-any required questionnaire in the Patient Portal.
+received HTTP 200 and a questionnaire. After the patient answered it in
+Chrome, a fresh email-verified GCP session received JSON `null`, and the
+eligibility, no-show restriction, and reservation verification reads passed.
+The bot treats JSON `null` as an empty questionnaire. It stops when LUX MED
+returns questions or when it cannot recognize the response.
 
 With the pilot enabled, reply `Book 2` to a fresh list to request that exact
 slot. The initial scope is covered in-person internist and routine
