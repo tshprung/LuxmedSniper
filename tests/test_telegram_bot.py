@@ -257,6 +257,26 @@ class BotTests(unittest.TestCase):
         self.assertIn("1. 31.03 14:00", final)
         self.assertNotIn("09:00", final)
 
+    def test_unnamed_clinicians_in_saved_results_are_omitted_from_list_and_details(self):
+        self.update(1, "/find Adult | Fixture service")
+        self.bot.flush()
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            portal.return_value.resolve_service.return_value = 12
+            portal.return_value.search.return_value = [
+                Appointment(dt.datetime(2030, 3, 31, 10, tzinfo=WARSAW), 2, "Fixture clinic",
+                            "None None None", 12, requires_preparation=True),
+            ]
+            self.bot.search_due()
+        listing = self.state.next_message()["text"]
+        self.assertIn("1. 31.03 10:00 · Fixture clinic\n", listing)
+        self.assertNotIn("None", listing)
+        self.bot.flush()
+        self.update(2, "Details 1")
+        details = self.state.next_message()["text"]
+        self.assertIn("Option 1. 31.03 10:00 · Fixture clinic\n", details)
+        self.assertIn("preparation instructions", details)
+        self.assertNotIn("None", details)
+
     def test_booking_asks_for_approval_when_calendar_is_unavailable_or_short_notice(self):
         self.update(1, "/find Child | routine visit")
         self.bot.flush()

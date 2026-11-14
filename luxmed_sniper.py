@@ -247,9 +247,9 @@ class LuxMedPortal:
             if not isinstance(terms, list):
                 raise ValueError("Expected a list of slots")
             for term in terms:
-                doctor = term["doctor"]
+                doctor = term.get("doctor") or {}
                 clinic_id = int(term["clinicGroupId"])
-                doctor_id = int(doctor["id"])
+                doctor_id = int(doctor["id"]) if doctor.get("id") is not None else None
                 if locator.doctor_ids and doctor_id not in locator.doctor_ids:
                     continue
                 if locator.clinic_ids and clinic_id not in locator.clinic_ids:
@@ -257,16 +257,21 @@ class LuxMedPortal:
                 starts_at = datetime.datetime.fromisoformat(term["dateTimeFrom"])
                 if starts_at.tzinfo is None:
                     starts_at = starts_at.replace(tzinfo=WARSAW)
+                title, first_name, last_name = (
+                    (doctor.get(key) or "").strip() for key in ("academicTitle", "firstName", "lastName")
+                )
+                name = " ".join(filter(None, (first_name, last_name)))
                 appointments.append(
                     Appointment(
                         starts_at.astimezone(WARSAW),
                         term["clinicId"],
                         term["clinic"],
-                        f"{doctor['academicTitle']} {doctor['firstName']} {doctor['lastName']}",
+                        " ".join(filter(None, (title, name))) if name else "",
                         term["serviceId"],
-                        doctor_search_name=f"{doctor['firstName']} {doctor['lastName']}",
+                        doctor_search_name=name,
                         doctor_id=doctor_id,
-                        booking_term=LuxMedPortal._booking_term(term, terms_for_service, content.get("correlationId")),
+                        booking_term=LuxMedPortal._booking_term(term, terms_for_service, content.get("correlationId"))
+                        if doctor_id is not None else None,
                         requires_preparation=requires_preparation,
                     ),
                 )
@@ -293,7 +298,7 @@ class LuxMedPortal:
         return {
             "correlationId": correlation_id, "roomId": term["roomId"], "scheduleId": term["scheduleId"],
             "cityId": term["cityId"], "cityName": term.get("city"),
-            "doctor": {key: term["doctor"][key] for key in ("id", "academicTitle", "firstName", "lastName")},
+            "doctor": {key: term["doctor"].get(key) for key in ("id", "academicTitle", "firstName", "lastName")},
             "start": start.astimezone(WARSAW) if start.tzinfo else start.replace(tzinfo=WARSAW),
             "end": end.astimezone(WARSAW) if end.tzinfo else end.replace(tzinfo=WARSAW),
         }

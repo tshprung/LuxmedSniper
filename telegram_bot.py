@@ -280,11 +280,14 @@ class SearchBot:
     @staticmethod
     def slot_details(slot: dict) -> str:
         starts = dt.datetime.fromtimestamp(slot["start"], WARSAW).strftime("%d.%m %H:%M")
-        return " · ".join(value for value in (starts, slot["clinic"], slot["doctor"]) if value)
+        _, clinic, doctor = SearchBot.slot_key(slot)
+        return " · ".join(value for value in (starts, clinic, doctor) if value)
 
     @staticmethod
     def slot_key(slot: dict) -> tuple[int, str, str]:
-        return slot["start"], slot["clinic"], slot["doctor"]
+        doctor = slot["doctor"]
+        # Older result lists stored this placeholder for an unnamed clinician.
+        return slot["start"], slot["clinic"], "" if doctor == "None None None" else doctor
 
     @staticmethod
     def portal_notices(service: str, slots: list[dict]) -> list[str]:
