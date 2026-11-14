@@ -9,11 +9,12 @@ from unittest.mock import MagicMock, patch
 import requests
 from nacl.public import PrivateKey, SealedBox
 
-from luxmed_sniper import WARSAW, Appointment, Luxmed, PortalError
+from luxmed_sniper import WARSAW, Appointment, LuxMedPortal, Luxmed, PortalError
 from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import SECRET_KEYS, booking_patients, package_settings, trusted_devices
 from telegram_free_text import FreeText, redacted_request
+from telegram_requests import INTERNIST_PHONE_SERVICE
 from telegram_state import SearchState, next_search_time
 
 
@@ -341,6 +342,100 @@ class BotTests(unittest.TestCase):
             self.bot.booking_due()
             self.assertIn("prior booking for this patient is unverified", self.state.next_message()["text"])
             client.reserve_standard_visit.assert_called_once()
+
+    def test_regular_phone_booking_from_search_to_verified_appointment(self):
+        self.bot.allowed_booking_patients = frozenset({"patient1"})
+        catalog = [{"name": INTERNIST_PHONE_SERVICE, "id": 30,
+                    "isTelemedicine": True, "isVideoConsultation": False, "isPoz": False}]
+        slot = {
+            "dateTimeFrom": "2030-03-31T10:00:00+02:00", "dateTimeTo": "2030-03-31T10:15:00+02:00",
+            "clinicGroupId": 4, "clinicId": 12, "clinic": "Fixture clinic", "cityId": None,
+            "serviceId": 30, "roomId": 19, "scheduleId": 20,
+            "doctor": {"id": 9, "firstName": "Fixture", "lastName": "Doctor", "academicTitle": None},
+            "isTelemedicine": True, "isAdditional": False, "isImpediment": False,
+        }
+        availability = {
+            "isNotAvailableInCity": False, "isNotAvailableInContract": False,
+            "isNotAvailableInAreaOfCare": False, "blockedByAccountLevel": False,
+        }
+        valuation = {"valuationType": 1, "price": 0, "isReferralRequired": False}
+        hold = {"hasErrors": False, "hasWarnings": False, "value": {
+            "temporaryReservationId": 135, "askForReferral": False, "valuations": [valuation],
+        }}
+        terms = {"termsForService": {"termsForDays": [{"terms": [slot]}]}}
+        portal = LuxMedPortal
+        base = portal.NEW_PORTAL_URL
+        replies = {
+            ("POST", portal.LUXMED_LOGIN_URL): {"token": "fixture-token"},
+            ("GET", portal.DICTIONARY_SERVICES_URL): catalog,
+            ("GET", portal.NEW_PORTAL_RESERVATION_URL): {**terms, "correlationId": "fixture-correlation"},
+            ("GET", portal.NON_SHOW_PENALTIES_URL): {"canReserve": True},
+            ("GET", f"{base}/Reservation/GetLimits"): {"canReserve": True},
+            ("GET", f"{base}/Reservation/GetReferralsForReservation"): {"referrals": []},
+            ("GET", f"{base}/security/getforgerytoken"): {"token": "fixture-request-token"},
+            ("GET", f"{base}/PNM/Index"): None,
+            ("GET", f"{base}/Reservation/serviceVariantAvailabilityDetails"): availability,
+            ("GET", f"{base}/terms/getevents"): {"events": []},
+            ("POST", f"{base}/Reservation/LockTerm"): hold,
+            ("POST", f"{base}/Reservation/Confirm"): {"hasErrors": False, "value": {"reservationId": 246}},
+            ("GET", portal.UPCOMING_VISITS_URL): {"events": [{"eventType": 7, "status": 1, "eventId": 246}]},
+        }
+
+        def request(method, url, **kwargs):
+            result = requests.Response()
+            result.status_code = 200
+            result._content = json.dumps(replies[method, url]).encode()
+            return result
+
+        with (
+            patch("luxmed_sniper.datetime.datetime", wraps=dt.datetime) as clock,
+            patch.object(requests.Session, "request", side_effect=request) as http,
+        ):
+            clock.now.return_value = dt.datetime.fromtimestamp(self.now, dt.UTC)
+            self.update(1, "Find an internist phone consultation for Adult in Wrocław")
+            self.bot.flush()
+            self.bot.search_due()
+            self.assertIn("Book <option number>", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(2, "Book 1")
+            self.bot.flush()
+            self.bot.booking_due()
+            self.assertIn("Approve 1", self.state.next_message()["text"])
+            reserve = (f"{base}/Reservation/LockTerm", f"{base}/Reservation/Confirm")
+            self.assertFalse(any(call.args[1] in reserve for call in http.call_args_list))
+            self.bot.flush()
+            self.update(3, "Approve 1")
+            self.bot.flush()
+            self.bot.booking_due()
+            self.assertIn("Booked and verified in LUX MED", self.state.next_message()["text"])
+
+        lock, confirm = [call for call in http.call_args_list if call.args[1] in reserve]
+        self.assertIs(lock.kwargs["json"]["isTelemedicine"], True)
+        self.assertIs(lock.kwargs["json"]["isPoz"], False)
+        self.assertIs(lock.kwargs["json"]["isVideoConsultation"], False)
+        self.assertIsNone(lock.kwargs["json"]["cityId"])
+        self.assertEqual(lock.kwargs["json"]["timeFrom"], "10:00")
+        self.assertEqual(confirm.kwargs["json"]["temporaryReservationId"], 135)
+        self.assertEqual(http.call_args.args, ("GET", portal.UPCOMING_VISITS_URL))
+
+    def test_nfz_internist_phone_slot_remains_in_the_portal(self):
+        self.bot.allowed_booking_patients = frozenset({"patient1"})
+        self.update(1, f"/find Adult | {INTERNIST_PHONE_SERVICE} NFZ (POZ)")
+        self.bot.flush()
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            client = portal.return_value
+            client.resolve_service.return_value = 12
+            client.search.return_value = [
+                Appointment(dt.datetime.fromtimestamp(self.now + 8 * 3600, WARSAW),
+                            2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9),
+            ]
+            self.bot.search_due()
+            self.assertIn("Details <option number>", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(2, "Book 1")
+            self.assertIn("needs to be booked in the Patient Portal", self.state.next_message()["text"])
+            self.bot.booking_due()
+            client.reserve_standard_visit.assert_not_called()
 
     def test_disabled_booking_returns_portal_link_without_accessing_luxmed(self):
         self.bot.booking_enabled = False

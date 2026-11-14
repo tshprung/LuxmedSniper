@@ -142,8 +142,10 @@ logins while it is valid. LUX MED can require verification again when
 device trust expires or is revoked.
 
 With the pilot enabled, reply `Book 2` to a fresh list to request that exact
-slot. The initial scope is covered in-person internist and routine
-pediatric visits. The bot rechecks the slot and asks for
+slot. Supported services include covered in-person internist and routine
+pediatric visits, and the regular internist phone consultation
+(`Konsultacja internistyczna - telefoniczna`). The NFZ phone option is
+available through the Patient Portal. The bot rechecks the slot and asks for
 approval when it starts in less than six hours, it detects a scheduling
 conflict, or a conflict check is unavailable. Use `Approve 1` with the
 request number shown, or `Stop booking 1` to drop a pending request.

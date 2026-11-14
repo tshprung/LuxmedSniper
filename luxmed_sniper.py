@@ -279,13 +279,19 @@ class LuxMedPortal:
 
     @staticmethod
     def _booking_term(term: dict, service: dict, correlation_id) -> dict | None:
-        """Keep the fields the standard in-person reservation flow needs in memory."""
+        """Keep the fields the standard reservation flow needs in memory."""
+        telephone = term.get("isTelemedicine")
+        city_id = term.get("cityId")
+        valid_city = type(city_id) is int and city_id >= (0 if telephone else 1)
         if (
             not isinstance(correlation_id, str) or not correlation_id
-            or term.get("isTelemedicine") is not False
+            or type(telephone) is not bool
+            or term.get("isVideoConsultation", False) is not False
+            or (telephone and term.get("isPoz", False) is not False)
             or any(term.get(key) is not False for key in ("isAdditional", "isImpediment"))
+            or not (valid_city or (telephone and "cityId" in term and city_id is None))
             or any(type(term.get(key)) is not int or term[key] <= 0
-                   for key in ("cityId", "serviceId", "clinicId", "roomId", "scheduleId"))
+                   for key in ("serviceId", "clinicId", "roomId", "scheduleId"))
         ):
             return None
         additional = service.get("additionalData") or {}
@@ -297,7 +303,7 @@ class LuxMedPortal:
             return None
         return {
             "correlationId": correlation_id, "roomId": term["roomId"], "scheduleId": term["scheduleId"],
-            "cityId": term["cityId"], "cityName": term.get("city"),
+            "cityId": city_id, "cityName": term.get("city"), "isTelemedicine": telephone,
             "doctor": {key: term["doctor"].get(key) for key in ("id", "academicTitle", "firstName", "lastName")},
             "start": start.astimezone(WARSAW) if start.tzinfo else start.replace(tzinfo=WARSAW),
             "end": end.astimezone(WARSAW) if end.tzinfo else end.replace(tzinfo=WARSAW),
@@ -306,18 +312,19 @@ class LuxMedPortal:
     def get_cities(self) -> list[dict]:
         return self._portal_json("GET", self.DICTIONARY_CITIES_URL)
 
-    def booked_visit_ids(self) -> set[int]:
-        """Return IDs of reserved or confirmed in-person visits shown on the dashboard."""
+    def booked_visit_ids(self, *, telephone: bool = False) -> set[int]:
+        """Return IDs of reserved or confirmed visits of the requested type."""
         content = self._portal_json("GET", self.UPCOMING_VISITS_URL)
         events = content.get("events") if isinstance(content, dict) else None
         if not isinstance(events, list):
             raise PortalError("unexpected-upcoming-visits", suspend=True)
 
+        event_type = 7 if telephone else 1  # Telemedicine or Visit in the portal enum.
         booked = set()
         for event in events:
             if not isinstance(event, dict) or type(event.get("eventType")) is not int:
                 raise PortalError("unexpected-upcoming-visits", suspend=True)
-            if event["eventType"] != 1:  # Visit in the portal's event type enum.
+            if event["eventType"] != event_type:
                 continue
             status = event.get("status")
             if type(status) is not int or not 0 <= status <= 6:
@@ -381,7 +388,7 @@ class LuxMedPortal:
         return {**headers, "XSRF-TOKEN": token}
 
     def check_booking_eligibility(self, city_id: int, service_variant_id: int) -> None:
-        """Check the normal portal prerequisites for an in-person visit without a referral."""
+        """Check the normal portal prerequisites for a visit without a referral."""
         limits = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/Reservation/GetLimits", stage="booking-limits")
         if not isinstance(limits, dict) or limits.get("canReserve") is not True:
             raise PortalError("booking-limit")
@@ -426,16 +433,18 @@ class LuxMedPortal:
         term = appointment.booking_term
         if term is None or appointment.doctor_id is None:
             raise PortalError("booking-details-missing")
+        telephone = term["isTelemedicine"]
         payload = {
             "cityId": term["cityId"], "cityName": term["cityName"], "serviceVariantId": appointment.service_id,
             "serviceVariantName": service_name,
-            "facilityId": appointment.clinic_id, "facilityName": appointment.ClinicPublicName,
+            "facilityId": appointment.clinic_id,
+            "facilityName": "Konsultacja telefoniczna" if telephone else appointment.ClinicPublicName,
             "doctorId": appointment.doctor_id, "doctor": term["doctor"],
             "roomId": term["roomId"], "scheduleId": term["scheduleId"],
             "date": term["start"].astimezone(datetime.UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             "timeFrom": term["start"].strftime("%H:%M"),
             "timeTo": term["end"].strftime("%H:%M"), "correlationId": term["correlationId"],
-            "isTelemedicine": False, "isPoz": False, "isRehabilitation": False, "isVideoConsultation": False,
+            "isTelemedicine": telephone, "isPoz": False, "isRehabilitation": False, "isVideoConsultation": False,
             "isAdditional": False, "isImpediment": False, "isPreparationRequired": False,
             "parentReservationId": None, "referralId": None, "eReferralId": None, "referralTypeId": None,
             "executedTriageId": None,
@@ -458,6 +467,7 @@ class LuxMedPortal:
             and value.get("askForReferral") is False and value.get("relatedVisits") in (None, [])
             and value.get("conflictedVisit") is None
             and value.get("changeTermAvailable", False) is False
+            and (not telephone or value.get("isAlfavoxVideoConsultation", False) is False)
             and isinstance(valuation, dict)
             and type(valuation.get("valuationType")) is int and valuation["valuationType"] == 1  # InPackage.
             and type(valuation.get("price")) in (int, float) and valuation["price"] == 0
@@ -503,7 +513,7 @@ class LuxMedPortal:
         return self.resolve_service(service_name, self.get_services())
 
     @staticmethod
-    def resolve_service(service_name: str, catalog: Any, *, telephone: bool = False) -> int:
+    def resolve_service(service_name: str, catalog: Any, *, telephone: bool = False, regular_phone: bool = False) -> int:
         target = " ".join(service_name.casefold().split())
         names = {target}
         if not telephone:
@@ -522,6 +532,8 @@ class LuxMedPortal:
                     continue
                 name = " ".join(node["name"].casefold().split())
                 if name in names and node.get("isTelemedicine") is telephone:
+                    if regular_phone and (node.get("isVideoConsultation") is not False or node.get("isPoz") is not False):
+                        continue
                     service_id = node.get("id")
                     if type(service_id) is not int or service_id <= 0:
                         raise PortalError("unexpected-catalog", suspend=True)

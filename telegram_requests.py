@@ -10,6 +10,7 @@ from pathlib import Path
 from telegram_preferences import Preferences, parse_preferences, split_preferences
 
 
+INTERNIST_PHONE_SERVICE = "Konsultacja internistyczna - telefoniczna"
 PEDIATRIC_PREFIX = "Konsultacja pediatryczna - "
 PEDIATRIC_SERVICES = (
     ("sick visit", "wizyta dla chorego dziecka", "gabinet dzieci chorych"),
@@ -37,6 +38,8 @@ GENERAL_SERVICES = {
     "internist": "Internista",
     "interniste": "Internista",
     "internal medicine": "Internista",
+    "internist phone consultation": INTERNIST_PHONE_SERVICE,
+    "phone consultation with an internist": INTERNIST_PHONE_SERVICE,
     "cardiologist": "Kardiolog",
     "kardiologa": "Kardiolog",
     "ophthalmologist": "Okulista",
@@ -135,6 +138,7 @@ def parse_search(text: str, aliases: dict[str, str], children: set[str], cities:
         raise PatientServiceMismatch(patient, "is configured as an adult, and pediatrics is for children.")
     if patient in children and normalize(GENERAL_SERVICES.get(key, service)) in {
         "internista", "konsultacja internisty", "konsultacja internistyczna",
+        normalize(INTERNIST_PHONE_SERVICE),
     }:
         raise PatientServiceMismatch(patient, "is configured as a child, and an internist is an adult service.")
     if key in PEDIATRIC_REQUESTS or (patient in children and key in GENERAL_REQUESTS):
