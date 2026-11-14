@@ -36,6 +36,22 @@ def slot(starts_at, *, doctor=9, clinic_group=6):
 
 
 class SearchTests(unittest.TestCase):
+    def test_search_formats_partial_names_and_allows_unnamed_clinicians(self):
+        terms = [
+            {**slot("2030-03-31T10:00:00"), "doctor": None},
+            {**slot("2030-03-31T11:00:00"), "doctor": {
+                "id": 9, "academicTitle": None, "firstName": None, "lastName": None,
+            }},
+            {**slot("2030-03-31T12:00:00"), "doctor": {"id": 10, "firstName": " Fixture ", "lastName": None}},
+        ]
+        content = {"termsForService": {"termsForDays": [{"terms": terms}]}}
+        results = LuxMedPortal._parse_visits_new_portal(content, DoctorLocator(id="5*30*-1*-1"))
+        self.assertEqual([result.DoctorName for result in results], ["", "", "Fixture"])
+        self.assertEqual([result.doctor_search_name for result in results], ["", "", "Fixture"])
+        self.assertEqual([result.doctor_id for result in results], [None, 9, 10])
+        filtered = LuxMedPortal._parse_visits_new_portal(content, DoctorLocator(id="5*30*-1*10"))
+        self.assertEqual([result.DoctorName for result in filtered], ["Fixture"])
+
     def test_trusted_device_is_sent_before_login_and_uses_portal_cookies(self):
         cookie = {"name": "FixtureDevice", "value": "fixture", "domain": "portalpacjenta.luxmed.pl",
                   "path": "/PatientPortal", "secure": True, "expires": 2000000000}
