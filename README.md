@@ -155,10 +155,11 @@ unclear, check the Patient Portal and reply `Reviewed 1` to allow new
 booking requests for that patient. The worker never retries an uncertain
 reservation.
 
-If the questionnaire endpoint returns HTTP 401, the worker pauses direct
-booking for that patient and ends their pending booking requests.
-Availability searches keep their own access checks. Use `/resume <patient>`
-after booking access is restored, then request a slot from a fresh search.
+If a booking check returns an access denial, the worker names the failed
+step and pauses direct booking for that patient. Availability searches
+keep their own access checks. A sign-in failure or rate limit can pause
+the whole account. Use `/resume <patient>` after access is restored, then
+request a slot from a fresh search.
 
 For calendar conflict checks, add the optional environment secret
 `LUXMED_BOOKING_CALENDAR` as a JSON object with `client_id`, `client_secret`,

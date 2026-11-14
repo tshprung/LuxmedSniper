@@ -152,11 +152,11 @@ class LuxMedPortal:
                 "POST",
                 self.LUXMED_LOGIN_URL,
                 json={"login": credentials.login, "password": credentials.password},
-                authenticating=True,
+                authenticating=True, stage="login",
             )
             token = data.get("token") if isinstance(data, dict) else None
             if not isinstance(token, str) or not token or any(not 33 <= ord(char) <= 126 for char in token):
-                raise PortalError("login-unconfirmed", suspend=True)
+                raise PortalError("login-unconfirmed", suspend=True, stage="login")
             self.token_expires_at = self._token_expiry(token)
             if trusted_device is None:
                 self.session.headers["authorization-token"] = f"Bearer {token}"
@@ -228,7 +228,7 @@ class LuxMedPortal:
             params.update({
                 "searchPlace.name": nationwide_from, "nextSearch": "false", "searchByMedicalSpecialist": "false",
             })
-        content = self._portal_json("GET", self.NEW_PORTAL_RESERVATION_URL, params=params)
+        content = self._portal_json("GET", self.NEW_PORTAL_RESERVATION_URL, params=params, stage="availability")
         try:
             appointments = self._parse_visits_new_portal(content, locator)
             if nationwide_from is not None:
@@ -236,7 +236,7 @@ class LuxMedPortal:
                 if any(not appointment.DoctorName and appointment.doctor_id for appointment in appointments):
                     self._fill_phone_doctors(appointments, params)
         except (KeyError, TypeError, ValueError, OverflowError):
-            raise PortalError("unexpected-response", suspend=True) from None
+            raise PortalError("unexpected-response", suspend=True, stage="availability") from None
         return [
             appointment for appointment in appointments
             if now <= appointment.AppointmentDate <= end
@@ -375,31 +375,31 @@ class LuxMedPortal:
 
     def booked_visit_ids(self, *, telephone: bool = False) -> set[int]:
         """Return IDs of reserved or confirmed visits of the requested type."""
-        content = self._portal_json("GET", self.UPCOMING_VISITS_URL)
+        content = self._portal_json("GET", self.UPCOMING_VISITS_URL, stage="booking-verification")
         events = content.get("events") if isinstance(content, dict) else None
         if not isinstance(events, list):
-            raise PortalError("unexpected-upcoming-visits", suspend=True)
+            raise PortalError("unexpected-upcoming-visits", suspend=True, stage="booking-verification")
 
         event_type = 7 if telephone else 1  # Telemedicine or Visit in the portal enum.
         booked = set()
         for event in events:
             if not isinstance(event, dict) or type(event.get("eventType")) is not int:
-                raise PortalError("unexpected-upcoming-visits", suspend=True)
+                raise PortalError("unexpected-upcoming-visits", suspend=True, stage="booking-verification")
             if event["eventType"] != event_type:
                 continue
             status = event.get("status")
             if type(status) is not int or not 0 <= status <= 6:
-                raise PortalError("unexpected-upcoming-visits", suspend=True)
+                raise PortalError("unexpected-upcoming-visits", suspend=True, stage="booking-verification")
             if status in (1, 2):  # Reserved, Confirmed.
                 visit_id = event.get("eventId")
                 if type(visit_id) is not int or visit_id <= 0:
-                    raise PortalError("unexpected-upcoming-visits", suspend=True)
+                    raise PortalError("unexpected-upcoming-visits", suspend=True, stage="booking-verification")
                 booked.add(visit_id)
         return booked
 
     def has_booking_conflict(self, start: datetime.datetime, end: datetime.datetime) -> bool:
         """Check overlaps against the upcoming events used on the portal search page."""
-        content = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/terms/getevents")
+        content = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/terms/getevents", stage="booking-conflicts")
         events = content.get("events") if isinstance(content, dict) else None
         if not isinstance(events, list):
             raise PortalError("booking-conflicts-unknown")
@@ -431,10 +431,11 @@ class LuxMedPortal:
             "GET",
             self.NON_SHOW_PENALTIES_URL,
             params={"cityId": city_id, "serviceVariantId": service_variant_id, "referralId": ""},
+            stage="booking-penalty",
         )
         can_reserve = content.get("canReserve") if isinstance(content, dict) else None
         if type(can_reserve) is not bool:
-            raise PortalError("unexpected-penalty-status", suspend=True)
+            raise PortalError("unexpected-penalty-status", suspend=True, stage="booking-penalty")
         return not can_reserve
 
     def _booking_request_headers(self) -> dict[str, str]:
@@ -545,30 +546,31 @@ class LuxMedPortal:
         )}
         confirmation.update(temporaryReservationId=hold_id, referralRequired=False, valuationId=None, valuation=valuation)
         try:
-            result = self._portal_json("POST", f"{base}/Confirm", json=confirmation, headers=headers)
+            result = self._portal_json("POST", f"{base}/Confirm", json=confirmation, headers=headers, stage="booking-confirm")
         except PortalError as error:
-            raise PortalError("booking-outcome-unknown", suspend=error.suspend) from None
+            raise PortalError("booking-outcome-unknown", suspend=error.suspend,
+                              stage=error.stage, http_status=error.http_status) from None
         if isinstance(result, dict) and result.get("hasErrors") is True:
             self.release_booking_hold(hold_id, headers)
             raise PortalError("booking-rejected")
         value = result.get("value") if isinstance(result, dict) and result.get("hasErrors") is False else None
         reservation_id = value.get("reservationId") if isinstance(value, dict) else None
         if type(reservation_id) is not int or reservation_id <= 0:
-            raise PortalError("booking-outcome-unknown")
+            raise PortalError("booking-outcome-unknown", stage="booking-confirm")
         return reservation_id
 
     def release_booking_hold(self, hold_id: int, headers: dict[str, str]) -> None:
         try:
             self._portal_json(
                 "POST", f"{self.NEW_PORTAL_URL}/Reservation/ReleaseTerm",
-                params={"reservationId": hold_id}, json={}, headers=headers,
+                params={"reservationId": hold_id}, json={}, headers=headers, stage="booking-release",
             )
         except PortalError as error:
             if error.suspend:
                 raise
 
     def get_services(self) -> list[dict]:
-        return self._portal_json("GET", self.DICTIONARY_SERVICES_URL)
+        return self._portal_json("GET", self.DICTIONARY_SERVICES_URL, stage="service-catalog")
 
     def resolve_in_person_service(self, service_name: str) -> int:
         return self.resolve_service(service_name, self.get_services())
