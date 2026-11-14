@@ -10,7 +10,8 @@ from unittest.mock import patch
 import requests
 
 import audit_search
-from luxmed_sniper import DoctorLocator, Luxmed, LuxMedPortal
+from luxmed_sniper import DoctorLocator, Luxmed, LuxMedPortal, PortalError
+from telegram_requests import INTERNIST_PHONE_SERVICE
 
 
 UTC = datetime.UTC
@@ -36,6 +37,20 @@ def slot(starts_at, *, doctor=9, clinic_group=6):
 
 
 class SearchTests(unittest.TestCase):
+    def test_phone_booking_catalog_requires_regular_nonvideo_consultation(self):
+        variant = {"name": INTERNIST_PHONE_SERVICE, "id": 30, "isTelemedicine": True,
+                   "isVideoConsultation": False, "isPoz": False}
+        video = {**variant, "id": 31, "isVideoConsultation": True}
+        nfz = {**variant, "id": 32, "isPoz": True}
+        self.assertEqual(
+            LuxMedPortal.resolve_service(INTERNIST_PHONE_SERVICE, [video, nfz, variant],
+                                         telephone=True, regular_phone=True),
+            30,
+        )
+        with self.assertRaisesRegex(PortalError, "service-not-in-catalog"):
+            LuxMedPortal.resolve_service(INTERNIST_PHONE_SERVICE, [video, nfz],
+                                         telephone=True, regular_phone=True)
+
     def test_search_formats_partial_names_and_allows_unnamed_clinicians(self):
         terms = [
             {**slot("2030-03-31T10:00:00"), "doctor": None},

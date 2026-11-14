@@ -16,7 +16,7 @@ from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_settings, trusted_devices, validate, worker_settings
 from telegram_free_text import FreeText
 from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences, split_preferences
-from telegram_requests import PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria, PatientServiceMismatch, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
+from telegram_requests import INTERNIST_PHONE_SERVICE, PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria, PatientServiceMismatch, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
 from telegram_state import SearchState, next_search_time
 
 PORTAL_REUSE_SECONDS = 3600
@@ -298,6 +298,13 @@ class SearchBot:
             notices.append(PREPARATION_NOTICE)
         return notices
 
+    @staticmethod
+    def supports_booking_service(service: str, telephone: bool) -> bool:
+        key = normalize(service)
+        if telephone:
+            return key == normalize(INTERNIST_PHONE_SERVICE)
+        return key in SUPPORTED_BOOKING_SERVICES
+
     def show_results(self, search_id: int) -> None:
         row = self.state.results(search_id)
         slots = json.loads(row["slots"])
@@ -320,8 +327,8 @@ class SearchBot:
         if any(slot["start"] > now for slot in slots[page[-1][0]:]):
             lines.append("Reply More to see the next options.")
         can_book = (
-            self.can_book_for(row["patient"]) and not notices and not row["telephone"]
-            and normalize(row["service"]) in SUPPORTED_BOOKING_SERVICES
+            self.can_book_for(row["patient"]) and not notices
+            and self.supports_booking_service(row["service"], bool(row["telephone"]))
             and not self.state.booking_paused(row["patient"])
         )
         action = "Book <option number> to request that slot" if can_book else "Details <option number> for the Patient Portal link"
@@ -397,7 +404,7 @@ class SearchBot:
         if self.state.booking_paused(row["patient"]):
             self.state.queue_message(f"{description}\n{BOOKING_ACCESS_NOTICE}\n{PATIENT_PORTAL_URL}", search_id)
             return
-        if row["telephone"] or normalize(row["service"]) not in SUPPORTED_BOOKING_SERVICES:
+        if not self.supports_booking_service(row["service"], bool(row["telephone"])):
             self.state.queue_message(f"This visit type needs to be booked in the Patient Portal.\n{PATIENT_PORTAL_URL}", search_id)
             return
         if any(type(slot.get(key)) is not int for key in ("clinic_id", "doctor_id", "service_id")):
@@ -605,6 +612,8 @@ class SearchBot:
                 raise PortalError("portal-questions")
             if slot.get("requires_preparation") is True:
                 raise PortalError("portal-preparation")
+            if not self.supports_booking_service(criteria.service, criteria.telephone):
+                raise PortalError("booking-needs-portal")
             if self.state.unresolved_booking(criteria.patient):
                 raise PortalError("prior-booking-unverified")
             if self.state.account_paused(criteria.patient):
@@ -612,11 +621,17 @@ class SearchBot:
             if self.state.booking_paused(criteria.patient):
                 raise PortalError("booking-access-paused")
             portal = self.portal_for(criteria.patient)
+            if criteria.telephone:
+                variant = portal.resolve_service(
+                    INTERNIST_PHONE_SERVICE, portal.get_services(), telephone=True, regular_phone=True,
+                )
+                if variant != slot["service_id"]:
+                    raise PortalError("booking-details-missing")
             if portal.is_booking_blocked_by_penalty(criteria.city_id, slot["service_id"]):
                 raise PortalError("booking-penalty")
             portal.check_booking_eligibility(criteria.city_id, slot["service_id"])
             locator = DoctorLocator(id=f"{criteria.city_id}*{slot['service_id']}*-1*{slot['doctor_id']}")
-            appointment = self.refresh_booking_slot(portal, locator, slot)
+            appointment = self.refresh_booking_slot(portal, locator, slot, telephone=criteria.telephone)
             start = appointment.AppointmentDate.astimezone(dt.UTC)
             end = appointment.booking_term["end"].astimezone(dt.UTC)
             reasons = self.booking_approval_reasons(portal, start, end)
@@ -638,7 +653,7 @@ class SearchBot:
             reservation_id = portal.reserve_standard_visit(appointment, criteria.service)
             with self.state.db:
                 self.state.booking_status(booking["id"], "verifying", reservation_id=reservation_id)
-            if reservation_id not in portal.booked_visit_ids():
+            if reservation_id not in portal.booked_visit_ids(telephone=criteria.telephone):
                 raise PortalError("booking-outcome-unknown")
         except PortalError as error:
             self.report_booking_failure(booking, description, error, reservation_id)
@@ -648,7 +663,7 @@ class SearchBot:
             self.state.queue_message(f"{description}\nBooked and verified in LUX MED.", row["id"])
 
     @staticmethod
-    def refresh_booking_slot(portal, locator: DoctorLocator, slot: dict):
+    def refresh_booking_slot(portal, locator: DoctorLocator, slot: dict, *, telephone: bool = False):
         date = dt.datetime.fromtimestamp(slot["start"], WARSAW).date()
         matches = [
             item for item in portal.search(locator, date=date)
@@ -661,7 +676,11 @@ class SearchBot:
         appointment = matches[0]
         if appointment.requires_preparation:
             raise PortalError("portal-preparation")
-        if appointment.booking_term is None or str(appointment.booking_term["cityId"]) != locator.city_id:
+        term = appointment.booking_term
+        if (
+            term is None or term.get("isTelemedicine", False) is not telephone
+            or (not telephone and str(term["cityId"]) != locator.city_id)
+        ):
             raise PortalError("booking-details-missing")
         return appointment
 
