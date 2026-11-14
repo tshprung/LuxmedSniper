@@ -625,6 +625,43 @@ class BotTests(unittest.TestCase):
             self.update(6, "/resume Adult")
             self.assertFalse(self.state.booking_paused("patient1"))
 
+    def test_booking_hold_denial_leaves_searches_active_and_names_the_failed_step(self):
+        self.update(1, "Find an internist for Adult")
+        self.bot.flush()
+        self.bot.calendar = MagicMock()
+        self.bot.calendar.busy.return_value = False
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            client = portal.return_value
+            start = dt.datetime.fromtimestamp(self.now + 8 * 3600, WARSAW)
+            client.resolve_service.return_value = 12
+            client.search.return_value = [
+                Appointment(start, 2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9,
+                            booking_term={"cityId": 5, "end": start + dt.timedelta(minutes=15)}),
+            ]
+            client.is_booking_blocked_by_penalty.return_value = False
+            client.has_booking_conflict.return_value = False
+            client.reserve_standard_visit.side_effect = PortalError(
+                "access-denied", suspend=True, stage="booking-hold", http_status=403,
+            )
+            self.bot.search_due()
+            self.bot.flush()
+            self.update(2, "Book 1")
+            self.bot.flush()
+            with patch("sys.stderr") as stderr:
+                self.bot.booking_due()
+            message = self.state.next_message()["text"]
+            self.assertIn("slot hold (HTTP 403)", message)
+            self.assertIn("/resume", message)
+            self.assertNotIn("https://", message)
+            self.assertTrue(stderr.write.called)
+            self.assertTrue(self.state.booking_paused("patient1"))
+            self.assertFalse(self.state.account_paused("patient1"))
+            self.bot.flush()
+            self.update(3, "Find an internist for Adult")
+            self.bot.search_due()
+            self.assertEqual(client.search.call_count, 3)
+            client.reserve_standard_visit.assert_called_once()
+
     def test_sick_child_search_shows_questionnaire_and_preparation_with_portal_handoff(self):
         self.update(1, "/find Child | sick kids")
         self.bot.flush()
