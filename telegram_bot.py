@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -113,13 +114,14 @@ class SearchBot:
     def __init__(self, telegram: Telegram, state: SearchState, profiles: dict[str, Profile], *, clock=time.time,
                  free_text: FreeText | None = None, calendar: CalendarAvailability | None = None,
                  booking_enabled: bool = False, device_credentials: dict | None = None,
-                 allowed_booking_patients: frozenset[str] | None = None):
+                 allowed_booking_patients: frozenset[str] | None = None, calendar_destination: str | None = None):
         self.telegram = telegram
         self.state = state
         self.profiles = profiles
         self.clock = clock
         self.free_text = free_text
         self.calendar = calendar
+        self.calendar_destination = calendar_destination
         self.booking_enabled = booking_enabled
         self.allowed_booking_patients = (
             frozenset(profiles) if allowed_booking_patients is None else allowed_booking_patients
@@ -668,6 +670,46 @@ class SearchBot:
         with self.state.db:
             self.state.booking_status(booking["id"], "booked", reservation_id=reservation_id)
             self.state.queue_message(f"{description}\nBooked and verified in LUX MED.", row["id"])
+            if self.calendar_destination:
+                self.state.queue_calendar_event(
+                    booking["id"], uuid.uuid4().hex, self.calendar_destination,
+                    int(start.timestamp()), int(end.timestamp()), int(self.clock()),
+                )
+
+    def sync_calendar_due(self) -> None:
+        if self.calendar is None or not self.calendar_destination:
+            return
+        now = int(self.clock())
+        if next_search_time(now) != now:
+            return
+        event = self.state.due_calendar_event(self.calendar_destination, now)
+        if event is None:
+            return
+        try:
+            if self.state.account_paused(event["patient"]):
+                raise CalendarUnavailable
+            portal = self.portal_for(event["patient"])
+            if event["reservation_id"] not in portal.booked_visit_ids(telephone=bool(event["telephone"])):
+                raise CalendarUnavailable
+            self.calendar.add_booking(
+                self.calendar_destination, event["event_id"],
+                dt.datetime.fromtimestamp(event["starts_at"], WARSAW),
+                dt.datetime.fromtimestamp(event["ends_at"], WARSAW),
+            )
+        except PortalError as error:
+            with self.state.db:
+                if error.suspend:
+                    self.close_portal(event["patient"])
+                    self.state.suspend(event["patient"])
+                self.state.finish_calendar_attempt(event["booking_id"], now, False)
+            return
+        except CalendarUnavailable:
+            with self.state.db:
+                self.state.finish_calendar_attempt(event["booking_id"], now, False)
+            return
+        with self.state.db:
+            self.state.finish_calendar_attempt(event["booking_id"], now, True)
+            self.state.queue_message("Added the appointment to Google Calendar.", event["search_id"])
 
     @staticmethod
     def refresh_booking_slot(portal, locator: DoctorLocator, slot: dict, *, nationwide_from: str | None = None):
@@ -877,7 +919,8 @@ def main() -> int:
                         free_text=interpreter, calendar=calendar,
                         booking_enabled=bool(allowed_booking_patients),
                         device_credentials=trusted_devices(profiles),
-                        allowed_booking_patients=allowed_booking_patients)
+                        allowed_booking_patients=allowed_booking_patients,
+                        calendar_destination=calendar_config.get("destination_calendar_id") if calendar_config else None)
     except (KeyError, ValueError, OSError):
         print("Telegram bot configuration is incomplete.", file=sys.stderr)
         return 2
@@ -897,6 +940,8 @@ def run_worker(bot: SearchBot) -> int:
                 bot.accept(update)
             bot.flush()
             bot.booking_due()
+            bot.flush()
+            bot.sync_calendar_due()
             bot.flush()
             bot.search_due()
             bot.flush()

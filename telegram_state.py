@@ -54,6 +54,11 @@ class SearchState:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS outstanding_booking_slot
                 ON booking_requests (patient, slot_key) WHERE status NOT IN ('stopped', 'ended');
+            CREATE TABLE IF NOT EXISTS calendar_sync (
+                booking_id INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE,
+                calendar_id TEXT NOT NULL, starts_at INTEGER NOT NULL, ends_at INTEGER NOT NULL,
+                next_attempt INTEGER NOT NULL, synced INTEGER NOT NULL DEFAULT 0
+            );
         """)
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -193,6 +198,32 @@ class SearchState:
         return self.db.execute(
             "SELECT * FROM booking_requests WHERE status IN ('checking', 'submitting', 'verifying')",
         ).fetchall()
+
+    def queue_calendar_event(self, booking_id: int, event_id: str, calendar_id: str, start: int, end: int, now: int) -> None:
+        self.db.execute(
+            """INSERT INTO calendar_sync (booking_id,event_id,calendar_id,starts_at,ends_at,next_attempt)
+               VALUES (?,?,?,?,?,?)""",
+            (booking_id, event_id, calendar_id, start, end, now),
+        )
+
+    def due_calendar_event(self, calendar_id: str, now: int):
+        return self.db.execute(
+            """SELECT calendar_sync.*, booking_requests.search_id, booking_requests.reservation_id,
+                      booking_requests.patient, searches.telephone
+               FROM calendar_sync JOIN booking_requests
+               ON booking_requests.id = calendar_sync.booking_id
+               JOIN searches ON searches.id = booking_requests.search_id
+               WHERE booking_requests.status = 'booked' AND synced = 0 AND calendar_id = ?
+                 AND ends_at > ? AND next_attempt <= ?
+               ORDER BY next_attempt, booking_id LIMIT 1""",
+            (calendar_id, now, now),
+        ).fetchone()
+
+    def finish_calendar_attempt(self, booking_id: int, now: int, synced: bool) -> None:
+        self.db.execute(
+            "UPDATE calendar_sync SET synced = ?, next_attempt = ? WHERE booking_id = ?",
+            (synced, now + 15 * 60, booking_id),
+        )
 
     def stop_booking(self, booking_id: int) -> bool:
         return self.db.execute(
