@@ -36,6 +36,22 @@ def slot(starts_at, *, doctor=9, clinic_group=6):
 
 
 class SearchTests(unittest.TestCase):
+    def test_trusted_device_is_sent_before_login_and_uses_portal_cookies(self):
+        cookie = {"name": "FixtureDevice", "value": "fixture", "domain": "portalpacjenta.luxmed.pl",
+                  "path": "/PatientPortal", "secure": True, "expires": 2000000000}
+        session = requests.Session()
+
+        def login(method, url, **kwargs):
+            self.assertEqual((method, url), ("POST", LuxMedPortal.LUXMED_LOGIN_URL))
+            self.assertEqual(session.cookies.get("FixtureDevice"), "fixture")
+            self.assertEqual(session.headers["X-Requested-With"], "XMLHttpRequest")
+            return response({"token": "fixture-token"})
+
+        with patch("luxmed_sniper.requests.Session", return_value=session), patch.object(session, "request", side_effect=login):
+            portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"), trusted_device=cookie)
+            with portal.session:
+                self.assertNotIn("authorization-token", portal.session.headers)
+
     def test_search_uses_warsaw_dates_and_filters_exact_instants(self):
         starts = [
             slot("2030-03-30T23:14:59Z"),

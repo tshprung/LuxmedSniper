@@ -13,7 +13,7 @@ import requests
 
 from luxmed_sniper import WARSAW, DoctorLocator, Luxmed, LuxMedPortal, PortalError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
-from telegram_configuration import PROFILE_KEYS, calendar_settings, validate, worker_settings
+from telegram_configuration import PROFILE_KEYS, calendar_settings, trusted_devices, validate, worker_settings
 from telegram_free_text import FreeText
 from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences, split_preferences
 from telegram_requests import PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria, PatientServiceMismatch, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
@@ -112,7 +112,7 @@ def local_time(timestamp: int) -> str:
 class SearchBot:
     def __init__(self, telegram: Telegram, state: SearchState, profiles: dict[str, Profile], *, clock=time.time,
                  free_text: FreeText | None = None, calendar: CalendarAvailability | None = None,
-                 booking_enabled: bool = False):
+                 booking_enabled: bool = False, device_credentials: dict | None = None):
         self.telegram = telegram
         self.state = state
         self.profiles = profiles
@@ -120,6 +120,7 @@ class SearchBot:
         self.free_text = free_text
         self.calendar = calendar
         self.booking_enabled = booking_enabled
+        self.device_credentials = device_credentials or {}
         self.portals: dict[str, tuple[float, LuxMedPortal]] = {}
         self.cities = city_catalog()
         self.children = {key for key, profile in profiles.items() if profile.child}
@@ -546,7 +547,12 @@ class SearchBot:
         if cached is not None and now < cached[0]:
             return cached[1]
         self.close_portal(patient)
-        portal = LuxMedPortal(self.profiles[patient].credentials)
+        credentials = self.profiles[patient].credentials
+        trusted_device = self.device_credentials.get(patient)
+        if trusted_device is not None and trusted_device["expires"] > now:
+            portal = LuxMedPortal(credentials, trusted_device=trusted_device)
+        else:
+            portal = LuxMedPortal(credentials)
         reuse_until = now + PORTAL_REUSE_SECONDS
         if type(portal.token_expires_at) is int:
             reuse_until = min(reuse_until, portal.token_expires_at)
@@ -820,7 +826,8 @@ def main() -> int:
         calendar = CalendarAvailability(calendar_config) if calendar_config else None
         bot = SearchBot(Telegram(token, owner), SearchState(path / "telegram.sqlite3"), profiles,
                         free_text=interpreter, calendar=calendar,
-                        booking_enabled=settings.get("LUXMED_DIRECT_BOOKING") == "1")
+                        booking_enabled=settings.get("LUXMED_DIRECT_BOOKING") == "1",
+                        device_credentials=trusted_devices(profiles))
     except (KeyError, ValueError, OSError):
         print("Telegram bot configuration is incomplete.", file=sys.stderr)
         return 2
