@@ -103,6 +103,7 @@ class Appointment:
     doctor_id: int | None = None
     booking_term: dict | None = field(default=None, repr=False)
     requires_preparation: bool = False
+    is_additional: bool = False
 
 
 @dataclass(frozen=True, repr=False)
@@ -358,6 +359,7 @@ class LuxMedPortal:
                         booking_term=LuxMedPortal._booking_term(term, terms_for_service, content.get("correlationId"))
                         if doctor_id is not None else None,
                         requires_preparation=requires_preparation,
+                        is_additional=term.get("isAdditional") is True,
                     ),
                 )
         return appointments

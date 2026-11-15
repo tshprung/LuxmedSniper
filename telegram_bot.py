@@ -42,6 +42,7 @@ QUESTIONNAIRE_EXPIRED = "This questionnaire session has ended. Start a fresh sea
 SUPPORTED_BOOKING_SERVICES = {"internista", normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[3][2])}
 QUESTIONNAIRE_NOTICE = "LUX MED requires a medical questionnaire for this visit. Complete it in the Patient Portal."
 PREPARATION_NOTICE = "LUX MED lists preparation instructions for this visit. Open “Zobacz szczegóły” in the Patient Portal."
+ADDITIONAL_SLOT_NOTICE = "LUX MED lists this as an additional slot. Check its booking options in the Patient Portal."
 BOOKING_ACCESS_NOTICE = "Direct booking is paused for this patient. Availability searches can continue. Use /resume with the patient name to clear the pause."
 OPTION_NUMBER = re.compile(r"[1-9][0-9]{0,8}")
 CALLBACK_COMMAND = re.compile(
@@ -543,6 +544,9 @@ class SearchBot:
             notices.append(QUESTIONNAIRE_NOTICE)
         if any(slot.get("requires_preparation") is True for slot in slots):
             notices.append(PREPARATION_NOTICE)
+        if slots and all(slot.get("is_additional") is True for slot in slots):
+            notices.append(ADDITIONAL_SLOT_NOTICE if len(slots) == 1 else
+                           "These are additional LUX MED slots. Check their booking options in the Patient Portal.")
         return notices
 
     @staticmethod
@@ -594,7 +598,9 @@ class SearchBot:
         heading = self.search_heading(row["display_number"], self.state.criteria(row))
         notices = self.portal_notices(row["service"], [slot for _, slot in page])
         lines = [heading, *notices, "Available slots (Warsaw time)"]
-        lines.extend(f"{number}. {self.slot_details(slot)}" for number, slot in page)
+        for number, slot in page:
+            suffix = " · Patient Portal" if slot.get("is_additional") is True else ""
+            lines.append(f"{number}. {self.slot_details(slot)}{suffix}")
         more = any(slot["start"] > now for slot in slots[max(row["shown"], page[-1][0]):])
         if more:
             lines.append("Reply More to see the next options.")
@@ -680,7 +686,11 @@ class SearchBot:
         description = f"{heading}\nOption {number}. {self.slot_details(slot)}"
         notices = self.portal_notices(row["service"], [slot])
         if notices:
-            self.state.queue_message("\n".join([description, *notices, "Book this visit in the Patient Portal.", PATIENT_PORTAL_URL]), search_id)
+            handoff = [*notices, PATIENT_PORTAL_URL] if slot.get("is_additional") is True else [
+                *notices, "Book this visit in the Patient Portal.", PATIENT_PORTAL_URL,
+            ]
+            self.state.queue_message("\n".join([description, *handoff]), search_id,
+                                     buttons=[[("Back to options", "options"), ("Continue search", "continue")]])
             return
         if not self.can_book_for(row["patient"]):
             self.state.queue_message(
@@ -1039,6 +1049,8 @@ class SearchBot:
                 raise PortalError("portal-questions")
             if slot.get("requires_preparation") is True:
                 raise PortalError("portal-preparation")
+            if slot.get("is_additional") is True:
+                raise PortalError("portal-additional")
             if not self.supports_booking_service(criteria.service, criteria.telephone, criteria.patient):
                 raise PortalError("booking-needs-portal")
             if self.state.unresolved_booking(criteria.patient):
@@ -1189,6 +1201,8 @@ class SearchBot:
         appointment = matches[0]
         if appointment.requires_preparation:
             raise PortalError("portal-preparation")
+        if appointment.is_additional:
+            raise PortalError("portal-additional", stage="slot-recheck")
         term = appointment.booking_term
         if term is None or term.get("isTelemedicine", False) is not telephone:
             raise PortalError("booking-details-missing", stage="slot-recheck")
@@ -1257,6 +1271,9 @@ class SearchBot:
             elif code in {"questionnaire-expired", "questionnaire-open", "booking-location-unverified"}:
                 message = BOOKING_FAILURES[code]
                 portal_link = False
+            elif code == "portal-additional":
+                message = ADDITIONAL_SLOT_NOTICE
+                buttons = [[("More", "more"), ("Continue search", "continue")]]
             elif code == "rate-limited":
                 message = "LUX MED rate-limited this account. Try /resume later."
                 portal_link = False
@@ -1398,10 +1415,16 @@ class SearchBot:
             }
             if slot.requires_preparation:
                 option["requires_preparation"] = True
+            if slot.is_additional:
+                option["is_additional"] = True
             key = self.slot_key(option)
             if key not in excluded:
                 excluded.add(key)
                 options.append(option)
+        if (self.can_book_for(criteria.patient)
+                and self.supports_booking_service(criteria.service, criteria.telephone, criteria.patient)
+                and not self.state.booking_paused(criteria.patient)):
+            options.sort(key=lambda option: option.get("is_additional") is True)
         if not options:
             with self.state.db:
                 result = "outside-preferred-clinic" if outside_clinic else "no-slots"
