@@ -301,6 +301,12 @@ class SearchState:
         ).fetchone()
         return row["next_due"] if row else None
 
+    def resolve_search_service(self, search_id: int, service: str, telephone: bool) -> None:
+        self.db.execute(
+            "UPDATE searches SET service = ?, telephone = ? WHERE id = ? AND status = 'active'",
+            (service, telephone, search_id),
+        )
+
     def mark_first_result(self, search_id: int) -> bool:
         cursor = self.db.execute(
             "UPDATE searches SET first_result_sent = 1 WHERE id = ? AND status = 'active' AND first_result_sent = 0",

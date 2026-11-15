@@ -28,6 +28,9 @@ WARSAW = ZoneInfo("Europe/Warsaw")
 PORTAL_TIMEOUT = (5, 15)
 IN_PERSON_SERVICE_NAMES = (
     {"internista", "konsultacja internisty", "konsultacja internistyczna"},
+    {"alergolog", "konsultacja alergologiczna"},
+    {"laryngolog", "konsultacja laryngologiczna"},
+    {"ortopeda", "konsultacja ortopedyczna"},
     {
         "pediatra - gabinet dzieci zdrowych",
         "konsultacja w gabinecie dzieci zdrowych",
@@ -583,26 +586,15 @@ class LuxMedPortal:
             names = next((aliases for aliases in IN_PERSON_SERVICE_NAMES if target in aliases), names)
         matches = set()
 
-        def collect(nodes: Any) -> None:
-            if not isinstance(nodes, list):
-                raise PortalError("unexpected-catalog", suspend=True)
-            for node in nodes:
-                if not isinstance(node, dict) or not isinstance(node.get("name"), str):
-                    raise PortalError("unexpected-catalog", suspend=True)
-                children = node.get("children", [])
-                if children:
-                    collect(children)
+        for node in service_variants(catalog):
+            name = " ".join(node["name"].casefold().split())
+            if name in names and node.get("isTelemedicine") is telephone:
+                if regular_phone and (node.get("isVideoConsultation") is not False or node.get("isPoz") is not False):
                     continue
-                name = " ".join(node["name"].casefold().split())
-                if name in names and node.get("isTelemedicine") is telephone:
-                    if regular_phone and (node.get("isVideoConsultation") is not False or node.get("isPoz") is not False):
-                        continue
-                    service_id = node.get("id")
-                    if type(service_id) is not int or service_id <= 0:
-                        raise PortalError("unexpected-catalog", suspend=True)
-                    matches.add(service_id)
-
-        collect(catalog)
+                service_id = node.get("id")
+                if type(service_id) is not int or service_id <= 0:
+                    raise PortalError("unexpected-catalog", suspend=True)
+                matches.add(service_id)
         if not matches:
             raise PortalError("service-not-in-catalog", suspend=True)
         if len(matches) > 1:
@@ -612,6 +604,18 @@ class LuxMedPortal:
     def get_facilities_and_doctors(self, city_id: int, service_variant_id: int) -> dict[str, Any]:
         params = {"cityId": city_id, "serviceVariantId": service_variant_id}
         return self._portal_json("GET", self.DICTIONARY_FACILITIES_AND_DOCTORS, params=params)
+
+
+def service_variants(catalog: Any) -> Iterable[dict]:
+    if not isinstance(catalog, list):
+        raise PortalError("unexpected-catalog", suspend=True)
+    for node in catalog:
+        if not isinstance(node, dict) or not isinstance(node.get("name"), str):
+            raise PortalError("unexpected-catalog", suspend=True)
+        if children := node.get("children"):
+            yield from service_variants(children)
+        else:
+            yield node
 
 
 class LuxMedSniper(LuxMedPortal):
