@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import requests
 from nacl.public import PrivateKey, SealedBox
 
+from luxmed_questionnaire import Questionnaire, QuestionnaireError
 from luxmed_sniper import WARSAW, Appointment, LuxMedPortal, Luxmed, PortalError, ScheduledVisit
 from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
@@ -674,6 +675,110 @@ class BotTests(unittest.TestCase):
             self.assertEqual(self.state.db.execute("SELECT status FROM booking_requests").fetchone()[0], "queued")
             client.check_booking_eligibility.assert_not_called()
             client.reserve_standard_visit.assert_not_called()
+
+    def test_allergy_replies_submit_one_form_and_require_approval_for_the_same_slot(self):
+        self.telegram.send.side_effect = iter(range(40, 100))
+        client = MagicMock()
+        self.bot.portals["patient1"] = (self.now + 900, client)
+        client.resolve_service.return_value = client.resolve_in_person_service.return_value = 12
+        client.is_booking_blocked_by_penalty.return_value = client.has_booking_conflict.return_value = False
+        client.reserve_standard_visit.return_value = 246
+        client.booked_visit_ids.return_value = {246}
+        start = dt.datetime.fromtimestamp(self.now + 8 * 3600, WARSAW)
+        slot = Appointment(start, 2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9,
+                           booking_term={"cityId": 5, "end": start + dt.timedelta(minutes=15)})
+        client.search.return_value = [slot]
+        client.booking_questionnaire.return_value = {
+            "id": "fixture-form", "inputService": {"servaId": 12},
+            "questions": [
+                {"id": "start", "questionType": 1, "name": "<p>First question</p>",
+                 "additionalInfo": "<p>Fixture information</p>",
+                 "answers": [{"id": "first-choice", "order": 1, "name": "Option A", "nextQuestionUuid": "route"}]},
+                {"id": "route", "questionType": 5,
+                 "answers": [{"id": "configured-link", "order": 1, "nextQuestionUuid": "finish"}]},
+                {"id": "finish", "questionType": 4, "name": "Second question",
+                 "answers": [{"id": "last-choice", "order": 1, "name": "Continue",
+                              "triageResult": {"discriminator": "ServiceVariantResultDto", "servaId": 12}}]},
+            ],
+        }
+        self.update(1, "/find me | Alergolog")
+        self.bot.search_due()
+        self.bot.flush()
+        self.update(2, "Book 1")
+        self.bot.booking_due()
+        self.bot.flush()
+        first = self.bot.allergy_booking.message_id
+        self.assertIn("Fixture information", self.telegram.send.call_args.args[0])
+        self.assertTrue(self.telegram.send.call_args.kwargs["force_reply"])
+        self.update(3, "Approve 1")
+        self.bot.booking_due()
+        client.reserve_standard_visit.assert_not_called()
+        self.update(4, "1", reply_to=first)
+        self.bot.flush()
+        second = self.bot.allergy_booking.message_id
+        self.assertNotEqual(first, second)
+        self.update(5, "1", reply_to=first)
+        self.update(6, "1", reply_to=second, sender=200, chat_id=200)
+        self.bot.booking_due()
+        client.submit_booking_questionnaire.assert_not_called()
+        self.bot.flush()
+        self.update(7, "1", reply_to=second)
+        self.bot.booking_due()
+        client.submit_booking_questionnaire.assert_called_once()
+        payload = client.submit_booking_questionnaire.call_args.args[0]
+        self.assertEqual(payload["selectedAnswers"], [
+            {"id": "first-choice"}, {"id": "configured-link"}, {"id": "last-choice"},
+        ])
+        receipt = client.search.call_args.kwargs["questionnaire"]
+        self.assertEqual((payload["executionId"], payload["processId"]), (receipt.execution_id, receipt.process_id))
+        client.reserve_standard_visit.assert_not_called()
+        self.assertIn("Reply Approve 1 to book", self.state.next_message()["text"])
+        self.bot.flush()
+        self.update(8, "Approve 1")
+        self.bot.booking_due()
+        client.reserve_standard_visit.assert_called_once_with(
+            slot, "Konsultacja alergologiczna", questionnaire=receipt,
+        )
+        self.assertEqual(client.submit_booking_questionnaire.call_count, 1)
+        self.assertIsNone(self.bot.allergy_booking)
+
+    def test_questionnaire_cannot_submit_an_alternate_service_outcome(self):
+        form = Questionnaire({
+            "id": "fixture-form", "inputService": {"servaId": 12},
+            "questions": [{"id": "start", "questionType": 1, "name": "Fixture question",
+                           "answers": [{"id": "alternate", "order": 1, "name": "Option B",
+                                        "triageResult": {"discriminator": "ServiceVariantResultDto", "servaId": 13}}]}],
+        }, 12, 5, self.now)
+        form.choose(1)
+        self.assertFalse(form.permits_original_service())
+        with self.assertRaises(QuestionnaireError):
+            form.submission(self.now)
+
+    def test_allergy_approval_expires_if_the_worker_loses_its_session(self):
+        client = MagicMock()
+        self.bot.portals["patient1"] = (self.now + 900, client)
+        client.resolve_service.return_value = client.resolve_in_person_service.return_value = 12
+        client.is_booking_blocked_by_penalty.return_value = client.has_booking_conflict.return_value = False
+        client.booking_questionnaire.return_value = None
+        start = dt.datetime.fromtimestamp(self.now + 8 * 3600, WARSAW)
+        client.search.return_value = [Appointment(
+            start, 2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9,
+            booking_term={"cityId": 5, "end": start + dt.timedelta(minutes=15)},
+        )]
+        self.update(1, "/find me | Alergolog")
+        self.bot.search_due()
+        self.bot.flush()
+        self.update(2, "Book 1")
+        self.bot.booking_due()
+        self.bot.flush()
+        self.bot = SearchBot(self.telegram, self.state, self.profiles, clock=lambda: self.now, booking_enabled=True)
+        self.bot.portals["patient1"] = (self.now + 900, client)
+        self.update(3, "Approve 1")
+        self.bot.flush()
+        self.bot.booking_due()
+        self.assertIn("session has ended", self.state.next_message()["text"])
+        client.reserve_standard_visit.assert_not_called()
+        client.booking_questionnaire.assert_called_once()
 
     def test_questionnaire_denial_pauses_booking_and_preserves_searches(self):
         self.update(1, "/find Adult | Internista")
