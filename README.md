@@ -96,6 +96,8 @@ for a phone consultation. Exact portal names and partial names are checked
 against the requested patient's current LUX MED catalog. If several services
 match, the bot shows labels you can use to refine the request. Common English
 aliases include orthopedist, ENT, allergist, and fasting blood draw.
+A close spelling can prompt a service choice. Reply `Service 1` or another
+shown number to use that service with the original search filters.
 
 Searches use a rolling 14-day window. A new search gets its first check
 as soon as the worker can run it during 06:00–22:00 Europe/Warsaw, even

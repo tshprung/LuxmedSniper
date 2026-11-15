@@ -233,6 +233,42 @@ class SearchTests(unittest.TestCase):
         self.assertIsNone(preparation_slot.booking_term)
         self.assertNotIn("private-fixture", repr(preparation_slot))
 
+    def test_in_person_slot_without_city_requires_matching_directory_group(self):
+        locator = DoctorLocator(id="5*30*-1*-1")
+        term = dict(slot("2030-04-01T10:00:00+02:00"), dateTimeTo="2030-04-01T10:15:00+02:00",
+                    roomId=19, scheduleId=20, isTelemedicine=False, isAdditional=False, isImpediment=False)
+        result = {"correlationId": "fixture", "termsForService": {"termsForDays": [{"terms": [term]}]}}
+        appointment, = LuxMedPortal._parse_visits_new_portal(result, locator)
+        valuation = {"valuationType": 1, "price": 0, "alternativePrice": None, "isReferralRequired": False}
+        hold = {"hasErrors": False, "hasWarnings": False,
+                "value": {"temporaryReservationId": 135, "askForReferral": False, "valuations": [valuation]}}
+        receipt = QuestionnaireReceipt("fixture-process", "fixture-execution")
+        with patch.object(requests.Session, "request", side_effect=[
+            response({"token": "fixture-token"}),
+            response({"facilities": [{"id": term["clinicId"]}]}),
+            response({"facilities": [{"id": term["clinicGroupId"]}]}),
+            response({"token": "fixture-request-token"}), response(hold),
+            response({"hasErrors": False, "value": {"reservationId": 246}}),
+        ]) as request:
+            portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
+            with portal.session:
+                with self.assertRaisesRegex(PortalError, "booking-location-unverified"):
+                    portal.check_booking_city(appointment, 5)
+                with self.assertRaisesRegex(PortalError, "booking-location-unverified"):
+                    portal.reserve_standard_visit(appointment, "Fixture service", questionnaire=receipt)
+                portal.check_booking_city(appointment, 5)
+                self.assertEqual(portal.reserve_standard_visit(
+                    appointment, "Fixture service", questionnaire=receipt,
+                ), 246)
+        _, rejected, verified, _, lock, confirm = request.call_args_list
+        for call in (rejected, verified):
+            self.assertEqual(call.args, ("GET", LuxMedPortal.DICTIONARY_FACILITIES_AND_DOCTORS))
+            self.assertEqual(call.kwargs["params"], {"cityId": 5, "serviceVariantId": 30})
+        for call in (lock, confirm):
+            self.assertNotIn("cityId", call.kwargs["json"])
+            self.assertNotIn("cityName", call.kwargs["json"])
+            self.assertEqual(call.kwargs["json"]["executedTriageId"], receipt.execution_id)
+
     def test_questionnaire_keeps_the_same_execution_for_submission_and_search(self):
         receipt = QuestionnaireReceipt("fixture-process", "fixture-execution")
         occurrence = {"processId": receipt.process_id, "executionId": receipt.execution_id}

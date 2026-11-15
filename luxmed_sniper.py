@@ -367,14 +367,14 @@ class LuxMedPortal:
         """Keep the fields the standard reservation flow needs in memory."""
         telephone = term.get("isTelemedicine")
         city_id = term.get("cityId")
-        valid_city = type(city_id) is int and city_id >= (0 if telephone else 1)
+        valid_city = city_id is None or (type(city_id) is int and city_id >= (0 if telephone else 1))
         if (
             not isinstance(correlation_id, str) or not correlation_id
             or type(telephone) is not bool
             or term.get("isVideoConsultation", False) is not False
             or (telephone and term.get("isPoz", False) is not False)
             or any(term.get(key) is not False for key in ("isAdditional", "isImpediment"))
-            or not (valid_city or (telephone and city_id is None))
+            or not valid_city
             or any(type(term.get(key)) is not int or term[key] <= 0
                    for key in ("serviceId", "clinicId", "roomId", "scheduleId"))
         ):
@@ -388,7 +388,8 @@ class LuxMedPortal:
             return None
         return {
             "correlationId": correlation_id, "roomId": term["roomId"], "scheduleId": term["scheduleId"],
-            "cityId": city_id, "cityName": term.get("city"), "isTelemedicine": telephone,
+            "cityId": city_id, "cityName": term.get("city"), "clinicGroupId": term.get("clinicGroupId"),
+            "isTelemedicine": telephone,
             "doctor": {key: term["doctor"].get(key) for key in ("id", "academicTitle", "firstName", "lastName")},
             "start": start.astimezone(WARSAW) if start.tzinfo else start.replace(tzinfo=WARSAW),
             "end": end.astimezone(WARSAW) if end.tzinfo else end.replace(tzinfo=WARSAW),
@@ -576,6 +577,29 @@ class LuxMedPortal:
         ):
             raise PortalError("booking-eligibility")
 
+    def check_booking_city(self, appointment: Appointment, city_id: int) -> None:
+        term = appointment.booking_term
+        error = PortalError("booking-location-unverified", stage="booking-location")
+        if term is None:
+            raise error
+        if term["cityId"] is not None:
+            if term["cityId"] != city_id:
+                raise error
+            return
+        term.pop("verifiedCityId", None)
+        # The city directory lists clinic groups. A slot also has a distinct clinic ID.
+        group_id = term.get("clinicGroupId")
+        if type(group_id) is not int or group_id <= 0:
+            raise error
+        directory = self.get_facilities_and_doctors(city_id, appointment.service_id)
+        facilities = directory.get("facilities") if isinstance(directory, dict) else None
+        if not isinstance(facilities, list) or not any(
+            isinstance(facility, dict) and type(facility.get("id")) is int and facility["id"] == group_id
+            for facility in facilities
+        ):
+            raise error
+        term["verifiedCityId"] = city_id
+
     def reserve_standard_visit(self, appointment: Appointment, service_name: str, *,
                                questionnaire: QuestionnaireReceipt | None = None) -> int:
         """Hold and confirm one routine covered visit. Return its reservation ID."""
@@ -583,6 +607,9 @@ class LuxMedPortal:
         if term is None or appointment.doctor_id is None:
             raise PortalError("booking-details-missing")
         telephone = term["isTelemedicine"]
+        missing_city = not telephone and term["cityId"] is None
+        if missing_city and (type(term.get("verifiedCityId")) is not int or term["verifiedCityId"] <= 0):
+            raise PortalError("booking-location-unverified", stage="booking-location")
         payload = {
             "cityId": term["cityId"], "cityName": term["cityName"], "serviceVariantId": appointment.service_id,
             "serviceVariantName": service_name,
@@ -598,6 +625,11 @@ class LuxMedPortal:
             "parentReservationId": None, "referralId": None, "eReferralId": None, "referralTypeId": None,
             "executedTriageId": questionnaire.execution_id if questionnaire else None,
         }
+        if missing_city:
+            # The portal omits the city fields when its term does not provide them.
+            del payload["cityId"]
+            if payload["cityName"] is None:
+                del payload["cityName"]
         base = f"{self.NEW_PORTAL_URL}/Reservation"
         headers = self._booking_request_headers()
         hold = self._portal_json("POST", f"{base}/LockTerm", json=payload, headers=headers, stage="booking-hold")
@@ -630,7 +662,7 @@ class LuxMedPortal:
         confirmation = {key: payload[key] for key in (
             "cityId", "serviceVariantId", "doctorId", "facilityId", "roomId", "scheduleId",
             "date", "timeFrom", "parentReservationId", "referralId", "eReferralId", "executedTriageId",
-        )}
+        ) if key in payload}
         confirmation.update(temporaryReservationId=hold_id, referralRequired=False, valuationId=None, valuation=valuation)
         try:
             result = self._portal_json("POST", f"{base}/Confirm", json=confirmation, headers=headers, stage="booking-confirm")
@@ -687,7 +719,7 @@ class LuxMedPortal:
 
     def get_facilities_and_doctors(self, city_id: int, service_variant_id: int) -> dict[str, Any]:
         params = {"cityId": city_id, "serviceVariantId": service_variant_id}
-        return self._portal_json("GET", self.DICTIONARY_FACILITIES_AND_DOCTORS, params=params)
+        return self._portal_json("GET", self.DICTIONARY_FACILITIES_AND_DOCTORS, params=params, stage="facility-directory")
 
 
 def service_variants(catalog: Any) -> Iterable[dict]:

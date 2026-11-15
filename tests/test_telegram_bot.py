@@ -1193,13 +1193,36 @@ class BotTests(unittest.TestCase):
             {"name": "Konsultacja alergologiczna - telefoniczna", "id": 11, "isTelemedicine": True},
             {"name": "Konsultacja ortopedyczna", "id": 12, "isTelemedicine": False},
             {"name": "Konsultacja ortopedyczna - uraz", "id": 13, "isTelemedicine": False},
+            {"name": "Konsultacja alergologiczna", "id": 14, "isTelemedicine": False},
         ]
         client.search.return_value = []
-        for number, service in enumerate(("ENT", "allergist phone call", "ortopeda"), 1):
+        for number, service in enumerate(("ENT", "allergist phone call", "ortopeda", "an alergolog", "an allergolog"), 1):
             self.update(number, f"Find {service} for me")
         with patch.object(self.bot, "portal_for", return_value=client):
             self.bot.search_due()
-        self.assertEqual([check.args[0].service_id for check in client.search.call_args_list], ["10", "11", "12"])
+        self.assertEqual([check.args[0].service_id for check in client.search.call_args_list], ["10", "11", "12", "14", "14"])
+
+    def test_close_service_spelling_asks_then_retains_the_original_search_filters(self):
+        self.update(1, "Find an allergsit for me tomorrow, after 16:00")
+        self.bot.flush()
+        client = MagicMock()
+        client.resolve_service = LuxMedPortal.resolve_service
+        client.get_services.return_value = [
+            {"name": "Konsultacja alergologiczna", "id": 10, "isTelemedicine": False},
+            {"name": "Konsultacja alergologiczna - telefoniczna", "id": 11, "isTelemedicine": True},
+        ]
+        with patch.object(self.bot, "portal_for", return_value=client):
+            self.bot.search_due()
+        client.search.assert_not_called()
+        prompt = self.state.next_message()["text"]
+        self.assertIn("Did you mean Konsultacja alergologiczna? Reply Service 1", prompt)
+        self.update(2, "Service 1")
+        row, = self.state.active()
+        criteria = self.state.criteria(row)
+        self.assertEqual((criteria.patient, criteria.service, criteria.telephone),
+                         ("patient1", "Konsultacja alergologiczna", False))
+        self.assertEqual((criteria.preferences.first_date, criteria.preferences.start_minute), ("2030-03-31", 960))
+        self.assertEqual(self.state.get_setting("pending_service"), "")
 
     def test_free_text_does_not_send_unrecognized_details_or_broaden_constraints(self):
         for text in (
