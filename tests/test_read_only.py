@@ -233,6 +233,14 @@ class SearchTests(unittest.TestCase):
         self.assertIsNone(preparation_slot.booking_term)
         self.assertNotIn("private-fixture", repr(preparation_slot))
 
+    def test_parser_preserves_additional_slots_but_rejects_standard_booking_metadata(self):
+        term = dict(slot("2030-04-01T10:00:00+02:00"), dateTimeTo="2030-04-01T10:15:00+02:00",
+                    roomId=19, scheduleId=20, isTelemedicine=False, isAdditional=True, isImpediment=False)
+        result = {"correlationId": "fixture", "termsForService": {"termsForDays": [{"terms": [term]}]}}
+        appointment, = LuxMedPortal._parse_visits_new_portal(result, DoctorLocator(id="5*30*-1*-1"))
+        self.assertTrue(appointment.is_additional)
+        self.assertIsNone(appointment.booking_term)
+
     def test_in_person_slot_without_city_requires_matching_directory_group(self):
         locator = DoctorLocator(id="5*30*-1*-1")
         term = dict(slot("2030-04-01T10:00:00+02:00"), dateTimeTo="2030-04-01T10:15:00+02:00",

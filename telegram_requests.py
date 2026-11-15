@@ -11,6 +11,7 @@ from telegram_preferences import Preferences, contains_words, name_words, parse_
 
 
 INTERNIST_PHONE_SERVICE = "Konsultacja internistyczna - telefoniczna"
+INTERNIST_NFZ_SERVICE = "Konsultacja internistyczna - NFZ (POZ)"
 ALLERGY_SERVICE = "Konsultacja alergologiczna"
 PHONE_WORDS = re.compile(r"\b(?:call|phone|telephone|telefonicz\w*|teleporad\w*)\b")
 REMOTE_WORDS = re.compile(r"\b(?:video|wideo|online)\b")
@@ -55,6 +56,10 @@ GENERAL_SERVICES = {
     "internist": "Internista",
     "interniste": "Internista",
     "internal medicine": "Internista",
+    "internista nfz": INTERNIST_NFZ_SERVICE,
+    "internist nfz": INTERNIST_NFZ_SERVICE,
+    "internista poz": INTERNIST_NFZ_SERVICE,
+    "internist poz": INTERNIST_NFZ_SERVICE,
     "internist phone consultation": INTERNIST_PHONE_SERVICE,
     "internist phone call": INTERNIST_PHONE_SERVICE,
     "phone consultation with an internist": INTERNIST_PHONE_SERVICE,

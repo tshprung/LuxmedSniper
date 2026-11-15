@@ -467,6 +467,35 @@ class BotTests(unittest.TestCase):
             client.reserve_standard_visit.assert_called_once()
             self.assertIn("Already booked", self.state.next_message()["text"])
 
+    def test_additional_allergy_slot_is_identified_and_regular_slot_is_listed_first(self):
+        self.update(1, "Find allergist for me")
+        self.bot.flush()
+        client = MagicMock()
+        client.resolve_service.return_value = 12
+        client.search.return_value = [
+            Appointment(dt.datetime.fromtimestamp(self.now + 3600, WARSAW),
+                        2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9, is_additional=True),
+            Appointment(dt.datetime.fromtimestamp(self.now + 7200, WARSAW),
+                        2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9),
+        ]
+        with patch.object(self.bot, "portal_for", return_value=client):
+            self.bot.search_due()
+        results = self.state.next_message()["text"]
+        self.assertRegex(results, r"2\. [^\n]+ · Patient Portal")
+        self.assertIn("Book <option number>", results)
+        self.bot.flush()
+        self.update(2, "2")
+        message = self.state.next_message()
+        self.assertIn("additional slot", message["text"])
+        self.assertNotIn("Book option", message["buttons"])
+        self.bot.flush()
+        self.update(3, "Book 2")
+        self.assertIn("additional slot", self.state.next_message()["text"])
+        self.assertEqual(self.state.db.execute("SELECT count(*) FROM booking_requests").fetchone()[0], 0)
+        self.bot.flush()
+        self.update(4, "1")
+        self.assertIn("Book option 1", self.state.next_message()["buttons"])
+
     def test_unavailable_slot_offers_more_from_the_same_result_list(self):
         self.telegram.send.side_effect = iter(range(40, 100))
         self.update(1, "/find Adult | Internista")
@@ -1258,6 +1287,25 @@ class BotTests(unittest.TestCase):
         self.assertEqual(criteria.service, "Konsultacja alergologiczna - telefoniczna")
         self.assertEqual((criteria.preferences.first_date, criteria.preferences.start_minute),
                          ("2030-03-31", 960))
+
+    def test_internista_nfz_resolves_the_in_person_catalog_label_and_keeps_tomorrow(self):
+        self.update(1, "find internista nfz for Adult tomorrow")
+        self.bot.flush()
+        client = MagicMock()
+        client.resolve_service = LuxMedPortal.resolve_service
+        client.get_services.return_value = [
+            {"name": "Konsultacja internistyczna - NFZ (POZ)", "id": 15, "isTelemedicine": False},
+            {"name": "Konsultacja internistyczna - telefoniczna", "id": 16, "isTelemedicine": True},
+        ]
+        client.search.return_value = []
+        with patch.object(self.bot, "portal_for", return_value=client):
+            self.bot.search_due()
+        row, = self.state.active()
+        criteria = self.state.criteria(row)
+        self.assertEqual(criteria.service, "Konsultacja internistyczna - NFZ (POZ)")
+        self.assertFalse(criteria.telephone)
+        self.assertEqual((criteria.preferences.first_date, criteria.preferences.last_date), ("2030-03-31",) * 2)
+        self.assertEqual(client.search.call_args.args[0].service_id, "15")
 
     def test_remote_catalog_variant_requires_selection_after_an_in_person_miss(self):
         self.update(1, "Find allergist for me")
