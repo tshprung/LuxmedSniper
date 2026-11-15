@@ -46,7 +46,7 @@ BOOKING_ACCESS_NOTICE = "Direct booking is paused for this patient. Availability
 OPTION_NUMBER = re.compile(r"[1-9][0-9]{0,8}")
 CALLBACK_COMMAND = re.compile(
     r"(?:select|book|approve|stop booking) [1-9][0-9]{0,8}|more|continue|options|"
-    r"stop questionnaire|active|pick patient|pick visits|"
+    r"active|pick patient|pick visits|"
     r"/appointments patient[123]|services patient[123]"
 )
 BOOKING_CHECK_LABELS = {
@@ -247,6 +247,8 @@ class SearchBot:
             return
         if match := re.fullmatch(r"answer ([1-9][0-9]?)", action):
             self.answer_questionnaire(match[1], message.get("message_id"))
+        elif action == "stop questionnaire":
+            self.stop_questionnaire(message)
         elif match := re.fullmatch(r"patient (patient[123]) ([a-f0-9]{12})", action):
             self.choose_patient_button(match[1], match[2])
         elif match := re.fullmatch(r"(service|pediatric) ([1-9][0-9]?) ([a-f0-9]{12})", action):
@@ -264,12 +266,7 @@ class SearchBot:
         reply = message.get("reply_to_message") or {}
         flow = self.allergy_booking
         if key in {"stop questionnaire", "/stop questionnaire", "cancel questionnaire"}:
-            if flow is not None:
-                self.state.stop_booking(flow.booking_id)
-                self.allergy_booking = None
-                self.state.queue_message("Questionnaire stopped.")
-            else:
-                self.state.queue_message("There’s no active questionnaire.")
+            self.stop_questionnaire()
         elif key in {"options", "/options", "give me options", "show me options", "show options"}:
             self.show_options(reply)
         elif (
@@ -560,12 +557,11 @@ class SearchBot:
         return criteria.telephone and normalize(criteria.service) == normalize(INTERNIST_PHONE_SERVICE)
 
     def show_options(self, reply: dict) -> None:
-        if self.allergy_booking is not None and self.allergy_booking.form is not None:
-            self.queue_question(self.allergy_booking)
-            return
         original = self.replied_search(reply)
         if original and self.state.results(original["id"]) is not None:
             self.show_results(original["id"], current=True)
+        elif self.allergy_booking is not None and self.allergy_booking.form is not None:
+            self.queue_question(self.allergy_booking)
         elif pending_patient := self.state.get_setting("pending_patient"):
             self.show_search_patient_choices(json.loads(pending_patient))
         elif pending_service := self.state.get_setting("pending_service"):
@@ -632,11 +628,13 @@ class SearchBot:
         if action in {"book", "details", "select"}:
             number = int(argument)
             if number > row["shown"]:
-                self.state.queue_message("Choose an option number shown in this list, or use More.", search_id)
+                self.state.queue_message("Choose an option from this list.", search_id,
+                                         buttons=[[("See options", "options"), ("More", "more")]])
                 return
             slot = slots[number - 1]
             if slot["start"] <= now:
-                self.state.queue_message("That appointment time has passed. Use More or Continue for other options.", search_id)
+                self.state.queue_message("That appointment time has passed.", search_id,
+                                         buttons=[[("See options", "options"), ("Continue search", "continue")]])
                 return
             if action in {"details", "select"}:
                 heading = self.search_heading(row["display_number"], self.state.criteria(row))
@@ -918,6 +916,18 @@ class SearchBot:
             "Tap an answer or reply directly with its number. I’ll send your choices to LUX MED when the form is complete. "
             "Send Stop questionnaire to end this request."
         )
+
+    def stop_questionnaire(self, message: dict | None = None) -> None:
+        flow = self.allergy_booking
+        if message is not None and (flow is None or flow.message_id is None
+                                    or message.get("message_id") != flow.message_id):
+            self.state.queue_message("That questionnaire button has expired.")
+            return
+        if flow is not None and self.state.stop_booking(flow.booking_id):
+            self.allergy_booking = None
+            self.state.queue_message("Questionnaire stopped.")
+        else:
+            self.state.queue_message("There’s no active questionnaire.")
 
     def answer_questionnaire(self, text: str, message_id: int | None) -> None:
         flow = self.allergy_booking
@@ -1228,6 +1238,7 @@ class SearchBot:
                 self.state.pause_booking(booking["patient"])
             self.state.booking_status(booking["id"], "unknown" if unknown else "ended", reservation_id=reservation_id)
             portal_link = True
+            buttons = None
             if unknown:
                 message = (
                     "LUX MED’s booking outcome is unclear. Check your appointments in the Patient Portal. "
@@ -1255,11 +1266,13 @@ class SearchBot:
                 message = BOOKING_FAILURES.get(code, f"The {step} failed{status}. Availability searches can continue.")
                 if code in {"booking-details-missing", "booking-hold-unavailable"}:
                     message = f"The {step} could not verify the selected slot{status}. Use More or Continue to try another slot."
+                if not error.suspend and code in {"slot-gone", "booking-details-missing", "booking-hold-unavailable"}:
+                    buttons = [[("More", "more"), ("Continue search", "continue")]]
                 portal_link = False
             else:
                 message = BOOKING_FAILURES.get(code, "The booking check failed. Check the Patient Portal.")
             link = f"\n{PATIENT_PORTAL_URL}" if portal_link else ""
-            self.state.queue_message(f"{description}\n{message}{link}", booking["search_id"])
+            self.state.queue_message(f"{description}\n{message}{link}", booking["search_id"], buttons=buttons)
 
     def recover_bookings(self) -> None:
         with self.state.db:

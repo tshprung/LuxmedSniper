@@ -381,7 +381,9 @@ class BotTests(unittest.TestCase):
             self.telegram.send.return_value = 43
             self.bot.flush()
             self.update(2, "Book 4", reply_to=43)
-            self.assertIn("Choose an option number shown", self.state.next_message()["text"])
+            invalid = self.state.next_message()
+            self.assertIn("Choose an option from this list", invalid["text"])
+            self.assertIn(["See options", "options"], json.loads(invalid["buttons"])[0])
             self.bot.flush()
             self.update(3, "More", reply_to=43)
             self.assertIn("4. 31.03 12:00", self.state.next_message()["text"])
@@ -464,6 +466,29 @@ class BotTests(unittest.TestCase):
             self.bot.booking_due()
             client.reserve_standard_visit.assert_called_once()
             self.assertIn("Already booked", self.state.next_message()["text"])
+
+    def test_unavailable_slot_offers_more_from_the_same_result_list(self):
+        self.telegram.send.side_effect = iter(range(40, 100))
+        self.update(1, "/find Adult | Internista")
+        with patch("telegram_bot.LuxMedPortal") as portal:
+            client = portal.return_value
+            client.resolve_service.return_value = 12
+            client.is_booking_blocked_by_penalty.return_value = False
+            slots = [Appointment(dt.datetime.fromtimestamp(self.now + hour * 3600, WARSAW),
+                                 2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9)
+                     for hour in (5, 6, 7, 8)]
+            client.search.side_effect = [slots, []]
+            self.bot.search_due()
+            self.bot.flush()
+            self.update(2, "Book 1")
+            self.bot.booking_due()
+            self.bot.flush()
+            message = self.telegram.send.call_args
+            self.assertIn("That exact slot is no longer available", message.args[0])
+            self.assertIn(["More", "more"], message.kwargs["buttons"][0])
+            self.tap(3, "more", 43)
+            self.assertIn("4. ", self.state.next_message()["text"])
+            client.reserve_standard_visit.assert_not_called()
 
     def test_clear_booking_submits_once_and_verification_failure_is_not_retried(self):
         self.bot.calendar = MagicMock()
@@ -760,12 +785,19 @@ class BotTests(unittest.TestCase):
         self.bot.flush()
         second = self.bot.allergy_booking.message_id
         self.assertNotEqual(first, second)
-        self.update(5, "1", reply_to=first)
-        self.update(6, "1", reply_to=second, sender=200, chat_id=200)
+        self.tap(5, "stop questionnaire", first)
+        self.assertEqual(self.bot.allergy_booking.message_id, second)
+        self.assertIn("button has expired", self.state.next_message()["text"])
+        self.bot.flush()
+        self.tap(6, "options", 41)
+        self.assertIn("Available slots", self.state.next_message()["text"])
+        self.assertEqual(self.bot.allergy_booking.message_id, second)
+        self.update(7, "1", reply_to=first)
+        self.update(8, "1", reply_to=second, sender=200, chat_id=200)
         self.bot.booking_due()
         client.submit_booking_questionnaire.assert_not_called()
         self.bot.flush()
-        self.update(7, "1", reply_to=second)
+        self.update(9, "1", reply_to=second)
         self.bot.booking_due()
         client.submit_booking_questionnaire.assert_called_once()
         payload = client.submit_booking_questionnaire.call_args.args[0]
@@ -777,7 +809,7 @@ class BotTests(unittest.TestCase):
         client.reserve_standard_visit.assert_not_called()
         self.assertIn("Reply Approve 1 to book", self.state.next_message()["text"])
         self.bot.flush()
-        self.update(8, "Approve 1")
+        self.update(10, "Approve 1")
         self.bot.booking_due()
         client.reserve_standard_visit.assert_called_once_with(
             slot, "Konsultacja alergologiczna", questionnaire=receipt,
