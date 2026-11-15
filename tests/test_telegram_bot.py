@@ -414,7 +414,7 @@ class BotTests(unittest.TestCase):
     def test_verified_booking_retries_calendar_delivery_with_same_event_id(self):
         self.bot.calendar = MagicMock()
         self.bot.calendar.busy.return_value = False
-        self.bot.calendar.add_booking.side_effect = [CalendarUnavailable, None]
+        self.bot.calendar.add_booking.side_effect = [CalendarUnavailable, CalendarUnavailable, None]
         self.bot.calendar_destination = "primary"
         self.bot.calendar_detail_patients = frozenset({"patient1"})
         self.update(1, "/find Adult | Internista")
@@ -441,15 +441,22 @@ class BotTests(unittest.TestCase):
             self.assertIn("Booked and verified in LUX MED", self.state.next_message()["text"])
             self.bot.flush()
             self.bot.sync_calendar_due()
-            self.assertIsNone(self.state.next_message())
+            delayed = self.state.next_message()["text"]
+            self.assertIn("Adult · 30.03 19:00 (Warsaw time)", delayed)
+            self.assertIn("I couldn’t confirm the Google Calendar event yet. I’ll retry automatically.", delayed)
+            self.bot.flush()
             self.bot.sync_calendar_due()
             self.bot.calendar.add_booking.assert_called_once()
             self.now += 15 * 60
             self.bot.sync_calendar_due()
-            self.assertIn("Added the appointment to Google Calendar", self.state.next_message()["text"])
+            self.assertIsNone(self.state.next_message())
+            self.now += 15 * 60
             self.bot.sync_calendar_due()
-            first, retry = self.bot.calendar.add_booking.call_args_list
-            self.assertEqual(first, retry)
+            self.assertIn("Adult · 30.03 19:00 (Warsaw time)\nAdded the appointment to Google Calendar.",
+                          self.state.next_message()["text"])
+            self.bot.sync_calendar_due()
+            first, second, retry = self.bot.calendar.add_booking.call_args_list
+            self.assertEqual([first, second], [retry, retry])
             self.assertEqual(retry.args[0], "primary")
             self.assertEqual(retry.args[2], start)
             self.assertEqual(retry.kwargs, {

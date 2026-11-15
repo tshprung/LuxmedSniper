@@ -57,7 +57,8 @@ class SearchState:
             CREATE TABLE IF NOT EXISTS calendar_sync (
                 booking_id INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE,
                 calendar_id TEXT NOT NULL, starts_at INTEGER NOT NULL, ends_at INTEGER NOT NULL,
-                next_attempt INTEGER NOT NULL, synced INTEGER NOT NULL DEFAULT 0
+                next_attempt INTEGER NOT NULL, synced INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0
             );
         """)
         with self.db:
@@ -65,6 +66,9 @@ class SearchState:
             account_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(accounts)")}
             if "booking_paused" not in account_columns:
                 self.db.execute("ALTER TABLE accounts ADD COLUMN booking_paused INTEGER NOT NULL DEFAULT 0")
+            calendar_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(calendar_sync)")}
+            if "attempts" not in calendar_columns:
+                self.db.execute("ALTER TABLE calendar_sync ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(searches)")}
             for name, declaration in (
                 ("last_checked", "INTEGER"),
@@ -219,10 +223,10 @@ class SearchState:
             (calendar_id, now, now),
         ).fetchone()
 
-    def finish_calendar_attempt(self, booking_id: int, now: int, synced: bool) -> None:
+    def finish_calendar_attempt(self, booking_id: int, next_attempt: int, synced: bool) -> None:
         self.db.execute(
-            "UPDATE calendar_sync SET synced = ?, next_attempt = ? WHERE booking_id = ?",
-            (synced, now + 15 * 60, booking_id),
+            "UPDATE calendar_sync SET synced = ?, next_attempt = ?, attempts = attempts + 1 WHERE booking_id = ?",
+            (synced, next_attempt, booking_id),
         )
 
     def stop_booking(self, booking_id: int) -> bool:

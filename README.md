@@ -176,10 +176,9 @@ title “Appointment” and the booked time. To include the service, clinician,
 clinic for in-person visits, and reminders 10 and 30 minutes before a
 visit, set `LUXMED_CALENDAR_DETAILS_PATIENTS` in the worker's environment
 to a comma-separated list of profile keys (such as `patient1`). This
-applies when creating events. The worker retries event creation
-using the same event ID and keeps the appointment status in LUX MED
-independent of the calendar result. Cancelled appointments already in
-Google Calendar need to be removed there.
+applies when creating events. The worker uses the same event ID for
+retries and sends a Telegram update if sync is delayed or succeeds.
+Cancelled appointments already in Google Calendar need to be removed there.
 
 ### Read-only booking feasibility
 
