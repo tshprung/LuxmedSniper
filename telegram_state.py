@@ -200,7 +200,7 @@ class SearchState:
 
     def booking_recovery(self):
         return self.db.execute(
-            "SELECT * FROM booking_requests WHERE status IN ('checking', 'submitting', 'verifying')",
+            "SELECT * FROM booking_requests WHERE status IN ('questionnaire', 'checking', 'submitting', 'verifying')",
         ).fetchall()
 
     def queue_calendar_event(self, booking_id: int, event_id: str, calendar_id: str, start: int, end: int, now: int) -> None:
@@ -231,7 +231,7 @@ class SearchState:
 
     def stop_booking(self, booking_id: int) -> bool:
         return self.db.execute(
-            "UPDATE booking_requests SET status = 'stopped' WHERE id = ? AND status IN ('queued', 'approval')",
+            "UPDATE booking_requests SET status = 'stopped' WHERE id = ? AND status IN ('queued', 'approval', 'questionnaire')",
             (booking_id,),
         ).rowcount == 1
 

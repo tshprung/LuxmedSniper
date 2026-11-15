@@ -23,6 +23,7 @@ import schedule
 import yaml
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
+from luxmed_questionnaire import QuestionnaireReceipt
 
 WARSAW = ZoneInfo("Europe/Warsaw")
 PORTAL_TIMEOUT = (5, 15)
@@ -197,7 +198,7 @@ class LuxMedPortal:
         return expires_at if type(expires_at) is int and expires_at > 0 else None
 
     def _portal_json(self, method: str, url: str, *, authenticating: bool = False,
-                     stage: str | None = None, **kwargs: Any) -> Any:
+                     stage: str | None = None, allow_empty: bool = False, **kwargs: Any) -> Any:
         try:
             response = self.session.request(
                 method, url, timeout=PORTAL_TIMEOUT, allow_redirects=False, **kwargs,
@@ -212,6 +213,8 @@ class LuxMedPortal:
             raise PortalError("access-denied", suspend=True, **error_context)
         if 300 <= status < 400:
             raise PortalError("login-unconfirmed" if authenticating else "session-unconfirmed", suspend=True, **error_context)
+        if allow_empty and status in (200, 204) and not response.content.strip():
+            return None
         if status != 200:
             raise PortalError("portal-error", suspend=authenticating and status < 500, **error_context)
         try:
@@ -224,7 +227,7 @@ class LuxMedPortal:
             ) from None
 
     def search(self, locator: DoctorLocator, *, days: int = 14, date: datetime.date | None = None,
-               nationwide_from: str | None = None) -> list[Appointment]:
+               nationwide_from: str | None = None, questionnaire: QuestionnaireReceipt | None = None) -> list[Appointment]:
         now = datetime.datetime.now(tz=datetime.UTC)
         end = now + datetime.timedelta(days=days)
         params = {
@@ -242,6 +245,8 @@ class LuxMedPortal:
             params["facilitiesIds"] = locator.clinic_ids
         if locator.doctor_ids:
             params["doctorsIds"] = locator.doctor_ids
+        if questionnaire is not None:
+            params.update(processId=questionnaire.process_id, pnmExecutionId=questionnaire.execution_id)
         if nationwide_from is not None:
             # LUX MED uses the selected city with this service's default nationwide scope.
             params.update({
@@ -515,6 +520,12 @@ class LuxMedPortal:
 
     def check_booking_eligibility(self, city_id: int, service_variant_id: int) -> None:
         """Check the normal portal prerequisites for a visit without a referral."""
+        self.check_booking_requirements(service_variant_id)
+        if self.booking_questionnaire(city_id, service_variant_id) is not None:
+            raise PortalError("portal-questions", stage="questionnaire")
+        self.check_booking_coverage(city_id, service_variant_id)
+
+    def check_booking_requirements(self, service_variant_id: int) -> None:
         limits = self._portal_json("GET", f"{self.NEW_PORTAL_URL}/Reservation/GetLimits", stage="booking-limits")
         if not isinstance(limits, dict) or limits.get("canReserve") is not True:
             raise PortalError("booking-limit")
@@ -526,6 +537,8 @@ class LuxMedPortal:
             raise PortalError("booking-referrals-unconfirmed", stage="referrals")
         if any(referral.get("serviceVariantId") == service_variant_id for referral in entries):
             raise PortalError("booking-referral-review", stage="referrals")
+
+    def booking_questionnaire(self, city_id: int, service_variant_id: int) -> dict | None:
         params = {"locationId": city_id, "serviceVariantId": service_variant_id, "process": 4}
         triage = self._portal_json(
             "GET", f"{self.NEW_PORTAL_URL}/PNM/Index",
@@ -541,8 +554,17 @@ class LuxMedPortal:
             not isinstance(questions, list) or any(not isinstance(question, dict) for question in questions)
         ):
             raise PortalError("questionnaire-response-unrecognized", stage="questionnaire")
-        if questions:
-            raise PortalError("portal-questions", stage="questionnaire")
+        return triage if questions else None
+
+    def submit_booking_questionnaire(self, occurrence: dict) -> None:
+        result = self._portal_json(
+            "POST", f"{self.NEW_PORTAL_URL}/PNM/Occurrence", json=occurrence,
+            headers=self._booking_request_headers(), allow_empty=True, stage="questionnaire-submission",
+        )
+        if result is not None and result != {} and result is not True:
+            raise PortalError("questionnaire-submission-unconfirmed", stage="questionnaire-submission")
+
+    def check_booking_coverage(self, city_id: int, service_variant_id: int) -> None:
         availability = self._portal_json(
             "GET", f"{self.NEW_PORTAL_URL}/Reservation/serviceVariantAvailabilityDetails",
             params={"cityId": city_id, "serviceVariantId": service_variant_id, "reservationId": ""},
@@ -554,7 +576,8 @@ class LuxMedPortal:
         ):
             raise PortalError("booking-eligibility")
 
-    def reserve_standard_visit(self, appointment: Appointment, service_name: str) -> int:
+    def reserve_standard_visit(self, appointment: Appointment, service_name: str, *,
+                               questionnaire: QuestionnaireReceipt | None = None) -> int:
         """Hold and confirm one routine covered visit. Return its reservation ID."""
         term = appointment.booking_term
         if term is None or appointment.doctor_id is None:
@@ -573,7 +596,7 @@ class LuxMedPortal:
             "isTelemedicine": telephone, "isPoz": False, "isRehabilitation": False, "isVideoConsultation": False,
             "isAdditional": False, "isImpediment": False, "isPreparationRequired": False,
             "parentReservationId": None, "referralId": None, "eReferralId": None, "referralTypeId": None,
-            "executedTriageId": None,
+            "executedTriageId": questionnaire.execution_id if questionnaire else None,
         }
         base = f"{self.NEW_PORTAL_URL}/Reservation"
         headers = self._booking_request_headers()

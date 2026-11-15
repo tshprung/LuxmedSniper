@@ -12,6 +12,7 @@ from pathlib import Path
 
 import requests
 
+from luxmed_questionnaire import Questionnaire, QuestionnaireError, QuestionnaireReceipt, visible_text
 from luxmed_sniper import WARSAW, DoctorLocator, Luxmed, LuxMedPortal, PortalError, service_variants
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_settings, trusted_devices, validate, worker_settings
@@ -32,6 +33,11 @@ PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/P
 SICK_CHILD_SERVICES = {
     normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[index][2]) for index in (0, 1, 2)
 }
+ALLERGY_SERVICE = "Konsultacja alergologiczna"
+ALLERGY_SERVICES = {"alergolog", normalize(ALLERGY_SERVICE)}
+QUESTIONNAIRE_PROMPT = "LUX MED questionnaire"
+QUESTIONNAIRE_APPROVAL = "Please confirm this allergy appointment."
+QUESTIONNAIRE_EXPIRED = "This questionnaire session has ended. Start a fresh search to try again."
 SUPPORTED_BOOKING_SERVICES = {"internista", normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[3][2])}
 QUESTIONNAIRE_NOTICE = "LUX MED requires a medical questionnaire for this visit. Complete it in the Patient Portal."
 PREPARATION_NOTICE = "LUX MED lists preparation instructions for this visit. Open “Zobacz szczegóły” in the Patient Portal."
@@ -42,6 +48,7 @@ BOOKING_CHECK_LABELS = {
     "phone-doctors": "phone clinician lookup", "booking-penalty": "no-show restriction check",
     "booking-limits": "booking limits", "referrals": "referral check",
     "questionnaire": "questionnaire check", "service-eligibility": "service eligibility",
+    "questionnaire-submission": "questionnaire submission",
     "booking-conflicts": "LUX MED conflict check", "booking-request-token": "booking request verification",
     "booking-hold": "slot hold", "booking-confirm": "booking confirmation",
     "booking-release": "slot hold release", "booking-verification": "reservation verification",
@@ -55,6 +62,9 @@ BOOKING_FAILURES = {
     "booking-referral-review": "LUX MED returned a referral for this service. Review it in the Patient Portal to book.",
     "portal-questions": QUESTIONNAIRE_NOTICE,
     "questionnaire-response-unrecognized": "I couldn't verify LUX MED's questionnaire response. Check this visit in the Patient Portal.",
+    "questionnaire-submission-unconfirmed": "I couldn’t verify that LUX MED accepted the answers. Check the Patient Portal.",
+    "questionnaire-expired": QUESTIONNAIRE_EXPIRED,
+    "questionnaire-open": "Finish the current questionnaire first, or send Stop questionnaire.",
     "portal-preparation": PREPARATION_NOTICE,
     "booking-needs-portal": "LUX MED returned a warning, a conflict, a payment or referral choice, or an existing visit. Check the Patient Portal.",
     "booking-rejected": "LUX MED declined the reservation. Check the Patient Portal for details.",
@@ -100,8 +110,11 @@ class Telegram:
             raise TelegramError()
         return updates
 
-    def send(self, message: str) -> int:
-        result = self.call("sendMessage", {"chat_id": self.owner, "text": message, "protect_content": True})
+    def send(self, message: str, *, force_reply: bool = False) -> int:
+        payload = {"chat_id": self.owner, "text": message, "protect_content": True}
+        if force_reply:
+            payload["reply_markup"] = {"force_reply": True}
+        result = self.call("sendMessage", payload)
         if not isinstance(result, dict) or type(result.get("message_id")) is not int:
             raise TelegramError()
         return result["message_id"]
@@ -113,6 +126,19 @@ class Profile:
     credentials: Luxmed = field(repr=False)
     aliases: tuple[str, ...] = ()
     child: bool = False
+
+
+@dataclass(repr=False)
+class AllergyBooking:
+    booking_id: int
+    search_id: int
+    patient: str
+    portal: LuxMedPortal
+    expires_at: float
+    form: Questionnaire | None
+    receipt: QuestionnaireReceipt | None = None
+    prompt: str | None = None
+    message_id: int | None = None
 
 
 def configured_profiles(settings: dict, metadata: dict) -> dict[str, Profile]:
@@ -149,6 +175,7 @@ class SearchBot:
         )
         self.device_credentials = device_credentials or {}
         self.portals: dict[str, tuple[float, LuxMedPortal]] = {}
+        self.allergy_booking: AllergyBooking | None = None
         self.cities = city_catalog()
         self.children = {key for key, profile in profiles.items() if profile.child}
         self.aliases = {}
@@ -186,7 +213,21 @@ class SearchBot:
         key = normalize(text)
         command, _, argument = key.partition(" ")
         reply = message.get("reply_to_message") or {}
-        if command in {"stop", "/stop"}:
+        flow = self.allergy_booking
+        if key in {"stop questionnaire", "/stop questionnaire", "cancel questionnaire"}:
+            if flow is not None:
+                self.state.stop_booking(flow.booking_id)
+                self.allergy_booking = None
+                self.state.queue_message("Questionnaire stopped.")
+            else:
+                self.state.queue_message("There’s no active questionnaire.")
+        elif (
+            (flow is not None and flow.message_id is not None and reply.get("message_id") == flow.message_id)
+            or (flow is not None and flow.form is not None and re.fullmatch(r"[0-9]{1,2}", text))
+            or str(reply.get("text") or "").startswith(QUESTIONNAIRE_PROMPT + "\n")
+        ):
+            self.answer_questionnaire(text, reply.get("message_id"))
+        elif command in {"stop", "/stop"}:
             self.stop(argument, reply)
         elif key in {"/active", "active", "show active searches", "show running searches"}:
             self.show_active()
@@ -370,11 +411,11 @@ class SearchBot:
         return notices
 
     @staticmethod
-    def supports_booking_service(service: str, telephone: bool) -> bool:
+    def supports_booking_service(service: str, telephone: bool, patient: str) -> bool:
         key = normalize(service)
         if telephone:
             return key == normalize(INTERNIST_PHONE_SERVICE)
-        return key in SUPPORTED_BOOKING_SERVICES
+        return key in SUPPORTED_BOOKING_SERVICES or (patient == "patient1" and key in ALLERGY_SERVICES)
 
     @staticmethod
     def is_nationwide_phone_search(criteria: Criteria) -> bool:
@@ -403,7 +444,7 @@ class SearchBot:
             lines.append("Reply More to see the next options.")
         can_book = (
             self.can_book_for(row["patient"]) and not notices
-            and self.supports_booking_service(row["service"], bool(row["telephone"]))
+            and self.supports_booking_service(row["service"], bool(row["telephone"]), row["patient"])
             and not self.state.booking_paused(row["patient"])
         )
         action = "Book <option number> to request that slot" if can_book else "Details <option number> for the Patient Portal link"
@@ -479,7 +520,7 @@ class SearchBot:
         if self.state.booking_paused(row["patient"]):
             self.state.queue_message(f"{description}\n{BOOKING_ACCESS_NOTICE}", search_id)
             return
-        if not self.supports_booking_service(row["service"], bool(row["telephone"])):
+        if not self.supports_booking_service(row["service"], bool(row["telephone"]), row["patient"]):
             self.state.queue_message(f"This visit type needs to be booked in the Patient Portal.\n{PATIENT_PORTAL_URL}", search_id)
             return
         if any(type(slot.get(key)) is not int for key in ("clinic_id", "doctor_id", "service_id")):
@@ -499,6 +540,8 @@ class SearchBot:
             due = next_search_time(now)
             timing = "Checking the exact slot and booking conditions." if due == now else f"Queued for {local_time(due)} Warsaw time."
             self.state.queue_message(f"{description}\n{timing}", search_id)
+        elif status == "questionnaire":
+            self.state.queue_message("Reply to the current LUX MED question, or send Stop questionnaire.", search_id)
         elif status in {"checking", "submitting", "verifying"}:
             self.state.queue_message(f"{description}\nThis booking is already being processed.", search_id)
         else:
@@ -605,6 +648,8 @@ class SearchBot:
     def stop(self, argument: str, reply: dict) -> None:
         if match := re.fullmatch(r"booking ([1-9][0-9]{0,8})", argument):
             stopped = self.state.stop_booking(int(match[1]))
+            if stopped and self.allergy_booking and self.allergy_booking.booking_id == int(match[1]):
+                self.allergy_booking = None
             self.state.queue_message("Booking request stopped." if stopped else "There’s no pending booking with that number.")
             return
         row = self.replied_search(reply)
@@ -638,6 +683,10 @@ class SearchBot:
         while (message := self.state.next_message()) is not None:
             sent = self.telegram.send(message["text"])
             self.state.sent(message, sent)
+        flow = self.allergy_booking
+        if flow is not None and flow.prompt is not None:
+            flow.message_id = self.telegram.send(flow.prompt, force_reply=True)
+            flow.prompt = None
 
     def portal_for(self, patient: str) -> LuxMedPortal:
         now = self.clock()
@@ -669,8 +718,107 @@ class SearchBot:
         for patient in tuple(self.portals):
             self.close_portal(patient)
 
+    def queue_question(self, flow: AllergyBooking) -> None:
+        question = flow.form.prompt()
+        name = self.profiles[flow.patient].name
+        flow.message_id = None
+        flow.prompt = (
+            f"{QUESTIONNAIRE_PROMPT}\n{name} · {ALLERGY_SERVICE}\n\n{question}\n\n"
+            "Reply to this message with an option number. I’ll send your choices to LUX MED when the form is complete. "
+            "Send Stop questionnaire to end this request."
+        )
+
+    def answer_questionnaire(self, text: str, message_id: int | None) -> None:
+        flow = self.allergy_booking
+        if flow is None or flow.expires_at <= self.clock():
+            self.state.queue_message(QUESTIONNAIRE_EXPIRED)
+            return
+        if flow.form is None or flow.message_id is None or message_id != flow.message_id:
+            self.state.queue_message("Reply to the most recent LUX MED question.")
+            return
+        if not re.fullmatch(r"[1-9][0-9]?", text) or int(text) > len(flow.form.choices):
+            self.state.queue_message("Please reply to the question with one of the option numbers shown.")
+            return
+        try:
+            flow.form.choose(int(text))
+            if flow.form.result is None:
+                self.queue_question(flow)
+                return
+            flow.message_id = None
+            if flow.form.permits_original_service():
+                info = flow.form.information
+                if len(info.encode("utf-16-le")) > 6800:
+                    raise QuestionnaireError()
+                if info:
+                    self.state.queue_message(f"LUX MED\n{info}", flow.search_id)
+                self.state.booking_status(flow.booking_id, "queued", reason=QUESTIONNAIRE_APPROVAL)
+                return
+            result = flow.form.result
+            service = visible_text(result.get("name"))[:160] if result.get("discriminator") == "ServiceVariantResultDto" else ""
+            notice = flow.form.information or service
+            message = "LUX MED recommends a different next step for your answers."
+            if service:
+                message += f" You can start a new search for {service} if that’s what you want."
+            else:
+                message += f" Review the result in the Patient Portal.\n{PATIENT_PORTAL_URL}"
+            if notice and notice != service and len(notice.encode("utf-16-le")) <= 6800:
+                message = f"{notice}\n{message}"
+        except QuestionnaireError:
+            message = BOOKING_FAILURES["questionnaire-response-unrecognized"] + f"\n{PATIENT_PORTAL_URL}"
+        self.state.booking_status(flow.booking_id, "ended")
+        self.allergy_booking = None
+        self.state.queue_message(message, flow.search_id)
+
+    def allergy_preflight(self, booking, criteria: Criteria, slot: dict, portal: LuxMedPortal) -> AllergyBooking:
+        flow = self.allergy_booking
+        service_id = slot["service_id"]
+        if flow is not None and flow.booking_id != booking["id"]:
+            raise PortalError("questionnaire-open")
+        if flow is not None and (flow.portal is not portal or flow.expires_at <= self.clock()):
+            raise PortalError("questionnaire-expired")
+        if flow is None and QUESTIONNAIRE_APPROVAL in (booking["reason"] or "").splitlines():
+            raise PortalError("questionnaire-expired")
+        variant = portal.resolve_in_person_service(ALLERGY_SERVICE)
+        if variant != service_id:
+            raise PortalError("booking-details-missing")
+        portal.check_booking_requirements(variant)
+        if flow is None:
+            raw = portal.booking_questionnaire(criteria.city_id, variant)
+            try:
+                form = Questionnaire(raw, variant, criteria.city_id, self.clock()) if raw is not None else None
+                flow = AllergyBooking(
+                    booking["id"], booking["search_id"], criteria.patient, portal,
+                    min(self.portals[criteria.patient][0], slot["start"]), form,
+                )
+                if form is not None:
+                    self.queue_question(flow)
+                    with self.state.db:
+                        self.state.booking_status(booking["id"], "questionnaire", reason=QUESTIONNAIRE_APPROVAL)
+            except QuestionnaireError:
+                raise PortalError("questionnaire-response-unrecognized", stage="questionnaire") from None
+            self.allergy_booking = flow
+            if form is not None:
+                return flow
+        portal.check_booking_coverage(criteria.city_id, variant)
+        if flow.form is not None:
+            # A queued questionnaire is complete only after the user chose a terminal answer.
+            try:
+                occurrence = flow.form.submission(self.clock())
+            except QuestionnaireError:
+                raise PortalError("questionnaire-response-unrecognized", stage="questionnaire") from None
+            portal.submit_booking_questionnaire(occurrence)
+            flow.receipt = flow.form.receipt
+            flow.form = None
+        return flow
+
     def booking_due(self) -> None:
         now = int(self.clock())
+        flow = self.allergy_booking
+        if flow is not None and flow.expires_at <= now:
+            with self.state.db:
+                if self.state.stop_booking(flow.booking_id):
+                    self.state.queue_message(QUESTIONNAIRE_EXPIRED, flow.search_id)
+            self.allergy_booking = None
         if not self.booking_enabled or not self.allowed_booking_patients or next_search_time(now) != now:
             return
         booking = self.state.claim_booking(self.allowed_booking_patients)
@@ -681,6 +829,7 @@ class SearchBot:
         criteria = self.state.criteria(row)
         heading = self.search_heading(row["display_number"], criteria)
         description = f"{heading}\nOption {booking['option_number']}. {self.slot_details(slot)}"
+        allergy = criteria.patient == "patient1" and not criteria.telephone and normalize(criteria.service) in ALLERGY_SERVICES
         reservation_id = None
         try:
             if slot["start"] <= now:
@@ -689,7 +838,7 @@ class SearchBot:
                 raise PortalError("portal-questions")
             if slot.get("requires_preparation") is True:
                 raise PortalError("portal-preparation")
-            if not self.supports_booking_service(criteria.service, criteria.telephone):
+            if not self.supports_booking_service(criteria.service, criteria.telephone, criteria.patient):
                 raise PortalError("booking-needs-portal")
             if self.state.unresolved_booking(criteria.patient):
                 raise PortalError("prior-booking-unverified")
@@ -706,14 +855,24 @@ class SearchBot:
                     raise PortalError("booking-details-missing")
             if portal.is_booking_blocked_by_penalty(criteria.city_id, slot["service_id"]):
                 raise PortalError("booking-penalty")
-            portal.check_booking_eligibility(criteria.city_id, slot["service_id"])
+            receipt = None
+            if allergy:
+                flow = self.allergy_preflight(booking, criteria, slot, portal)
+                if flow.form is not None:
+                    return
+                receipt = flow.receipt
+            else:
+                portal.check_booking_eligibility(criteria.city_id, slot["service_id"])
             locator = DoctorLocator(id=f"{criteria.city_id}*{slot['service_id']}*-1*{slot['doctor_id']}")
             appointment = self.refresh_booking_slot(
                 portal, locator, slot, nationwide_from=criteria.city if criteria.telephone else None,
+                questionnaire=receipt,
             )
             start = appointment.AppointmentDate.astimezone(dt.UTC)
             end = appointment.booking_term["end"].astimezone(dt.UTC)
             reasons = self.booking_approval_reasons(portal, start, end)
+            if allergy:
+                reasons.append(QUESTIONNAIRE_APPROVAL)
             if slot["start"] <= int(self.clock()):
                 raise PortalError("slot-gone")
             checked_at = int(self.clock())
@@ -729,14 +888,22 @@ class SearchBot:
                 return
             with self.state.db:
                 self.state.booking_status(booking["id"], "submitting")
-            reservation_id = portal.reserve_standard_visit(appointment, criteria.service)
+            service_name = ALLERGY_SERVICE if allergy else criteria.service
+            reservation_id = (
+                portal.reserve_standard_visit(appointment, service_name, questionnaire=receipt)
+                if receipt else portal.reserve_standard_visit(appointment, service_name)
+            )
             with self.state.db:
                 self.state.booking_status(booking["id"], "verifying", reservation_id=reservation_id)
             if reservation_id not in portal.booked_visit_ids(telephone=criteria.telephone):
                 raise PortalError("booking-outcome-unknown")
         except PortalError as error:
+            if self.allergy_booking and self.allergy_booking.booking_id == booking["id"]:
+                self.allergy_booking = None
             self.report_booking_failure(booking, description, error, reservation_id)
             return
+        if allergy:
+            self.allergy_booking = None
         with self.state.db:
             self.state.booking_status(booking["id"], "booked", reservation_id=reservation_id)
             self.state.queue_message(f"{description}\nBooked and verified in LUX MED.", row["id"])
@@ -802,10 +969,14 @@ class SearchBot:
             self.state.queue_message(f"{appointment}\nAdded the appointment to Google Calendar.", event["search_id"])
 
     @staticmethod
-    def refresh_booking_slot(portal, locator: DoctorLocator, slot: dict, *, nationwide_from: str | None = None):
+    def refresh_booking_slot(portal, locator: DoctorLocator, slot: dict, *, nationwide_from: str | None = None,
+                             questionnaire: QuestionnaireReceipt | None = None):
         date = dt.datetime.fromtimestamp(slot["start"], WARSAW).date()
         telephone = nationwide_from is not None
-        availability = portal.search(locator, date=date, nationwide_from=nationwide_from)
+        parameters = {"date": date, "nationwide_from": nationwide_from}
+        if questionnaire is not None:
+            parameters["questionnaire"] = questionnaire
+        availability = portal.search(locator, **parameters)
         matches = [
             item for item in availability
             if int(item.AppointmentDate.timestamp()) == slot["start"]
@@ -882,6 +1053,9 @@ class SearchBot:
             elif code == "booking-access-paused":
                 message = BOOKING_ACCESS_NOTICE
                 portal_link = False
+            elif code in {"questionnaire-expired", "questionnaire-open"}:
+                message = BOOKING_FAILURES[code]
+                portal_link = False
             elif code == "rate-limited":
                 message = "LUX MED rate-limited this account. Try /resume later."
                 portal_link = False
@@ -900,7 +1074,10 @@ class SearchBot:
     def recover_bookings(self) -> None:
         with self.state.db:
             for booking in self.state.booking_recovery():
-                if booking["status"] == "checking":
+                if booking["status"] == "questionnaire":
+                    self.state.booking_status(booking["id"], "ended")
+                    self.state.queue_message(QUESTIONNAIRE_EXPIRED, booking["search_id"])
+                elif booking["status"] == "checking":
                     self.state.booking_status(booking["id"], "queued", reason=booking["reason"])
                 else:
                     self.report_booking_failure(

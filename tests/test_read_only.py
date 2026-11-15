@@ -10,6 +10,7 @@ from unittest.mock import patch
 import requests
 
 import audit_search
+from luxmed_questionnaire import QuestionnaireReceipt
 from luxmed_sniper import DoctorLocator, Luxmed, LuxMedPortal, PortalError
 from telegram_requests import INTERNIST_PHONE_SERVICE
 
@@ -195,13 +196,16 @@ class SearchTests(unittest.TestCase):
         hold = {"hasErrors": False, "hasWarnings": False,
                 "value": {"temporaryReservationId": 135, "askForReferral": False, "valuations": [valuation]}}
         confirmed = {"hasErrors": False, "value": {"reservationId": 246}}
+        questionnaire = QuestionnaireReceipt("fixture-process", "fixture-execution")
         with patch.object(requests.Session, "request", side_effect=[
             response({"token": "fixture-token"}), response({"token": "fixture-request-token"}),
             response(hold), response(confirmed),
         ]) as request:
             portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
             with portal.session:
-                self.assertEqual(portal.reserve_standard_visit(appointment, "Fixture service"), 246)
+                self.assertEqual(portal.reserve_standard_visit(
+                    appointment, "Fixture service", questionnaire=questionnaire,
+                ), 246)
         request_token, lock, confirm = request.call_args_list[1:]
         self.assertTrue(request_token.args[1].endswith("/security/getforgerytoken"))
         self.assertEqual(request_token.args[0], "GET")
@@ -209,6 +213,7 @@ class SearchTests(unittest.TestCase):
             self.assertEqual(call.kwargs["headers"], {
                 "X-Requested-With": "XMLHttpRequest", "XSRF-TOKEN": "fixture-request-token",
             })
+            self.assertEqual(call.kwargs["json"]["executedTriageId"], questionnaire.execution_id)
         self.assertTrue(lock.args[1].endswith("/Reservation/LockTerm"))
         self.assertEqual(lock.kwargs["json"]["doctorId"], 9)
         self.assertEqual(lock.kwargs["json"]["date"], "2030-04-01T08:00:00.000Z")
@@ -227,6 +232,23 @@ class SearchTests(unittest.TestCase):
         self.assertTrue(preparation_slot.requires_preparation)
         self.assertIsNone(preparation_slot.booking_term)
         self.assertNotIn("private-fixture", repr(preparation_slot))
+
+    def test_questionnaire_keeps_the_same_execution_for_submission_and_search(self):
+        receipt = QuestionnaireReceipt("fixture-process", "fixture-execution")
+        occurrence = {"processId": receipt.process_id, "executionId": receipt.execution_id}
+        with patch.object(requests.Session, "request", side_effect=[
+            response({"token": "fixture-token"}), response({"token": "fixture-request-token"}),
+            response(status=204, raw=""), response({"termsForService": {"termsForDays": []}}),
+        ]) as request:
+            portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
+            with portal.session:
+                portal.submit_booking_questionnaire(occurrence)
+                portal.search(DoctorLocator(id="5*30*-1*-1"), questionnaire=receipt)
+        _, _, submit, search = request.call_args_list
+        self.assertEqual(submit.args, ("POST", f"{LuxMedPortal.NEW_PORTAL_URL}/PNM/Occurrence"))
+        self.assertEqual(submit.kwargs["json"], occurrence)
+        self.assertEqual(search.kwargs["params"]["processId"], receipt.process_id)
+        self.assertEqual(search.kwargs["params"]["pnmExecutionId"], receipt.execution_id)
 
     def test_booking_hold_releases_without_confirmation_if_portal_requires_review(self):
         locator = DoctorLocator(id="5*30*-1*-1")
