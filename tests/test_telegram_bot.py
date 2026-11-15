@@ -274,8 +274,10 @@ class BotTests(unittest.TestCase):
             self.assertIn("5. 31.03 13:00", self.state.next_message()["text"])
             self.bot.flush()
             self.update(4, "Book 4")
-            self.assertIn("Option 4. 31.03 12:00", self.state.next_message()["text"])
-            self.assertIn("Checking the exact slot", self.state.next_message()["text"])
+            confirmation = self.state.next_message()["text"]
+            self.assertIn("Option 4. 31.03 12:00", confirmation)
+            self.assertIn("Checking the exact slot", confirmation)
+            self.assertNotIn("Booking request", confirmation)
             self.bot.flush()
             self.update(5, "find something else", reply_to=43)
             self.update(6, "Continue", reply_to=43)
@@ -334,6 +336,7 @@ class BotTests(unittest.TestCase):
             prompt = self.state.next_message()["text"]
             self.assertIn("within six hours", prompt)
             self.assertIn("couldn’t check your Google Calendar", prompt)
+            self.assertIn("Approval code: 1", prompt)
             self.assertIn("Approve 1", prompt)
             client.reserve_standard_visit.assert_not_called()
             self.bot.flush()
