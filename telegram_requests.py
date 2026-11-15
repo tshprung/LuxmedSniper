@@ -12,6 +12,16 @@ from telegram_preferences import Preferences, contains_words, name_words, parse_
 
 INTERNIST_PHONE_SERVICE = "Konsultacja internistyczna - telefoniczna"
 ALLERGY_SERVICE = "Konsultacja alergologiczna"
+PHONE_WORDS = re.compile(r"\b(?:call|phone|telephone|telefonicz\w*|teleporad\w*)\b")
+REMOTE_WORDS = re.compile(r"\b(?:video|wideo|online)\b")
+OFFICE_SUFFIX = re.compile(r"\s+(?:in[- ]person|in (?:the )?office|in (?:the )?clinic)$", re.IGNORECASE)
+PHONE_SUFFIX = re.compile(r"\s+(?:by phone|over the phone|by telephone|phone(?: call| consultation)?|call)$", re.IGNORECASE)
+PHONE_PREFIX = re.compile(r"^(?:phone consultation|(?:phone )?call|telephone consultation)\s+(?:with\s+(?:(?:a|an)\s+)?)?", re.IGNORECASE)
+MODE_CHOICES = re.compile(
+    r"\s+(?:(?:in[- ]person|in (?:the )?office) or (?:by )?(?:phone(?: call)?|telephone|call)|"
+    r"(?:by )?(?:phone(?: call)?|telephone|call) or (?:in[- ]person|in (?:the )?office))$",
+    re.IGNORECASE,
+)
 PEDIATRIC_PREFIX = "Konsultacja pediatryczna - "
 PEDIATRIC_SERVICES = (
     ("sick visit", "wizyta dla chorego dziecka", "gabinet dzieci chorych"),
@@ -139,6 +149,36 @@ class PatientServiceMismatch(RequestError):
         self.patient = patient
 
 
+class PatientChoiceNeeded(RequestError):
+    def __init__(self, service: str, city: str, filters: str):
+        self.parts = (service, city, filters)
+
+
+class VisitModeChoiceNeeded(RequestError):
+    def __init__(self, criteria: Criteria):
+        self.criteria = criteria
+
+
+class ServiceChoiceNeeded(RequestError):
+    def __init__(self, criteria: Criteria):
+        self.criteria = criteria
+
+
+def requests_phone(text: str) -> bool:
+    return bool(PHONE_WORDS.search(normalize(text)))
+
+
+def requests_remote(text: str) -> bool:
+    return requests_phone(text) or bool(REMOTE_WORDS.search(normalize(text)))
+
+
+def phone_service(service: str) -> str:
+    key = normalize(service)
+    if key == "internista":
+        return INTERNIST_PHONE_SERVICE
+    return service if requests_remote(service) else f"{service} - telefoniczna"
+
+
 def check_patient_service(patient: str, service: str, children: set[str]) -> None:
     key = normalize(service)
     if patient not in children and (
@@ -156,7 +196,7 @@ def matching_catalog_variants(service: str, variants, *, telephone: bool) -> lis
     partial = {}
     for variant in variants:
         remote, service_id = variant.get("isTelemedicine"), variant.get("id")
-        if type(remote) is not bool or (telephone and not remote) or type(service_id) is not int or service_id <= 0:
+        if remote is not telephone or type(service_id) is not int or service_id <= 0:
             continue
         words = name_words(variant["name"])
         if requested and words == requested:
@@ -190,7 +230,7 @@ def nearby_catalog_variants(service: str, variants, *, telephone: bool) -> list[
     matches = {}
     for variant in variants:
         remote, service_id = variant.get("isTelemedicine"), variant.get("id")
-        if type(remote) is not bool or (telephone and not remote) or type(service_id) is not int or service_id <= 0:
+        if remote is not telephone or type(service_id) is not int or service_id <= 0:
             continue
         name = normalize(variant["name"])
         if name in aliases or _one_edit(requested, name):
@@ -200,6 +240,8 @@ def nearby_catalog_variants(service: str, variants, *, telephone: bool) -> list[
 
 def parse_search(text: str, aliases: dict[str, str], children: set[str], cities: dict, *, today: dt.date | None = None) -> Criteria | None:
     preference_text = ""
+    phone_after_patient = False
+    choose_mode = False
     if re.match(r"^/find(?:\s|$)", text, re.IGNORECASE):
         _, *tail = text.split(maxsplit=1)
         arguments = tail[0] if tail else ""
@@ -213,15 +255,23 @@ def parse_search(text: str, aliases: dict[str, str], children: set[str], cities:
         prefix = SEARCH_PREFIX.match(text)
         if prefix is None:
             return None
-        phrase = text[prefix.end():]
+        phrase = text[prefix.end():].rstrip(" ?.!")
         # Only the part after the service can contain search filters.
         patient_separator = re.search(r"\s+for\s+", phrase, re.IGNORECASE)
         if patient_separator is None:
+            standalone = re.sub(r"^(?:a|an)\s+", "", phrase, flags=re.IGNORECASE)
+            if normalize(standalone) in GENERAL_SERVICES.keys() | GENERAL_REQUESTS | PEDIATRIC_REQUESTS:
+                raise PatientChoiceNeeded(standalone, "Wrocław", "")
             return None
         service = phrase[:patient_separator.start()]
         patient_phrase = phrase[patient_separator.end():]
         if today is not None:
             patient_phrase, preference_text = split_preferences(patient_phrase)
+        patient_phrase, option_requested = MODE_CHOICES.subn("", patient_phrase)
+        choose_mode = bool(option_requested)
+        patient_phrase, removed_phone = PHONE_SUFFIX.subn("", patient_phrase)
+        phone_after_patient = bool(removed_phone)
+        patient_phrase = OFFICE_SUFFIX.sub("", patient_phrase)
         patient_location = re.fullmatch(r"(.+?)(?:\s+in\s+(.+))?", patient_phrase, re.IGNORECASE)
         if patient_location is None:
             return None
@@ -241,25 +291,45 @@ def parse_search(text: str, aliases: dict[str, str], children: set[str], cities:
 
     patient = aliases.get(normalize(patient_name))
     if patient is None:
-        raise RequestError("Who should I look for? Say “me” or give the patient’s name.")
+        if choose_mode:
+            service += " by phone or in person"
+        elif phone_after_patient:
+            service += " by phone"
+        raise PatientChoiceNeeded(service, city_name, preference_text)
     city = cities.get(normalize(city_name))
     if city is None:
         raise RequestError("Use the city name shown in the portal.")
     city_id, city_name = city
     preferences = parse_preferences(preference_text, today) if today is not None else Preferences()
+    service, service_mode_choice = MODE_CHOICES.subn("", service)
+    choose_mode = choose_mode or bool(service_mode_choice)
     key = normalize(service)
     selected = pediatric_choice(service, allow_number=False)
     service = GENERAL_SERVICES.get(key, service)
+    if selected is None and key not in GENERAL_SERVICES and key not in GENERAL_REQUESTS | PEDIATRIC_REQUESTS:
+        # Match explicit English phone wording around a known specialty.
+        plain = OFFICE_SUFFIX.sub("", service)
+        plain, removed_suffix = PHONE_SUFFIX.subn("", plain)
+        plain, removed_prefix = PHONE_PREFIX.subn("", plain)
+        if plain != service:
+            service = GENERAL_SERVICES.get(normalize(plain), plain)
+            if removed_suffix or removed_prefix:
+                service = phone_service(service)
+    if phone_after_patient and selected is None and key not in GENERAL_REQUESTS | PEDIATRIC_REQUESTS:
+        service = phone_service(service)
     check_patient_service(patient, selected or service, children)
     if key in PEDIATRIC_REQUESTS or (patient in children and key in GENERAL_REQUESTS):
         return Criteria(patient, "", city_id, city_name, preferences=preferences)
     if key in GENERAL_REQUESTS:
-        raise RequestError("Which service or specialty?")
+        raise ServiceChoiceNeeded(Criteria(patient, "", city_id, city_name, phone_after_patient, preferences))
     if selected:
-        return Criteria(patient, selected, city_id, city_name, "telefonicz" in normalize(selected), preferences)
+        return Criteria(patient, selected, city_id, city_name, requests_remote(selected), preferences)
     if len(service) > 130 or not service.strip():
         raise RequestError("Use a service name from the portal.")
-    return Criteria(patient, service, city_id, city_name, "telefonicz" in normalize(service), preferences)
+    criteria = Criteria(patient, service, city_id, city_name, requests_remote(service), preferences)
+    if choose_mode and not criteria.telephone:
+        raise VisitModeChoiceNeeded(criteria)
+    return criteria
 
 
 def pediatric_choice(text: str, *, allow_number: bool = True) -> str | None:
@@ -281,6 +351,6 @@ def pediatric_choice(text: str, *, allow_number: bool = True) -> str | None:
 
 
 def pediatric_menu(patient_name: str) -> str:
-    title = f"Which type of pediatric visit should I search for {patient_name}? Reply with a number."
+    title = f"Which type of pediatric visit should I search for {patient_name}? Tap a choice or reply with its number."
     options = [f"{index}. {choice[0]}" for index, choice in enumerate(PEDIATRIC_SERVICES, 1)]
     return "\n".join([title, *options])

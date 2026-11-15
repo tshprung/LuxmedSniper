@@ -12,7 +12,6 @@ import requests
 from telegram_requests import (
     GENERAL_REQUESTS,
     GENERAL_SERVICES,
-    INTERNIST_PHONE_SERVICE,
     PEDIATRIC_ALIASES,
     PEDIATRIC_PREFIX,
     PEDIATRIC_REQUESTS,
@@ -21,6 +20,8 @@ from telegram_requests import (
     RequestError,
     normalize,
     parse_search,
+    phone_service,
+    requests_phone,
 )
 from telegram_preferences import Preferences, parse_preferences, split_preferences
 
@@ -30,8 +31,8 @@ SCHEDULING_WORDS = frozenset("""
     a about afternoon after am an any appointments appointment are around at available availability
     before between by call can check consult consultation could d day days do does earliest evening
     find first for get got have help i if in in-person is just like look looking me morning my myself
-    need next of on open or person phone please pm prefer preferably rather request s search see
-    show slot slots some speak soon soonest set the there this time times to today tomorrow up
+    need next of office on open or over person phone please pm prefer preferably rather request s search see
+    show slot slots some speak soon soonest set telephone the there this time times to today tomorrow up
     visit want was week weekday weekend what when whenever whether with would you able
     monday tuesday wednesday thursday friday saturday sunday
 """.split())
@@ -180,10 +181,8 @@ class FreeText:
         if local is not None and (prepared is None or not service):
             return local
         key = normalize(service)
-        if mode == "phone" and "telefonicz" not in key and key not in PEDIATRIC_REQUESTS | GENERAL_REQUESTS:
-            service = INTERNIST_PHONE_SERVICE if key == "internista" else f"{service} - telefoniczna"
-        elif mode == "in_person" and "telefonicz" in key:
-            raise RequestError("Did you want a phone appointment or an in-person visit? Please specify in your search.")
+        if mode == "phone" and requests_phone(redacted) and key not in PEDIATRIC_REQUESTS | GENERAL_REQUESTS:
+            service = phone_service(service)
         if preferences == Preferences() and when:
             preferences = parse_preferences(when, today)
             if preferences.clinic or preferences.doctor:
