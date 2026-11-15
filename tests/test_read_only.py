@@ -154,6 +154,36 @@ class SearchTests(unittest.TestCase):
                 self.assertEqual(portal.booked_visit_ids(), {11, 12})
         self.assertEqual(request.call_args.args, ("GET", LuxMedPortal.UPCOMING_VISITS_URL))
 
+    def test_scheduled_timeline_returns_future_booked_visits_in_warsaw_time(self):
+        in_person = {
+            "eventType": 1, "eventId": 1, "status": 2, "date": "2030-04-01T12:00:00",
+            "title": "Fixture in-person visit", "doctor": {"name": "Fixture doctor"},
+            "clinic": {"name": "Fixture clinic"}, "patientNotes": "fixture private data",
+        }
+        phone = {
+            "eventType": 7, "eventId": 2, "status": 1, "date": "2030-04-01T07:30:00Z",
+            "title": "Fixture phone visit", "doctor": None, "clinic": {"name": "Internal routing location"},
+        }
+        events = [
+            in_person, phone, phone,
+            {**in_person, "eventId": 3, "status": 6},
+            {**in_person, "eventId": 4, "date": "2030-03-30T12:00:00"},
+            {**in_person, "eventId": 5, "eventType": 6},
+            {**in_person, "eventId": 6, "eventType": 16},
+        ]
+        with patch.object(requests.Session, "request", side_effect=[
+            response({"token": "fixture-token"}), response({"events": events}),
+        ]) as request:
+            portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
+            with portal.session:
+                earlier, later = portal.scheduled_visits(NOW)
+        self.assertEqual(request.call_args.args, ("GET", LuxMedPortal.SCHEDULED_VISITS_URL))
+        self.assertEqual(earlier.starts_at.isoformat(), "2030-04-01T09:30:00+02:00")
+        self.assertEqual((earlier.service, earlier.mode, earlier.clinic), ("Fixture phone visit", "Phone consultation", ""))
+        self.assertEqual(later.starts_at.isoformat(), "2030-04-01T12:00:00+02:00")
+        self.assertEqual((later.clinic, later.clinician), ("Fixture clinic", "Fixture doctor"))
+        self.assertNotIn("fixture private data", repr(later))
+
     def test_booking_holds_and_confirms_the_exact_covered_slot(self):
         locator = DoctorLocator(id="5*30*-1*-1")
         term = dict(slot("2030-04-01T10:00:00+02:00"), cityId=5, city="Fixture city",

@@ -236,7 +236,8 @@ class SearchState:
         ).rowcount == 1
 
     def account_paused(self, patient: str) -> bool:
-        return bool(self.db.execute("SELECT suspended FROM accounts WHERE patient = ?", (patient,)).fetchone()[0])
+        row = self.db.execute("SELECT suspended FROM accounts WHERE patient = ?", (patient,)).fetchone()
+        return bool(row and row["suspended"])
 
     def booking_paused(self, patient: str) -> bool:
         row = self.db.execute("SELECT booking_paused FROM accounts WHERE patient = ?", (patient,)).fetchone()
@@ -321,7 +322,11 @@ class SearchState:
         return cursor.rowcount == 1
 
     def suspend(self, patient: str) -> None:
-        self.db.execute("UPDATE accounts SET suspended = 1 WHERE patient = ?", (patient,))
+        self.db.execute(
+            "INSERT INTO accounts (patient, suspended) VALUES (?, 1) "
+            "ON CONFLICT(patient) DO UPDATE SET suspended = 1",
+            (patient,),
+        )
 
     def resume(self, patient: str) -> bool:
         row = self.db.execute(
