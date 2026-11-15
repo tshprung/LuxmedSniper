@@ -23,6 +23,7 @@ from telegram_state import SearchState, next_search_time
 PORTAL_REUSE_SECONDS = 3600
 RESULTS_PER_PAGE = 3
 SHORT_NOTICE_SECONDS = 6 * 3600
+CALENDAR_RETRY_SECONDS = 15 * 60
 PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
 SICK_CHILD_VISIT = normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[0][2])
 SUPPORTED_BOOKING_SERVICES = {"internista", normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[3][2])}
@@ -698,12 +699,16 @@ class SearchBot:
         event = self.state.due_calendar_event(self.calendar_destination, now)
         if event is None:
             return
+        profile = self.profiles[event["patient"]].name
+        appointment = f"{profile} · {local_time(event['starts_at'])} (Warsaw time)"
+        failure = "I couldn’t recheck this booking with LUX MED."
         try:
             if self.state.account_paused(event["patient"]):
                 raise CalendarUnavailable
             portal = self.portal_for(event["patient"])
             if event["reservation_id"] not in portal.booked_visit_ids(telephone=bool(event["telephone"])):
                 raise CalendarUnavailable
+            failure = "I couldn’t confirm the Google Calendar event yet."
             details = {}
             if event["patient"] in self.calendar_detail_patients:
                 result = self.state.results(event["search_id"])
@@ -720,21 +725,25 @@ class SearchBot:
                 dt.datetime.fromtimestamp(event["ends_at"], WARSAW),
                 **details,
             )
-        except PortalError as error:
+        except (CalendarUnavailable, PortalError) as error:
+            retry = next_search_time(now + CALENDAR_RETRY_SECONDS)
             with self.state.db:
-                if error.suspend:
+                if isinstance(error, PortalError) and error.suspend:
                     self.close_portal(event["patient"])
                     if error.stage == "login" or str(error) == "rate-limited":
                         self.state.suspend(event["patient"])
-                self.state.finish_calendar_attempt(event["booking_id"], now, False)
-            return
-        except CalendarUnavailable:
-            with self.state.db:
-                self.state.finish_calendar_attempt(event["booking_id"], now, False)
+                self.state.finish_calendar_attempt(event["booking_id"], retry, False)
+                if retry >= event["ends_at"]:
+                    followup = "Check Google Calendar for this appointment."
+                elif event["attempts"] == 0:
+                    followup = "I’ll retry automatically."
+                else:
+                    return
+                self.state.queue_message(f"{appointment}\n{failure} {followup}", event["search_id"])
             return
         with self.state.db:
             self.state.finish_calendar_attempt(event["booking_id"], now, True)
-            self.state.queue_message("Added the appointment to Google Calendar.", event["search_id"])
+            self.state.queue_message(f"{appointment}\nAdded the appointment to Google Calendar.", event["search_id"])
 
     @staticmethod
     def refresh_booking_slot(portal, locator: DoctorLocator, slot: dict, *, nationwide_from: str | None = None):
