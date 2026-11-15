@@ -92,12 +92,12 @@ once those dates have passed.
 
 In the owner's private chat, “me” and “myself” select `patient1`.
 For example, “Find a call with an internist for me after 16:00” searches
-for a phone consultation. Exact portal names and partial names are checked
-against the requested patient's current LUX MED catalog. If several services
-match, the bot shows labels you can use to refine the request. Common English
-aliases include orthopedist, ENT, allergist, and fasting blood draw.
-A close spelling can prompt a service choice. Reply `Service 1` or another
-shown number to use that service with the original search filters.
+for a phone consultation. A service name on its own defaults to an in-person
+visit. Exact portal names and partial names are checked against the requested
+patient's current LUX MED catalog. If the visit type or service needs
+clarification, tap a choice or reply `Service 1` with the shown number.
+The original search filters apply. Common English aliases include orthopedist,
+ENT, allergist, and fasting blood draw.
 
 Searches use a rolling 14-day window. A new search gets its first check
 as soon as the worker can run it during 06:00–22:00 Europe/Warsaw, even
@@ -110,12 +110,13 @@ before using `/resume <patient>`. Availability is returned in the private
 chat. The first completed check reports whether it found a match. Later
 checks with no matches update `/active` quietly.
 
-Results are numbered in groups of three. Reply `More` for more options from
-the same check, or `Details 2` for the details of option 2 and the Patient
+Results are numbered in groups of three. Tap an option or reply with its number
+to view the slot and its booking actions. Tap `More` for the next page or say
+“give me options” to reopen the current list. For supported visits, use the
+`Book` button or a command such as `Book 2`. `Details 2` shows the Patient
 Portal link. The bot flags selections within six hours of the appointment.
-Confirm availability and book in the portal. `Continue`
-or `Find something else` starts a follow-up with the same filters, skipping
-slots already shown and respecting the search's next hourly check.
+`Continue` or `Find something else` starts a follow-up with the same filters,
+skipping slots already shown and respecting the search's next hourly check.
 Reply to a result message to select that list. Standalone commands use the
 latest list.
 

@@ -19,9 +19,11 @@ from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_sett
 from telegram_free_text import FreeText
 from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences
 from telegram_requests import (
-    ALLERGY_SERVICE, INTERNIST_PHONE_SERVICE, PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria,
-    PatientServiceMismatch, RequestError, appointments_request, check_patient_service, city_catalog,
+    ALLERGY_SERVICE, GENERAL_SERVICES, INTERNIST_PHONE_SERVICE, PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria,
+    PatientChoiceNeeded, PatientServiceMismatch, RequestError, ServiceChoiceNeeded, VisitModeChoiceNeeded,
+    appointments_request, check_patient_service, city_catalog,
     matching_catalog_variants, nearby_catalog_variants, normalize, parse_search, pediatric_choice, pediatric_menu,
+    phone_service, requests_phone, requests_remote,
 )
 from telegram_state import SearchState, next_search_time
 
@@ -41,6 +43,12 @@ SUPPORTED_BOOKING_SERVICES = {"internista", normalize(PEDIATRIC_PREFIX + PEDIATR
 QUESTIONNAIRE_NOTICE = "LUX MED requires a medical questionnaire for this visit. Complete it in the Patient Portal."
 PREPARATION_NOTICE = "LUX MED lists preparation instructions for this visit. Open “Zobacz szczegóły” in the Patient Portal."
 BOOKING_ACCESS_NOTICE = "Direct booking is paused for this patient. Availability searches can continue. Use /resume with the patient name to clear the pause."
+OPTION_NUMBER = re.compile(r"[1-9][0-9]{0,8}")
+CALLBACK_COMMAND = re.compile(
+    r"(?:select|book|approve|stop booking) [1-9][0-9]{0,8}|more|continue|options|"
+    r"stop questionnaire|active|pick patient|pick visits|"
+    r"/appointments patient[123]|services patient[123]"
+)
 BOOKING_CHECK_LABELS = {
     "login": "sign-in", "service-catalog": "service catalog",
     "availability": "slot availability", "phone-availability": "phone slot availability",
@@ -107,19 +115,35 @@ class Telegram:
             raise TelegramError() from None
 
     def poll(self, offset: int) -> list[dict]:
-        updates = self.call("getUpdates", {"offset": offset, "timeout": 8, "allowed_updates": ["message"]})
+        updates = self.call("getUpdates", {
+            "offset": offset, "timeout": 8, "allowed_updates": ["message", "callback_query"],
+        })
         if not isinstance(updates, list):
             raise TelegramError()
         return updates
 
-    def send(self, message: str, *, force_reply: bool = False) -> int:
+    def send(self, message: str, *, force_reply: bool = False,
+             buttons: list[list[tuple[str, str]]] | None = None) -> int:
         payload = {"chat_id": self.owner, "text": message, "protect_content": True}
-        if force_reply:
+        if buttons:
+            payload["reply_markup"] = {
+                "inline_keyboard": [
+                    [{"text": label, "callback_data": action} for label, action in row] for row in buttons
+                ],
+            }
+        elif force_reply:
             payload["reply_markup"] = {"force_reply": True}
         result = self.call("sendMessage", payload)
         if not isinstance(result, dict) or type(result.get("message_id")) is not int:
             raise TelegramError()
         return result["message_id"]
+
+    def acknowledge(self, callback_id: str) -> None:
+        try:
+            self.call("answerCallbackQuery", {"callback_query_id": callback_id})
+        except TelegramError as error:
+            if error.stop:
+                raise
 
 
 @dataclass(frozen=True)
@@ -194,21 +218,44 @@ class SearchBot:
         if not isinstance(update, dict) or type(update.get("update_id")) is not int:
             return
         update_id = update["update_id"]
+        callback = update.get("callback_query") or {}
+        callback_id = None
         with self.state.db:
             self.state.db.execute("BEGIN IMMEDIATE")
             if update_id < int(self.state.get_setting("offset", "0")):
                 return
-            message = update.get("message") or {}
+            message = callback.get("message") if callback else update.get("message")
+            message = message or {}
             chat = message.get("chat") or {}
-            sender = message.get("from") or {}
+            sender = (callback if callback else message).get("from") or {}
             if (
                 chat.get("type") == "private"
                 and chat.get("id") == self.telegram.owner
                 and sender.get("id") == self.telegram.owner
-                and isinstance(message.get("text"), str)
             ):
-                self.handle(message)
+                if callback and isinstance(callback.get("id"), str):
+                    callback_id = callback["id"]
+                    self.handle_callback(callback.get("data"), message)
+                elif not callback and isinstance(message.get("text"), str):
+                    self.handle(message)
             self.state.set_setting("offset", str(update_id + 1))
+        if callback_id is not None:
+            self.telegram.acknowledge(callback_id)
+
+    def handle_callback(self, action, message: dict) -> None:
+        if not isinstance(action, str):
+            return
+        if match := re.fullmatch(r"answer ([1-9][0-9]?)", action):
+            self.answer_questionnaire(match[1], message.get("message_id"))
+        elif match := re.fullmatch(r"patient (patient[123]) ([a-f0-9]{12})", action):
+            self.choose_patient_button(match[1], match[2])
+        elif match := re.fullmatch(r"(service|pediatric) ([1-9][0-9]?) ([a-f0-9]{12})", action):
+            if match[1] == "service":
+                self.choose_catalog_service(match[2], menu_id=match[3])
+            else:
+                self.choose_pediatric_button(match[2], match[3])
+        elif CALLBACK_COMMAND.fullmatch(action):
+            self.handle({"text": action, "reply_to_message": message})
 
     def handle(self, message: dict) -> None:
         text = message["text"].strip()
@@ -223,9 +270,11 @@ class SearchBot:
                 self.state.queue_message("Questionnaire stopped.")
             else:
                 self.state.queue_message("There’s no active questionnaire.")
+        elif key in {"options", "/options", "give me options", "show me options", "show options"}:
+            self.show_options(reply)
         elif (
             (flow is not None and flow.message_id is not None and reply.get("message_id") == flow.message_id)
-            or (flow is not None and flow.form is not None and re.fullmatch(r"[0-9]{1,2}", text))
+            or (flow is not None and flow.form is not None and not reply and re.fullmatch(r"[0-9]{1,2}", text))
             or str(reply.get("text") or "").startswith(QUESTIONNAIRE_PROMPT + "\n")
         ):
             self.answer_questionnaire(text, reply.get("message_id"))
@@ -235,11 +284,22 @@ class SearchBot:
             self.show_active()
         elif command in {"service", "/service"}:
             self.choose_catalog_service(argument)
+        elif OPTION_NUMBER.fullmatch(key):
+            if not reply and self.state.get_setting("pending_service"):
+                self.choose_catalog_service(key)
+            elif not reply and self.state.get_setting("pending"):
+                self.handle_search(key)
+            else:
+                self.handle_results("select", key, reply)
+        elif key in {"pick patient", "pick visits"}:
+            self.show_patient_buttons(appointments=key == "pick visits")
+        elif command == "services" and argument in self.profiles:
+            self.handle_search(f"/find {argument} | doctor")
         elif len(text) <= 600 and (patient_name := appointments_request(text)) is not None:
             self.show_appointments(patient_name)
         elif command in {"/change", "change"}:
             self.change(text, reply)
-        elif command in {"book", "/book", "details", "/details"} or key in {
+        elif command in {"book", "/book", "details", "/details", "select", "option"} or key in {
             "more", "/more", "continue", "/continue", "find something else",
         }:
             self.handle_results(command, argument, reply)
@@ -274,8 +334,7 @@ class SearchBot:
     def show_appointments(self, patient_name: str) -> None:
         patient = self.aliases.get(patient_name)
         if patient is None:
-            names = ", ".join(profile.name for profile in self.profiles.values())
-            self.state.queue_message(f"Whose appointments should I show? Say “me” or use a patient’s name ({names}).")
+            self.show_patient_buttons(appointments=True)
             return
         name = self.profiles[patient].name
         paused = f"LUX MED access for {name} is paused. Once access is restored, send /resume {name} and ask again."
@@ -313,6 +372,23 @@ class SearchBot:
         today = dt.datetime.fromtimestamp(self.clock(), WARSAW).date()
         try:
             criteria = parse_search(text, self.aliases, self.children, self.cities, today=today)
+        except PatientChoiceNeeded as error:
+            self.show_search_patient_choices({"parts": error.parts})
+            return
+        except VisitModeChoiceNeeded as error:
+            criteria = error.criteria
+            self.show_catalog_service_menu({
+                "criteria": asdict(criteria),
+                "choices": [
+                    {"service": criteria.service, "telephone": False},
+                    {"service": phone_service(criteria.service), "telephone": True},
+                ],
+                "prompt": "Would you like an in-person visit or a phone call?",
+            })
+            return
+        except ServiceChoiceNeeded as error:
+            self.show_specialty_choices(error.criteria)
+            return
         except PatientServiceMismatch as error:
             self.reject_mismatch(error)
             return
@@ -326,10 +402,11 @@ class SearchBot:
         if criteria is None and pending and error_message is None:
             fields = json.loads(pending)
             fields.pop("polish", None)  # Pending choices saved by the bilingual worker.
+            fields.pop("menu", None)
             fields["preferences"] = Preferences(**fields.get("preferences", {}))
             candidate = Criteria(**fields)
             if service := pediatric_choice(text):
-                criteria = replace(candidate, service=service, telephone="telefonicz" in normalize(service))
+                criteria = replace(candidate, service=service, telephone=requests_remote(service))
                 menu_selection = True
         if self.free_text is not None and not menu_selection and not text.startswith("/"):
             try:
@@ -341,26 +418,81 @@ class SearchBot:
             except PatientServiceMismatch as error:
                 self.reject_mismatch(error)
                 return
+            except ServiceChoiceNeeded as error:
+                self.show_specialty_choices(error.criteria)
+                return
             except PreferenceError as error:
                 self.state.queue_message(str(error))
                 return
             except RequestError as error:
                 error_message = str(error)
         if criteria and not criteria.service:
-            self.state.set_setting("pending", json.dumps(asdict(criteria)))
-            self.state.queue_message(pediatric_menu(self.profiles[criteria.patient].name))
+            fields = {**asdict(criteria), "menu": uuid.uuid4().hex[:12]}
+            self.state.set_setting("pending", json.dumps(fields))
+            self.show_pediatric_menu(fields)
         elif criteria:
             self.state.set_setting("pending", "")
             self.start(criteria)
         elif error_message:
             self.state.queue_message(error_message)
         elif pending:
-            self.state.queue_message(pediatric_menu(self.profiles[json.loads(pending)["patient"]].name))
+            self.show_pediatric_menu(json.loads(pending))
         else:
             self.state.queue_message(
-                "What kind of appointment should I look for, and who is it for? "
-                "You can say “Find an internist phone call for me.”"
+                "What would you like to do?",
+                buttons=[[("Find a visit", "pick patient")],
+                         [("Upcoming appointments", "pick visits"), ("Active searches", "active")]],
             )
+
+    def show_patient_buttons(self, *, appointments: bool = False) -> None:
+        prefix = "/appointments" if appointments else "services"
+        prompt = "Whose appointments should I show?" if appointments else "Who is the appointment for?"
+        self.state.queue_message(prompt, buttons=[[
+            (profile.name, f"{prefix} {patient}") for patient, profile in self.profiles.items()
+        ]])
+
+    def show_specialty_choices(self, criteria: Criteria) -> None:
+        services = [GENERAL_SERVICES[key] for key in ("internist", "allergist", "ent", "orthopedist")]
+        self.show_catalog_service_menu({
+            "criteria": asdict(criteria),
+            "choices": [{"service": phone_service(service) if criteria.telephone else service,
+                         "telephone": criteria.telephone} for service in services],
+            "prompt": "Which specialty should I search for? You can also type a different one.",
+        })
+
+    def show_search_patient_choices(self, choice: dict) -> None:
+        if "menu" not in choice:
+            choice["menu"] = uuid.uuid4().hex[:12]
+            self.state.set_setting("pending_patient", json.dumps(choice))
+        self.state.queue_message("Who is the appointment for?", buttons=[[
+            (profile.name, f"patient {patient} {choice['menu']}") for patient, profile in self.profiles.items()
+        ]])
+
+    def choose_patient_button(self, patient: str, menu_id: str) -> None:
+        choice = json.loads(self.state.get_setting("pending_patient") or "{}")
+        if patient not in self.profiles or choice.get("menu") != menu_id:
+            self.state.queue_message("That patient choice has expired. Ask for a fresh search.")
+            return
+        self.state.set_setting("pending_patient", "")
+        self.handle_search("/find " + " | ".join([patient, *filter(None, choice["parts"])]))
+
+    def show_pediatric_menu(self, fields: dict) -> None:
+        menu = fields.get("menu")
+        if not menu:
+            menu = fields["menu"] = uuid.uuid4().hex[:12]
+            self.state.set_setting("pending", json.dumps(fields))
+        self.state.queue_message(
+            pediatric_menu(self.profiles[fields["patient"]].name),
+            buttons=[[(choice[0], f"pediatric {number} {menu}")]
+                     for number, choice in enumerate(PEDIATRIC_SERVICES, 1)],
+        )
+
+    def choose_pediatric_button(self, number: str, menu_id: str) -> None:
+        fields = json.loads(self.state.get_setting("pending") or "{}")
+        if fields.get("menu") != menu_id:
+            self.state.queue_message("That pediatric menu has expired. Ask for a fresh search.")
+            return
+        self.handle_search(number)
 
     def reject_mismatch(self, error: PatientServiceMismatch, search_id: int | None = None) -> None:
         if search_id is None:
@@ -388,6 +520,7 @@ class SearchBot:
 
     def start(self, criteria: Criteria, *, excluded_slots=(), not_before: int = 0) -> None:
         self.state.set_setting("pending_service", "")
+        self.state.set_setting("pending_patient", "")
         now = int(self.clock())
         search_id, number, due, paused = self.state.add(
             criteria, now, excluded_slots=excluded_slots, not_before=not_before,
@@ -426,26 +559,48 @@ class SearchBot:
     def is_nationwide_phone_search(criteria: Criteria) -> bool:
         return criteria.telephone and normalize(criteria.service) == normalize(INTERNIST_PHONE_SERVICE)
 
-    def show_results(self, search_id: int) -> None:
+    def show_options(self, reply: dict) -> None:
+        if self.allergy_booking is not None and self.allergy_booking.form is not None:
+            self.queue_question(self.allergy_booking)
+            return
+        original = self.replied_search(reply)
+        if original and self.state.results(original["id"]) is not None:
+            self.show_results(original["id"], current=True)
+        elif pending_patient := self.state.get_setting("pending_patient"):
+            self.show_search_patient_choices(json.loads(pending_patient))
+        elif pending_service := self.state.get_setting("pending_service"):
+            self.show_catalog_service_menu(json.loads(pending_service))
+        elif pending := self.state.get_setting("pending"):
+            self.show_pediatric_menu(json.loads(pending))
+        elif row := self.state.results():
+            self.show_results(row["id"], current=True)
+        else:
+            self.show_patient_buttons()
+
+    def show_results(self, search_id: int, *, current: bool = False) -> None:
         row = self.state.results(search_id)
         slots = json.loads(row["slots"])
         now = int(self.clock())
-        page = []
-        for index in range(row["shown"], len(slots)):
-            if slots[index]["start"] > now:
-                page.append((index + 1, slots[index]))
-                if len(page) == RESULTS_PER_PAGE:
-                    break
+        page = [(index + 1, slot) for index, slot in enumerate(slots[:row["shown"]])
+                if slot["start"] > now][-RESULTS_PER_PAGE:] if current else []
         if not page:
-            self.state.queue_message("No more upcoming options in this list. Use Continue to look for other slots.", search_id)
+            for index in range(row["shown"], len(slots)):
+                if slots[index]["start"] > now:
+                    page.append((index + 1, slots[index]))
+                    if len(page) == RESULTS_PER_PAGE:
+                        break
+        if not page:
+            self.state.queue_message("No more upcoming options in this list. Use Continue to look for other slots.",
+                                     search_id, buttons=[[("Continue", "continue")]])
             return
-        self.state.mark_shown(search_id, page[-1][0])
+        self.state.mark_shown(search_id, max(row["shown"], page[-1][0]))
         self.state.set_setting("latest_result", str(search_id))
         heading = self.search_heading(row["display_number"], self.state.criteria(row))
         notices = self.portal_notices(row["service"], [slot for _, slot in page])
         lines = [heading, *notices, "Available slots (Warsaw time)"]
         lines.extend(f"{number}. {self.slot_details(slot)}" for number, slot in page)
-        if any(slot["start"] > now for slot in slots[page[-1][0]:]):
+        more = any(slot["start"] > now for slot in slots[max(row["shown"], page[-1][0]):])
+        if more:
             lines.append("Reply More to see the next options.")
         can_book = (
             self.can_book_for(row["patient"]) and not notices
@@ -453,12 +608,14 @@ class SearchBot:
             and not self.state.booking_paused(row["patient"])
         )
         action = "Book <option number> to request that slot" if can_book else "Details <option number> for the Patient Portal link"
-        lines.append(f"Reply {action}, or Continue to search for different slots.")
-        self.state.queue_message("\n".join(lines), search_id)
+        lines.append(f"Tap an option or reply with its number. Reply {action}, or Continue to search for different slots.")
+        buttons = [[(f"Option {number}", f"select {number}") for number, _ in page]]
+        buttons.append(([("More", "more")] if more else []) + [("Continue", "continue")])
+        self.state.queue_message("\n".join(lines), search_id, buttons=buttons)
 
     def handle_results(self, command: str, argument: str, reply: dict) -> None:
-        action = command.lstrip("/")
-        if action in {"book", "details"} and not re.fullmatch(r"[1-9][0-9]{0,8}", argument):
+        action = "select" if command == "option" else command.lstrip("/")
+        if action in {"book", "details", "select"} and not OPTION_NUMBER.fullmatch(argument):
             label = action.capitalize()
             self.state.queue_message(f"Use {label} followed by an option number, for example {label} 2.")
             return
@@ -472,7 +629,7 @@ class SearchBot:
         search_id = row["id"]
         slots = json.loads(row["slots"])
         now = int(self.clock())
-        if action in {"book", "details"}:
+        if action in {"book", "details", "select"}:
             number = int(argument)
             if number > row["shown"]:
                 self.state.queue_message("Choose an option number shown in this list, or use More.", search_id)
@@ -481,14 +638,25 @@ class SearchBot:
             if slot["start"] <= now:
                 self.state.queue_message("That appointment time has passed. Use More or Continue for other options.", search_id)
                 return
-            if action == "details":
+            if action in {"details", "select"}:
                 heading = self.search_heading(row["display_number"], self.state.criteria(row))
                 notices = self.portal_notices(row["service"], [slot])
+                can_book = (
+                    action == "select" and self.can_book_for(row["patient"])
+                    and self.supports_booking_service(row["service"], bool(row["telephone"]), row["patient"])
+                    and not self.state.booking_paused(row["patient"]) and not notices
+                )
                 if slot["start"] - now < SHORT_NOTICE_SECONDS:
                     notices.append("This appointment starts within six hours. Check the cancellation terms before confirming.")
-                lines = [heading, f"Option {number}. {self.slot_details(slot)}", *notices,
-                         "Confirm availability in the Patient Portal.", PATIENT_PORTAL_URL]
-                self.state.queue_message("\n".join(lines), search_id)
+                lines = [heading, f"Option {number}. {self.slot_details(slot)}", *notices]
+                if can_book:
+                    lines.append(f"Want this time? Tap Book option {number}.")
+                else:
+                    lines.extend(["Confirm availability in the Patient Portal.", PATIENT_PORTAL_URL])
+                buttons = [[("Back to options", "options"), ("Continue", "continue")]]
+                if can_book:
+                    buttons.insert(0, [(f"Book option {number}", f"book {number}")])
+                self.state.queue_message("\n".join(lines), search_id, buttons=buttons)
             else:
                 self.request_booking(row, number, slot, now)
         elif action == "more":
@@ -557,6 +725,8 @@ class SearchBot:
             f"{description}\n{reason}\nApproval code: {booking['id']}\n"
             f"Reply Approve {booking['id']} to book this option or Stop booking {booking['id']} to drop this request.",
             booking["search_id"],
+            buttons=[[("Approve booking", f"approve {booking['id']}"),
+                      ("Stop booking", f"stop booking {booking['id']}")]],
         )
 
     def confirm_search(self, search_id: int, number: int, criteria: Criteria, due: int, paused: bool, now: int, *, changed: bool = False) -> None:
@@ -676,6 +846,10 @@ class SearchBot:
             self.state.set_setting("pending_service", "")
             self.state.queue_message("Service selection cleared.")
             return
+        elif not reply and self.state.get_setting("pending_patient"):
+            self.state.set_setting("pending_patient", "")
+            self.state.queue_message("Patient selection cleared.")
+            return
         elif not reply:
             rows = self.state.active()
             if len(rows) == 1:
@@ -690,11 +864,19 @@ class SearchBot:
 
     def flush(self) -> None:
         while (message := self.state.next_message()) is not None:
-            sent = self.telegram.send(message["text"])
+            if message["buttons"]:
+                sent = self.telegram.send(message["text"], buttons=json.loads(message["buttons"]))
+            else:
+                sent = self.telegram.send(message["text"])
             self.state.sent(message, sent)
         flow = self.allergy_booking
         if flow is not None and flow.prompt is not None:
-            flow.message_id = self.telegram.send(flow.prompt, force_reply=True)
+            choices = [
+                [(f"{number}. {visible_text(choice['name'])[:55]}", f"answer {number}")]
+                for number, choice in enumerate(flow.form.choices, 1)
+            ]
+            choices.append([("Stop questionnaire", "stop questionnaire")])
+            flow.message_id = self.telegram.send(flow.prompt, buttons=choices)
             flow.prompt = None
 
     def portal_for(self, patient: str) -> LuxMedPortal:
@@ -733,7 +915,7 @@ class SearchBot:
         flow.message_id = None
         flow.prompt = (
             f"{QUESTIONNAIRE_PROMPT}\n{name} · {ALLERGY_SERVICE}\n\n{question}\n\n"
-            "Reply to this message with an option number. I’ll send your choices to LUX MED when the form is complete. "
+            "Tap an answer or reply directly with its number. I’ll send your choices to LUX MED when the form is complete. "
             "Send Stop questionnaire to end this request."
         )
 
@@ -1149,6 +1331,16 @@ class SearchBot:
                 if choices:
                     self.offer_catalog_service(row, criteria, choices)
                     return
+                alternatives = matching_catalog_variants(criteria.service, variants, telephone=not criteria.telephone)
+                if alternatives:
+                    self.offer_catalog_service(
+                        row, criteria, alternatives,
+                        prompt="I found another visit type for this service. Would you like one of these options?",
+                    )
+                    return
+            if len({item["name"] for item in matches}) > 1:
+                self.offer_catalog_service(row, criteria, matches, prompt="Several LUX MED services match. Which one did you mean?")
+                return
             if len(matches) != 1:
                 heading = self.search_heading(row["display_number"], criteria)
                 self.report_catalog_choices(search_id, heading, matches, ambiguous=str(error) == "ambiguous-service")
@@ -1217,25 +1409,45 @@ class SearchBot:
             self.state.save_results(search_id, options)
             self.show_results(search_id)
 
-    def offer_catalog_service(self, row, criteria: Criteria, matches: list[dict]) -> None:
+    def offer_catalog_service(self, row, criteria: Criteria, matches: list[dict], *, prompt: str = "") -> None:
         choices = [{"service": item["name"], "telephone": item["isTelemedicine"]} for item in matches[:5]]
         heading = self.search_heading(row["display_number"], criteria)
         with self.state.db:
             if self.state.finish(row["id"], "service-unresolved"):
-                self.state.set_setting("pending_service", json.dumps({"criteria": asdict(criteria), "choices": choices}))
-                if len(choices) == 1:
-                    question = f"Did you mean {choices[0]['service']}? Reply Service 1 to search for it."
-                else:
-                    options = "\n".join(f"{number}. {choice['service']}" for number, choice in enumerate(choices, 1))
-                    question = f"Which LUX MED service did you mean?\n{options}\nReply Service followed by its number."
-                self.state.queue_message(f"{heading}\n{question}", row["id"])
+                self.show_catalog_service_menu({
+                    "criteria": asdict(criteria), "choices": choices, "heading": heading,
+                    "search_id": row["id"], "prompt": prompt,
+                })
 
-    def choose_catalog_service(self, argument: str) -> None:
+    def show_catalog_service_menu(self, suggestion: dict) -> None:
+        if "menu" not in suggestion:
+            suggestion["menu"] = uuid.uuid4().hex[:12]
+            self.state.set_setting("pending_service", json.dumps(suggestion))
+        menu = suggestion["menu"]
+        choices = suggestion["choices"]
+        prompt = suggestion.get("prompt")
+        if not prompt and len(choices) == 1:
+            prompt = f"Did you mean {choices[0]['service']}? Reply Service 1 to search for it."
+        lines = [suggestion.get("heading", ""), prompt or "Which LUX MED service did you mean?"]
+        buttons = []
+        for number, choice in enumerate(choices, 1):
+            service = choice["service"]
+            kind = "In person"
+            if choice["telephone"]:
+                kind = "Phone" if requests_phone(service) else "Remote"
+            lines.append(f"{number}. {service} · {kind}")
+            buttons.append([(f"{number}. {kind} · {service}"[:64], f"service {number} {menu}")])
+        self.state.queue_message("\n".join(filter(None, lines)), suggestion.get("search_id"), buttons=buttons)
+
+    def choose_catalog_service(self, argument: str, *, menu_id: str | None = None) -> None:
         pending = self.state.get_setting("pending_service")
         if not pending:
             self.state.queue_message("I don’t have a service choice open. Tell me what appointment to look for.")
             return
         suggestion = json.loads(pending)
+        if menu_id is not None and suggestion.get("menu") != menu_id:
+            self.state.queue_message("That service choice has expired. Ask for a fresh search.")
+            return
         choices = suggestion["choices"]
         if not re.fullmatch(r"[1-9]", argument) or int(argument) > len(choices):
             self.state.queue_message("Reply Service followed by one of the numbers shown.")

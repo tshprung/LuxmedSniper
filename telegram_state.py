@@ -36,7 +36,7 @@ class SearchState:
                 telephone INTEGER NOT NULL, next_due INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active'
             );
             CREATE TABLE IF NOT EXISTS outbox (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, search_id INTEGER
+                id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, search_id INTEGER, buttons TEXT
             );
             CREATE TABLE IF NOT EXISTS message_searches (
                 message_id INTEGER PRIMARY KEY, search_id INTEGER NOT NULL
@@ -69,6 +69,9 @@ class SearchState:
             calendar_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(calendar_sync)")}
             if "attempts" not in calendar_columns:
                 self.db.execute("ALTER TABLE calendar_sync ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            outbox_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(outbox)")}
+            if "buttons" not in outbox_columns:
+                self.db.execute("ALTER TABLE outbox ADD COLUMN buttons TEXT")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(searches)")}
             for name, declaration in (
                 ("last_checked", "INTEGER"),
@@ -99,8 +102,10 @@ class SearchState:
     def set_setting(self, key: str, value: str) -> None:
         self.db.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, value))
 
-    def queue_message(self, text: str, search_id: int | None = None) -> None:
-        self.db.execute("INSERT INTO outbox (text, search_id) VALUES (?, ?)", (text, search_id))
+    def queue_message(self, text: str, search_id: int | None = None, *,
+                      buttons: list[list[tuple[str, str]]] | None = None) -> None:
+        self.db.execute("INSERT INTO outbox (text, search_id, buttons) VALUES (?, ?, ?)",
+                        (text, search_id, json.dumps(buttons) if buttons else None))
 
     def next_message(self) -> sqlite3.Row | None:
         return self.db.execute("SELECT * FROM outbox ORDER BY id LIMIT 1").fetchone()

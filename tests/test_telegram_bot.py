@@ -135,6 +135,13 @@ class BotTests(unittest.TestCase):
             message["reply_to_message"] = {"message_id": reply_to}
         self.bot.accept({"update_id": number, "message": message})
 
+    def tap(self, number, action, message_id=42, *, sender=100, chat_id=100, chat_type="private"):
+        self.bot.accept({"update_id": number, "callback_query": {
+            "id": f"fixture-{number}", "from": {"id": sender}, "data": action, "message": {
+                "message_id": message_id, "chat": {"id": chat_id, "type": chat_type},
+            },
+        }})
+
     def test_owner_only_private_chat(self):
         self.update(1, "Find an internist for Adult", sender=200, chat_id=200)
         self.update(2, "Find an internist for Adult", chat_id=-100, chat_type="group")
@@ -320,6 +327,42 @@ class BotTests(unittest.TestCase):
         message = self.state.next_message()["text"]
         self.assertIn("Last check 30.03 11:00: no matching slots", message)
         self.assertIn("Next check 30.03 12:00 Warsaw time", message)
+
+    def test_number_or_button_selects_a_slot_before_explicit_booking(self):
+        self.telegram.send.side_effect = iter(range(40, 100))
+        self.update(1, "Find allergist for me")
+        self.bot.flush()
+        client = MagicMock()
+        client.resolve_service.return_value = 12
+        client.search.return_value = [
+            Appointment(dt.datetime.fromtimestamp(self.now + hour * 3600, WARSAW), 2, "Fixture clinic",
+                        "Fixture doctor", 12, doctor_id=9)
+            for hour in (5, 6, 7, 8)
+        ]
+        with patch.object(self.bot, "portal_for", return_value=client):
+            self.bot.search_due()
+        self.assertIn(["Option 3", "select 3"], json.loads(self.state.next_message()["buttons"])[0])
+        self.bot.flush()
+        results_message = 41
+        self.update(2, "3")
+        selected = self.state.next_message()
+        self.assertIn("Option 3.", selected["text"])
+        self.assertIn(["Book option 3", "book 3"], json.loads(selected["buttons"])[0])
+        self.assertEqual(self.state.db.execute("SELECT count(*) FROM booking_requests").fetchone()[0], 0)
+        self.bot.flush()
+        self.update(3, "give me options")
+        self.assertIn(["Option 3", "select 3"], json.loads(self.state.next_message()["buttons"])[0])
+        self.bot.flush()
+        self.tap(4, "select 3", results_message)
+        self.bot.flush()
+        selected_message = 44
+        self.tap(5, "book 3", selected_message, sender=200, chat_id=200)
+        self.assertEqual(self.state.db.execute("SELECT count(*) FROM booking_requests").fetchone()[0], 0)
+        self.tap(6, "book 3", selected_message)
+        request, = self.state.db.execute("SELECT option_number, status FROM booking_requests")
+        self.assertEqual(tuple(request), (3, "queued"))
+        self.telegram.acknowledge.assert_any_call("fixture-6")
+        client.reserve_standard_visit.assert_not_called()
 
     def test_numbered_options_support_booking_steps_more_and_continue(self):
         self.update(1, "/find Child | routine visit")
@@ -709,11 +752,11 @@ class BotTests(unittest.TestCase):
         self.bot.flush()
         first = self.bot.allergy_booking.message_id
         self.assertIn("Fixture information", self.telegram.send.call_args.args[0])
-        self.assertTrue(self.telegram.send.call_args.kwargs["force_reply"])
+        self.assertIn(("1. Option A", "answer 1"), self.telegram.send.call_args.kwargs["buttons"][0])
         self.update(3, "Approve 1")
         self.bot.booking_due()
         client.reserve_standard_visit.assert_not_called()
-        self.update(4, "1", reply_to=first)
+        self.tap(4, "answer 1", first)
         self.bot.flush()
         second = self.bot.allergy_booking.message_id
         self.assertNotEqual(first, second)
@@ -1148,6 +1191,82 @@ class BotTests(unittest.TestCase):
                           conversational.preferences.end_minute), ("2030-03-31", 720, 1020))
         self.assertEqual(explicit.preferences.start_minute, 1080)
         self.assertEqual(command.service, "Internista")
+
+    def test_in_person_default_resists_an_unrequested_phone_interpretation(self):
+        self.bot.free_text = FreeText("fixture-key")
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"status": "completed", "output": [{
+            "type": "message", "content": [{"type": "output_text", "text": json.dumps({
+                "intent": "search", "mode": "phone", "when": "",
+            })}],
+        }]}
+        with patch.object(self.bot.free_text.session, "post", return_value=response):
+            self.update(1, "Find an allergist for me")
+            self.update(2, "Find an allergist for me by phone")
+            self.update(3, "Find an allergist for me in the office")
+        rows = [self.state.criteria(row) for row in self.state.active()]
+        self.assertEqual([(row.service, row.telephone) for row in rows], [
+            ("Konsultacja alergologiczna", False),
+            ("Konsultacja alergologiczna - telefoniczna", True),
+            ("Konsultacja alergologiczna", False),
+        ])
+
+    def test_unclear_mode_gets_buttons_and_preserves_original_filters(self):
+        self.update(1, "Find an allergist for me by phone or in person tomorrow after 16:00")
+        message = self.state.next_message()
+        self.assertIn("Would you like an in-person visit or a phone call?", message["text"])
+        buttons = json.loads(message["buttons"])
+        self.assertIn("In person", buttons[0][0][0])
+        self.assertIn("Phone", buttons[1][0][0])
+        self.assertEqual(self.state.active(), [])
+        self.tap(2, buttons[1][0][1])
+        row, = self.state.active()
+        criteria = self.state.criteria(row)
+        self.assertTrue(criteria.telephone)
+        self.assertEqual(criteria.service, "Konsultacja alergologiczna - telefoniczna")
+        self.assertEqual((criteria.preferences.first_date, criteria.preferences.start_minute),
+                         ("2030-03-31", 960))
+
+    def test_remote_catalog_variant_requires_selection_after_an_in_person_miss(self):
+        self.update(1, "Find allergist for me")
+        self.bot.flush()
+        client = MagicMock()
+        client.resolve_service = LuxMedPortal.resolve_service
+        client.get_services.return_value = [
+            {"name": "Konsultacja alergologiczna - telefoniczna", "id": 11, "isTelemedicine": True},
+        ]
+        with patch.object(self.bot, "portal_for", return_value=client):
+            self.bot.search_due()
+        client.search.assert_not_called()
+        message = self.state.next_message()
+        self.assertIn("another visit type", message["text"])
+        buttons = json.loads(message["buttons"])
+        self.assertIn("Phone", buttons[0][0][0])
+        self.tap(2, buttons[0][0][1])
+        row, = self.state.active()
+        self.assertTrue(row["telephone"])
+
+    def test_missing_patient_offers_profiles_for_the_original_service(self):
+        self.update(1, "Find an allergist")
+        message = self.state.next_message()
+        self.assertIn("Who is the appointment for?", message["text"])
+        buttons = json.loads(message["buttons"])
+        self.assertEqual([button[0] for button in buttons[0]], ["Adult", "Child", "Other"])
+        self.tap(2, buttons[0][0][1])
+        row, = self.state.active()
+        self.assertEqual((row["patient"], row["service"], row["telephone"]),
+                         ("patient1", "Konsultacja alergologiczna", 0))
+
+    def test_unspecified_adult_specialty_offers_choices_with_original_filters(self):
+        self.update(1, "Find a doctor for me tomorrow after 16:00")
+        message = self.state.next_message()
+        self.assertIn("Which specialty should I search for?", message["text"])
+        buttons = json.loads(message["buttons"])
+        self.tap(2, buttons[0][0][1])
+        row, = self.state.active()
+        criteria = self.state.criteria(row)
+        self.assertEqual((criteria.service, criteria.telephone), ("Internista", False))
+        self.assertEqual((criteria.preferences.first_date, criteria.preferences.start_minute), ("2030-03-31", 960))
 
     def test_live_catalog_matches_unlisted_names_and_preserves_remote_mode(self):
         self.update(1, "Find kontrola online for me tomorrow")
