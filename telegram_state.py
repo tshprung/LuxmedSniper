@@ -209,7 +209,7 @@ class SearchState:
     def due_calendar_event(self, calendar_id: str, now: int):
         return self.db.execute(
             """SELECT calendar_sync.*, booking_requests.search_id, booking_requests.reservation_id,
-                      booking_requests.patient, searches.telephone
+                      booking_requests.patient, booking_requests.option_number, searches.telephone
                FROM calendar_sync JOIN booking_requests
                ON booking_requests.id = calendar_sync.booking_id
                JOIN searches ON searches.id = booking_requests.search_id
