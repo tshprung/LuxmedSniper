@@ -124,7 +124,8 @@ class SearchBot:
     def __init__(self, telegram: Telegram, state: SearchState, profiles: dict[str, Profile], *, clock=time.time,
                  free_text: FreeText | None = None, calendar: CalendarAvailability | None = None,
                  booking_enabled: bool = False, device_credentials: dict | None = None,
-                 allowed_booking_patients: frozenset[str] | None = None, calendar_destination: str | None = None):
+                 allowed_booking_patients: frozenset[str] | None = None, calendar_destination: str | None = None,
+                 calendar_detail_patients: frozenset[str] = frozenset()):
         self.telegram = telegram
         self.state = state
         self.profiles = profiles
@@ -132,6 +133,7 @@ class SearchBot:
         self.free_text = free_text
         self.calendar = calendar
         self.calendar_destination = calendar_destination
+        self.calendar_detail_patients = calendar_detail_patients
         self.booking_enabled = booking_enabled
         self.allowed_booking_patients = (
             frozenset(profiles) if allowed_booking_patients is None else allowed_booking_patients
@@ -702,10 +704,21 @@ class SearchBot:
             portal = self.portal_for(event["patient"])
             if event["reservation_id"] not in portal.booked_visit_ids(telephone=bool(event["telephone"])):
                 raise CalendarUnavailable
+            details = {}
+            if event["patient"] in self.calendar_detail_patients:
+                result = self.state.results(event["search_id"])
+                if result is not None:
+                    slot = json.loads(result["slots"])[event["option_number"] - 1]
+                    _, clinic, clinician = self.slot_key(slot)
+                    details = {
+                        "service": result["service"], "clinic": clinic, "clinician": clinician,
+                        "telephone": bool(event["telephone"]),
+                    }
             self.calendar.add_booking(
                 self.calendar_destination, event["event_id"],
                 dt.datetime.fromtimestamp(event["starts_at"], WARSAW),
                 dt.datetime.fromtimestamp(event["ends_at"], WARSAW),
+                **details,
             )
         except PortalError as error:
             with self.state.db:
@@ -948,12 +961,19 @@ def main() -> int:
         interpreter = FreeText(key) if key else None
         calendar_config = calendar_settings(settings)
         calendar = CalendarAvailability(calendar_config) if calendar_config else None
+        calendar_detail_patients = frozenset(
+            value.strip() for value in os.environ.get("LUXMED_CALENDAR_DETAILS_PATIENTS", "").split(",")
+            if value.strip()
+        )
+        if not calendar_detail_patients.issubset(PROFILE_KEYS):
+            raise ValueError("Invalid calendar details patient list")
         bot = SearchBot(Telegram(token, owner), SearchState(path / "telegram.sqlite3"), profiles,
                         free_text=interpreter, calendar=calendar,
                         booking_enabled=bool(allowed_booking_patients),
                         device_credentials=trusted_devices(profiles),
                         allowed_booking_patients=allowed_booking_patients,
-                        calendar_destination=calendar_config.get("destination_calendar_id") if calendar_config else None)
+                        calendar_destination=calendar_config.get("destination_calendar_id") if calendar_config else None,
+                        calendar_detail_patients=calendar_detail_patients)
     except (KeyError, ValueError, OSError):
         print("Telegram bot configuration is incomplete.", file=sys.stderr)
         return 2

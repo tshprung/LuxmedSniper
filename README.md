@@ -171,8 +171,12 @@ asks you to check your calendar before approving.
 To check the account's primary calendar, set `"calendar_ids": ["primary"]`.
 To also add new verified bookings there, set `"destination_calendar_id": "primary"`
 and authorize the OAuth credential with the Calendar availability and
-`calendar.events.owned` scopes. Each event is private with the title
-“Appointment” and the booked time. The worker retries event creation
+`calendar.events.owned` scopes. By default each event is private with the
+title “Appointment” and the booked time. To include the service, clinician,
+clinic for in-person visits, and reminders 10 and 30 minutes before a
+visit, set `LUXMED_CALENDAR_DETAILS_PATIENTS` in the worker's environment
+to a comma-separated list of profile keys (such as `patient1`). This
+applies when creating events. The worker retries event creation
 using the same event ID and keeps the appointment status in LUX MED
 independent of the calendar result. Cancelled appointments already in
 Google Calendar need to be removed there.

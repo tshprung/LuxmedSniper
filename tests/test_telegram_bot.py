@@ -57,6 +57,35 @@ class CalendarTests(unittest.TestCase):
         })
         self.assertTrue(get.call_args.args[0].endswith(f"/calendars/primary/events/{key}"))
 
+    def test_detailed_calendar_event_uses_clinic_only_for_in_person_visits(self):
+        calendar = CalendarAvailability({})
+        start = dt.datetime(2030, 3, 31, 11, tzinfo=WARSAW)
+        end = start + dt.timedelta(minutes=15)
+        with (
+            patch.object(calendar, "_headers", return_value={}),
+            patch("telegram_calendar.requests.post") as insert,
+        ):
+            response = insert.return_value.__enter__.return_value
+            response.status_code = 200
+            response.json.return_value = {"id": "fixture123"}
+            for telephone in (False, True):
+                with self.subTest(telephone=telephone):
+                    calendar.add_booking(
+                        "primary", "fixture123", start, end, service="Fixture service",
+                        clinic="Fixture clinic", clinician="Dr. A & B", telephone=telephone,
+                    )
+                    payload = insert.call_args.kwargs["json"]
+                    self.assertEqual(payload, {
+                        "id": "fixture123", "summary": "Fixture service — LUX MED",
+                        "visibility": "private",
+                        "start": {"dateTime": start.isoformat()}, "end": {"dateTime": end.isoformat()},
+                        "description": "Telephone consultation<br>Dr. A &amp; B" if telephone else "Dr. A &amp; B",
+                        "reminders": {"useDefault": False, "overrides": [
+                            {"method": "popup", "minutes": 10}, {"method": "popup", "minutes": 30},
+                        ]},
+                        **({} if telephone else {"location": "Fixture clinic"}),
+                    })
+
     def test_free_busy_uses_only_intervals_and_checks_errors_for_each_calendar(self):
         calendar = CalendarAvailability({
             "client_id": "fixture", "client_secret": "fixture", "refresh_token": "fixture",
@@ -387,6 +416,7 @@ class BotTests(unittest.TestCase):
         self.bot.calendar.busy.return_value = False
         self.bot.calendar.add_booking.side_effect = [CalendarUnavailable, None]
         self.bot.calendar_destination = "primary"
+        self.bot.calendar_detail_patients = frozenset({"patient1"})
         self.update(1, "/find Adult | Internista")
         self.bot.flush()
         with patch("telegram_bot.LuxMedPortal") as portal:
@@ -395,14 +425,17 @@ class BotTests(unittest.TestCase):
             slot = Appointment(start, 2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9,
                                booking_term={"cityId": 5, "end": start + dt.timedelta(minutes=15)})
             client.resolve_service.return_value = 12
-            client.search.return_value = [slot]
+            client.search.return_value = [
+                Appointment(start - dt.timedelta(minutes=15), 2, "Other clinic", "Other doctor", 12, doctor_id=8),
+                slot,
+            ]
             client.is_booking_blocked_by_penalty.return_value = False
             client.has_booking_conflict.return_value = False
             client.reserve_standard_visit.return_value = 543
             client.booked_visit_ids.return_value = {543}
             self.bot.search_due()
             self.bot.flush()
-            self.update(2, "Book 1")
+            self.update(2, "Book 2")
             self.bot.flush()
             self.bot.booking_due()
             self.assertIn("Booked and verified in LUX MED", self.state.next_message()["text"])
@@ -419,6 +452,10 @@ class BotTests(unittest.TestCase):
             self.assertEqual(first, retry)
             self.assertEqual(retry.args[0], "primary")
             self.assertEqual(retry.args[2], start)
+            self.assertEqual(retry.kwargs, {
+                "service": "Internista", "clinic": "Fixture clinic", "clinician": "Fixture doctor",
+                "telephone": False,
+            })
             client.reserve_standard_visit.assert_called_once()
 
     def test_regular_phone_booking_from_search_to_verified_appointment(self):

@@ -2,6 +2,7 @@
 
 import datetime as dt
 import time
+from html import escape
 from urllib.parse import quote
 
 import requests
@@ -63,17 +64,32 @@ class CalendarAvailability:
             raise CalendarUnavailable
         return any(calendars[key]["busy"] for key in ids)
 
-    def add_booking(self, calendar_id: str, event_id: str, start: dt.datetime, end: dt.datetime) -> None:
+    def add_booking(self, calendar_id: str, event_id: str, start: dt.datetime, end: dt.datetime, *,
+                    service: str = "", clinic: str = "", clinician: str = "", telephone: bool = False) -> None:
+        event = {
+            "id": event_id, "summary": "Appointment", "visibility": "private",
+            "start": {"dateTime": start.isoformat()}, "end": {"dateTime": end.isoformat()},
+        }
+        if service:
+            event["summary"] = f"{service} — LUX MED"
+            notes = ["Telephone consultation"] if telephone else []
+            if clinician:
+                notes.append(escape(clinician))
+            if notes:
+                event["description"] = "<br>".join(notes)
+            if clinic and not telephone:
+                event["location"] = clinic
+            event["reminders"] = {
+                "useDefault": False,
+                "overrides": [{"method": "popup", "minutes": minutes} for minutes in (10, 30)],
+            }
         url = f"https://www.googleapis.com/calendar/v3/calendars/{quote(calendar_id, safe='')}/events"
         headers = self._headers()
         try:
             with requests.post(
                 url, headers=headers, timeout=(5, 15), allow_redirects=False,
                 params={"sendUpdates": "none", "fields": "id"},
-                json={
-                    "id": event_id, "summary": "Appointment", "visibility": "private",
-                    "start": {"dateTime": start.isoformat()}, "end": {"dateTime": end.isoformat()},
-                },
+                json=event,
             ) as response:
                 if response.status_code in (200, 201) and response.json().get("id") == event_id:
                     return
