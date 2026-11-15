@@ -90,6 +90,13 @@ Use `Change 123 to after 17:00` or `Change 123 to clear filters` to update
 an active search in plain English. A search for a fixed date window ends
 once those dates have passed.
 
+In the owner's private chat, “me” and “myself” select `patient1`.
+For example, “Find a call with an internist for me after 16:00” searches
+for a phone consultation. Exact portal names and partial names are checked
+against the requested patient's current LUX MED catalog. If several services
+match, the bot shows labels you can use to refine the request. Common English
+aliases include orthopedist, ENT, allergist, and fasting blood draw.
+
 Searches use a rolling 14-day window. A new search gets its first check
 as soon as the worker can run it during 06:00–22:00 Europe/Warsaw, even
 when another search for the same patient is already running. Each search
@@ -231,20 +238,25 @@ a private SQLite database. An interruption between Telegram accepting a
 notification and the worker recording delivery can result in a duplicate
 notification.
 
-### Optional free-text requests
+### Plain-English requests
 
 Set `OPENAI_API_KEY` as a secret in the same GitHub environment and repeat
 the encrypted configuration handoff. Use an OpenAI API project key. The
-worker uses the Responses API for short English requests that the
-built-in parser could not interpret, such as “Could you check whether there’s
-an internist available for [patient] in Wrocław?”
+worker uses one Responses API call per new plain-English availability
+request it can redact, such as “I’d like an internist to call me tomorrow
+afternoon.” Explicit `/find` commands and scheduled checks run locally.
+The local parser can also handle explicit requests if the API is unavailable.
 
 The worker recognizes the patient, service, and city locally. Only a small
-set of scheduling words and placeholders leave the VM. It sends no chat
-history, patient labels, service labels, results, or portal credentials.
-Messages with unrecognized details stay local. The model classifies intent.
-The worker validates the search criteria and controls all
-account access and scheduling.
+set of scheduling words, date and time expressions, and placeholders leave
+the VM. Patient names, service labels, clinician and clinic names, chat
+history, results, and portal credentials stay local. The model interprets
+search intent, visit mode, and timing. The worker applies filters, matches
+the live catalog, and controls account access and scheduling.
+
+A planned Telegram feature is a list of upcoming LUX MED bookings by
+patient. Example requests include “Show my next appointments” and “Show
+upcoming appointments for Daniel.”
 
 How to use LuxmedSniper?
 --------------------

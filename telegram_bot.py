@@ -12,12 +12,16 @@ from pathlib import Path
 
 import requests
 
-from luxmed_sniper import WARSAW, DoctorLocator, Luxmed, LuxMedPortal, PortalError
+from luxmed_sniper import WARSAW, DoctorLocator, Luxmed, LuxMedPortal, PortalError, service_variants
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_settings, trusted_devices, validate, worker_settings
 from telegram_free_text import FreeText
-from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences, split_preferences
-from telegram_requests import INTERNIST_PHONE_SERVICE, PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria, PatientServiceMismatch, RequestError, city_catalog, normalize, parse_search, pediatric_choice, pediatric_menu
+from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences
+from telegram_requests import (
+    INTERNIST_PHONE_SERVICE, PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria,
+    PatientServiceMismatch, RequestError, check_patient_service, city_catalog,
+    matching_catalog_variants, normalize, parse_search, pediatric_choice, pediatric_menu,
+)
 from telegram_state import SearchState, next_search_time
 
 PORTAL_REUSE_SECONDS = 3600
@@ -145,7 +149,8 @@ class SearchBot:
         self.children = {key for key, profile in profiles.items() if profile.child}
         self.aliases = {}
         for key, profile in profiles.items():
-            for alias in (key, profile.name, *profile.aliases):
+            owner_aliases = ("me", "myself") if key == "patient1" else ()
+            for alias in (key, profile.name, *profile.aliases, *owner_aliases):
                 name = normalize(alias)
                 if not name:
                     continue
@@ -217,6 +222,7 @@ class SearchBot:
 
     def handle_search(self, text: str) -> None:
         error_message = None
+        menu_selection = False
         today = dt.datetime.fromtimestamp(self.clock(), WARSAW).date()
         try:
             criteria = parse_search(text, self.aliases, self.children, self.cities, today=today)
@@ -237,13 +243,14 @@ class SearchBot:
             candidate = Criteria(**fields)
             if service := pediatric_choice(text):
                 criteria = replace(candidate, service=service, telephone="telefonicz" in normalize(service))
-        if criteria is None and self.free_text is not None and not text.startswith("/"):
+                menu_selection = True
+        if self.free_text is not None and not menu_selection and not text.startswith("/"):
             try:
-                request, filters = split_preferences(text)
-                preferences = parse_preferences(filters, today)
-                criteria = self.free_text.criteria(request, self.aliases, self.children, self.cities)
-                if criteria is not None:
-                    criteria = replace(criteria, preferences=preferences)
+                interpreted = self.free_text.criteria(
+                    text, self.aliases, self.children, self.cities, today=today, local=criteria,
+                )
+                if interpreted is not None:
+                    criteria = interpreted
             except PatientServiceMismatch as error:
                 self.reject_mismatch(error)
                 return
@@ -263,19 +270,25 @@ class SearchBot:
         elif pending:
             self.state.queue_message(pediatric_menu(self.profiles[json.loads(pending)["patient"]].name))
         else:
-            self.help()
+            self.state.queue_message(
+                "What kind of appointment should I look for, and who is it for? "
+                "You can say “Find an internist phone call for me.”"
+            )
 
-    def reject_mismatch(self, error: PatientServiceMismatch) -> None:
-        self.state.set_setting("pending", "")
+    def reject_mismatch(self, error: PatientServiceMismatch, search_id: int | None = None) -> None:
+        if search_id is None:
+            self.state.set_setting("pending", "")
         name = self.profiles[error.patient].name
-        self.state.queue_message(f"{name} {error} Please send a new request with the patient and service you intended.")
+        self.state.queue_message(
+            f"{name} {error} Please send a new request with the patient and service you intended.", search_id,
+        )
 
     def help(self) -> None:
         booking_available = self.booking_enabled and bool(self.allowed_booking_patients)
         title = "LUX MED appointment assistant" if booking_available else "Read-only appointment search"
         self.state.queue_message(
             f"{title}\n"
-            "Find an internist for <patient>\nFind a pediatrician for <patient>\n"
+            "Find an internist phone call for me\nFind a pediatrician for <patient>\n"
             "Find an internist for <patient> next week after 16:00\n"
             "/find patient | portal service | city | optional filters\n"
             "/active · Stop <number>\n"
@@ -459,9 +472,9 @@ class SearchBot:
         if paused:
             status = "Paused. Check the portal, then use /resume."
         elif due > now:
-            status = f"Queued for {local_time(due)} Warsaw time."
+            status = f"I’ll start looking at {local_time(due)} Warsaw time."
         else:
-            status = "Checking availability. I’ll send the first result when the check finishes."
+            status = "I’ll check LUX MED now and let you know what I find."
         prefix = "Updated\n" if changed else ""
         self.state.queue_message(f"{prefix}{self.search_heading(number, criteria)}\n{status}", search_id)
 
@@ -890,21 +903,39 @@ class SearchBot:
     def search_one(self, portal: LuxMedPortal, catalog: list, row) -> None:
         search_id = row["id"]
         criteria = self.state.criteria(row)
-        heading = self.search_heading(row["display_number"], criteria)
+        regular_phone = self.is_nationwide_phone_search(criteria)
         try:
-            service_id = portal.resolve_service(row["service"], catalog, telephone=bool(row["telephone"]))
+            service_id = portal.resolve_service(
+                criteria.service, catalog, telephone=criteria.telephone, regular_phone=regular_phone,
+            )
         except PortalError as error:
             if str(error) not in {"service-not-in-catalog", "ambiguous-service"}:
                 raise
-            with self.state.db:
-                if self.state.finish(search_id, "service-unresolved"):
-                    if str(error) == "service-not-in-catalog":
-                        status = "I couldn't find that service in this patient's LUX MED catalog. Search finished."
-                    else:
-                        status = "More than one service matched. Try its exact portal label. Search finished."
-                    self.state.queue_message(f"{heading}\n{status}", search_id)
-            return
+            variants = service_variants(catalog)
+            if regular_phone:
+                variants = (variant for variant in variants
+                            if variant.get("isVideoConsultation") is False and variant.get("isPoz") is False)
+            matches = matching_catalog_variants(criteria.service, variants, telephone=criteria.telephone)
+            if len(matches) != 1:
+                heading = self.search_heading(row["display_number"], criteria)
+                self.report_catalog_choices(search_id, heading, matches, ambiguous=str(error) == "ambiguous-service")
+                return
+            service, = matches
+            service_id = service["id"]
+            criteria = replace(criteria, service=service["name"], telephone=service["isTelemedicine"])
 
+        try:
+            check_patient_service(criteria.patient, criteria.service, self.children)
+        except PatientServiceMismatch as error:
+            with self.state.db:
+                if self.state.finish(search_id, "service-mismatch"):
+                    self.reject_mismatch(error, search_id)
+            return
+        if (criteria.service, criteria.telephone) != (row["service"], bool(row["telephone"])):
+            with self.state.db:
+                self.state.resolve_search_service(search_id, criteria.service, criteria.telephone)
+
+        heading = self.search_heading(row["display_number"], criteria)
         locator = DoctorLocator(id=f"{row['city_id']}*{service_id}*-1*-1")
         try:
             if self.is_nationwide_phone_search(criteria):
@@ -952,6 +983,23 @@ class SearchBot:
                 return
             self.state.save_results(search_id, options)
             self.show_results(search_id)
+
+    def report_catalog_choices(self, search_id: int, heading: str, matches: list[dict], *, ambiguous: bool) -> None:
+        labels = list(dict.fromkeys(variant["name"] for variant in matches))
+        if len(labels) > 1:
+            status = "\n".join([
+                "Several LUX MED services match. Use one of these names in your request.",
+                *(f"• {label}" for label in labels[:5]),
+            ])
+            if len(labels) > 5:
+                status += "\nAdd more words to narrow the list."
+        elif ambiguous or matches:
+            status = "LUX MED lists variants with the same name. Use a more specific service name or choose in the Patient Portal."
+        else:
+            status = "I couldn't find that service in this patient's LUX MED catalog. Try a specialty or the portal service name."
+        with self.state.db:
+            if self.state.finish(search_id, "service-unresolved"):
+                self.state.queue_message(f"{heading}\n{status}", search_id)
 
 
 def main() -> int:

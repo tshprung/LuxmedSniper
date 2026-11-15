@@ -938,7 +938,9 @@ class BotTests(unittest.TestCase):
         response = MagicMock(status_code=200)
         response.json.return_value = {
             "status": "completed",
-            "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"intent":"search"}'}]}],
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps({
+                "intent": "search", "mode": "unspecified", "when": "",
+            })}]}],
         }
         with patch.object(self.bot.free_text.session, "post", return_value=response) as api:
             self.update(1, "Could you check whether a pediatrician is available for Child in Wrocław?")
@@ -955,10 +957,99 @@ class BotTests(unittest.TestCase):
         self.assertEqual(row["patient"], "patient2")
         self.assertIn("gabinet dzieci zdrowych", row["service"])
 
+    def test_internist_phone_phrasing_resolves_locally_to_the_owner(self):
+        for number, text in enumerate((
+            "Find call with internist for Adult",
+            "Find internist phone call for Adult",
+            "Find internist phone call for me",
+            "Could you find a phone call with an internist for me tomorrow, after 16:00?",
+        ), 1):
+            self.update(number, text)
+        self.assertEqual(len(self.state.active()), 4)
+        for row in self.state.active():
+            self.assertEqual((row["patient"], row["service"], row["telephone"]),
+                             ("patient1", INTERNIST_PHONE_SERVICE, 1))
+        criteria = self.state.criteria(self.state.active()[-1])
+        self.assertEqual((criteria.preferences.first_date, criteria.preferences.start_minute), ("2030-03-31", 960))
+
+    def test_model_interprets_a_search_once_and_preserves_patient_privacy(self):
+        self.bot.free_text = FreeText("fixture-key")
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"status": "completed", "output": [{
+            "type": "message", "content": [{"type": "output_text", "text": json.dumps({
+                "intent": "search", "mode": "phone", "when": "tomorrow, between 12:00 and 17:00",
+            })}],
+        }]}
+        with patch.object(self.bot.free_text.session, "post", return_value=response) as api:
+            self.update(1, "I'd like an internist to call me tomorrow afternoon.")
+            self.assertEqual(api.call_args.kwargs["json"]["input"],
+                             "i d like an SERVICE to call me tomorrow afternoon")
+            self.update(2, "Find call with internist for Adult tomorrow after 18:00")
+            self.assertNotIn("adult", api.call_args.kwargs["json"]["input"].casefold())
+            self.update(3, "/find me | Internista")
+            self.assertEqual(api.call_count, 2)
+        conversational, explicit, command = [self.state.criteria(row) for row in self.state.active()]
+        self.assertEqual((conversational.patient, conversational.service, conversational.telephone),
+                         ("patient1", INTERNIST_PHONE_SERVICE, True))
+        self.assertEqual((conversational.preferences.first_date, conversational.preferences.start_minute,
+                          conversational.preferences.end_minute), ("2030-03-31", 720, 1020))
+        self.assertEqual(explicit.preferences.start_minute, 1080)
+        self.assertEqual(command.service, "Internista")
+
+    def test_live_catalog_matches_unlisted_names_and_preserves_remote_mode(self):
+        self.update(1, "Find kontrola online for me tomorrow")
+        self.bot.flush()
+        client = MagicMock()
+        client.resolve_service = LuxMedPortal.resolve_service
+        client.get_services.return_value = [
+            {"name": "Consultations", "children": [
+                {"name": "Kontrola online – wideo", "id": 10, "isTelemedicine": True, "isVideoConsultation": True},
+            ]},
+        ]
+        client.search.return_value = []
+        with patch.object(self.bot, "portal_for", return_value=client):
+            self.bot.search_due()
+        row, = self.state.active()
+        self.assertEqual((row["patient"], row["service"], row["telephone"]),
+                         ("patient1", "Kontrola online – wideo", 1))
+        self.assertEqual(client.search.call_args.args[0].service_id, "10")
+        self.assertIn("Kontrola online – wideo", self.state.next_message()["text"])
+
+    def test_ambiguous_catalog_service_lists_choices_without_searching(self):
+        self.update(1, "Find an ultrasound for me")
+        self.bot.flush()
+        client = MagicMock()
+        client.resolve_service = LuxMedPortal.resolve_service
+        client.get_services.return_value = [
+            {"name": "USG stawu skokowego", "id": 11, "isTelemedicine": False},
+            {"name": "USG tarczycy", "id": 12, "isTelemedicine": False},
+        ]
+        with patch.object(self.bot, "portal_for", return_value=client):
+            self.bot.search_due()
+        client.search.assert_not_called()
+        message = self.state.next_message()["text"]
+        self.assertIn("Several LUX MED services match", message)
+        self.assertIn("USG stawu skokowego", message)
+        self.assertIn("USG tarczycy", message)
+
+    def test_specialty_aliases_match_current_portal_labels(self):
+        client = MagicMock()
+        client.resolve_service = LuxMedPortal.resolve_service
+        client.get_services.return_value = [
+            {"name": "Konsultacja laryngologiczna", "id": 10, "isTelemedicine": False},
+            {"name": "Konsultacja alergologiczna - telefoniczna", "id": 11, "isTelemedicine": True},
+            {"name": "Konsultacja ortopedyczna", "id": 12, "isTelemedicine": False},
+            {"name": "Konsultacja ortopedyczna - uraz", "id": 13, "isTelemedicine": False},
+        ]
+        client.search.return_value = []
+        for number, service in enumerate(("ENT", "allergist phone call", "ortopeda"), 1):
+            self.update(number, f"Find {service} for me")
+        with patch.object(self.bot, "portal_for", return_value=client):
+            self.bot.search_due()
+        self.assertEqual([check.args[0].service_id for check in client.search.call_args_list], ["10", "11", "12"])
+
     def test_free_text_does_not_send_unrecognized_details_or_broaden_constraints(self):
         for text in (
-            "Please find an internist for Adult tomorrow",
-            "Please find an internist for Adult at 9",
             "Please book an internist for Adult",
             "Please find an internist for Adult or Child",
             "Could you find a pediatric visit for Child with details unknown-private-note?",
