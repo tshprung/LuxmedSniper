@@ -19,9 +19,9 @@ from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_sett
 from telegram_free_text import FreeText
 from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences
 from telegram_requests import (
-    INTERNIST_PHONE_SERVICE, PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria,
+    ALLERGY_SERVICE, INTERNIST_PHONE_SERVICE, PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria,
     PatientServiceMismatch, RequestError, appointments_request, check_patient_service, city_catalog,
-    matching_catalog_variants, normalize, parse_search, pediatric_choice, pediatric_menu,
+    matching_catalog_variants, nearby_catalog_variants, normalize, parse_search, pediatric_choice, pediatric_menu,
 )
 from telegram_state import SearchState, next_search_time
 
@@ -33,7 +33,6 @@ PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/P
 SICK_CHILD_SERVICES = {
     normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[index][2]) for index in (0, 1, 2)
 }
-ALLERGY_SERVICE = "Konsultacja alergologiczna"
 ALLERGY_SERVICES = {"alergolog", normalize(ALLERGY_SERVICE)}
 QUESTIONNAIRE_PROMPT = "LUX MED questionnaire"
 QUESTIONNAIRE_APPROVAL = "Please confirm this allergy appointment."
@@ -45,8 +44,10 @@ BOOKING_ACCESS_NOTICE = "Direct booking is paused for this patient. Availability
 BOOKING_CHECK_LABELS = {
     "login": "sign-in", "service-catalog": "service catalog",
     "availability": "slot availability", "phone-availability": "phone slot availability",
+    "slot-recheck": "exact slot check",
     "phone-doctors": "phone clinician lookup", "booking-penalty": "no-show restriction check",
     "booking-limits": "booking limits", "referrals": "referral check",
+    "booking-location": "clinic location check", "facility-directory": "clinic directory",
     "questionnaire": "questionnaire check", "service-eligibility": "service eligibility",
     "questionnaire-submission": "questionnaire submission",
     "booking-conflicts": "LUX MED conflict check", "booking-request-token": "booking request verification",
@@ -56,6 +57,7 @@ BOOKING_CHECK_LABELS = {
 BOOKING_FAILURES = {
     "slot-gone": "That exact slot is no longer available. Use More or Continue to find another.",
     "booking-details-missing": "I couldn't verify all the details for this slot. Check it in the Patient Portal.",
+    "booking-location-unverified": "I couldn’t verify that this clinic belongs to your requested city. Use More or Continue to try another slot.",
     "booking-limit": "LUX MED didn't clear its booking limit check. Check the Patient Portal.",
     "booking-eligibility": "LUX MED didn't confirm that this service is covered and available to book online.",
     "booking-referrals-unconfirmed": "I couldn’t verify the referral requirements. Check this visit in the Patient Portal.",
@@ -231,6 +233,8 @@ class SearchBot:
             self.stop(argument, reply)
         elif key in {"/active", "active", "show active searches", "show running searches"}:
             self.show_active()
+        elif command in {"service", "/service"}:
+            self.choose_catalog_service(argument)
         elif len(text) <= 600 and (patient_name := appointments_request(text)) is not None:
             self.show_appointments(patient_name)
         elif command in {"/change", "change"}:
@@ -383,6 +387,7 @@ class SearchBot:
         )
 
     def start(self, criteria: Criteria, *, excluded_slots=(), not_before: int = 0) -> None:
+        self.state.set_setting("pending_service", "")
         now = int(self.clock())
         search_id, number, due, paused = self.state.add(
             criteria, now, excluded_slots=excluded_slots, not_before=not_before,
@@ -666,6 +671,10 @@ class SearchBot:
         elif not reply and self.state.get_setting("pending"):
             self.state.set_setting("pending", "")
             self.state.queue_message("Pending selection cleared.")
+            return
+        elif not reply and self.state.get_setting("pending_service"):
+            self.state.set_setting("pending_service", "")
+            self.state.queue_message("Service selection cleared.")
             return
         elif not reply:
             rows = self.state.active()
@@ -989,11 +998,10 @@ class SearchBot:
         if appointment.requires_preparation:
             raise PortalError("portal-preparation")
         term = appointment.booking_term
-        if (
-            term is None or term.get("isTelemedicine", False) is not telephone
-            or (not telephone and str(term["cityId"]) != locator.city_id)
-        ):
-            raise PortalError("booking-details-missing")
+        if term is None or term.get("isTelemedicine", False) is not telephone:
+            raise PortalError("booking-details-missing", stage="slot-recheck")
+        if not telephone:
+            portal.check_booking_city(appointment, int(locator.city_id))
         return appointment
 
     def booking_approval_reasons(self, portal, start: dt.datetime, end: dt.datetime) -> list[str]:
@@ -1053,7 +1061,7 @@ class SearchBot:
             elif code == "booking-access-paused":
                 message = BOOKING_ACCESS_NOTICE
                 portal_link = False
-            elif code in {"questionnaire-expired", "questionnaire-open"}:
+            elif code in {"questionnaire-expired", "questionnaire-open", "booking-location-unverified"}:
                 message = BOOKING_FAILURES[code]
                 portal_link = False
             elif code == "rate-limited":
@@ -1131,11 +1139,16 @@ class SearchBot:
         except PortalError as error:
             if str(error) not in {"service-not-in-catalog", "ambiguous-service"}:
                 raise
-            variants = service_variants(catalog)
+            variants = list(service_variants(catalog))
             if regular_phone:
-                variants = (variant for variant in variants
-                            if variant.get("isVideoConsultation") is False and variant.get("isPoz") is False)
+                variants = [variant for variant in variants
+                            if variant.get("isVideoConsultation") is False and variant.get("isPoz") is False]
             matches = matching_catalog_variants(criteria.service, variants, telephone=criteria.telephone)
+            if not matches and str(error) == "service-not-in-catalog":
+                choices = nearby_catalog_variants(criteria.service, variants, telephone=criteria.telephone)
+                if choices:
+                    self.offer_catalog_service(row, criteria, choices)
+                    return
             if len(matches) != 1:
                 heading = self.search_heading(row["display_number"], criteria)
                 self.report_catalog_choices(search_id, heading, matches, ambiguous=str(error) == "ambiguous-service")
@@ -1203,6 +1216,42 @@ class SearchBot:
                 return
             self.state.save_results(search_id, options)
             self.show_results(search_id)
+
+    def offer_catalog_service(self, row, criteria: Criteria, matches: list[dict]) -> None:
+        choices = [{"service": item["name"], "telephone": item["isTelemedicine"]} for item in matches[:5]]
+        heading = self.search_heading(row["display_number"], criteria)
+        with self.state.db:
+            if self.state.finish(row["id"], "service-unresolved"):
+                self.state.set_setting("pending_service", json.dumps({"criteria": asdict(criteria), "choices": choices}))
+                if len(choices) == 1:
+                    question = f"Did you mean {choices[0]['service']}? Reply Service 1 to search for it."
+                else:
+                    options = "\n".join(f"{number}. {choice['service']}" for number, choice in enumerate(choices, 1))
+                    question = f"Which LUX MED service did you mean?\n{options}\nReply Service followed by its number."
+                self.state.queue_message(f"{heading}\n{question}", row["id"])
+
+    def choose_catalog_service(self, argument: str) -> None:
+        pending = self.state.get_setting("pending_service")
+        if not pending:
+            self.state.queue_message("I don’t have a service choice open. Tell me what appointment to look for.")
+            return
+        suggestion = json.loads(pending)
+        choices = suggestion["choices"]
+        if not re.fullmatch(r"[1-9]", argument) or int(argument) > len(choices):
+            self.state.queue_message("Reply Service followed by one of the numbers shown.")
+            return
+        fields = suggestion["criteria"]
+        fields.update(choices[int(argument) - 1])
+        fields["preferences"] = Preferences(**fields["preferences"])
+        criteria = Criteria(**fields)
+        try:
+            check_patient_service(criteria.patient, criteria.service, self.children)
+        except PatientServiceMismatch as error:
+            self.state.set_setting("pending_service", "")
+            self.reject_mismatch(error)
+            return
+        self.state.set_setting("pending", "")
+        self.start(criteria)
 
     def report_catalog_choices(self, search_id: int, heading: str, matches: list[dict], *, ambiguous: bool) -> None:
         labels = list(dict.fromkeys(variant["name"] for variant in matches))

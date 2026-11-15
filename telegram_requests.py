@@ -11,6 +11,7 @@ from telegram_preferences import Preferences, contains_words, name_words, parse_
 
 
 INTERNIST_PHONE_SERVICE = "Konsultacja internistyczna - telefoniczna"
+ALLERGY_SERVICE = "Konsultacja alergologiczna"
 PEDIATRIC_PREFIX = "Konsultacja pediatryczna - "
 PEDIATRIC_SERVICES = (
     ("sick visit", "wizyta dla chorego dziecka", "gabinet dzieci chorych"),
@@ -32,7 +33,11 @@ PEDIATRIC_SERVICES = (
 )
 
 GENERAL_SERVICES = {
-    "allergist": "Konsultacja alergologiczna",
+    "allergist": ALLERGY_SERVICE,
+    "alergolog": ALLERGY_SERVICE,
+    "alergologa": ALLERGY_SERVICE,
+    "allergolog": ALLERGY_SERVICE,
+    "allergy consultation": ALLERGY_SERVICE,
     "allergist phone consultation": "Konsultacja alergologiczna - telefoniczna",
     "allergist phone call": "Konsultacja alergologiczna - telefoniczna",
     "dermatologist": "Dermatolog",
@@ -159,6 +164,38 @@ def matching_catalog_variants(service: str, variants, *, telephone: bool) -> lis
         elif contains_words(words, requested):
             partial[service_id] = variant
     return sorted((exact or partial).values(), key=lambda variant: normalize(variant["name"]))
+
+
+def _one_edit(left: str, right: str) -> bool:
+    if len(left) == len(right):
+        changed = [index for index, (first, second) in enumerate(zip(left, right)) if first != second]
+        if len(changed) == 1:
+            return True
+        if len(changed) == 2:
+            first, second = changed
+            return second == first + 1 and left[first:second + 1] == right[first:second + 1][::-1]
+        return False
+    shorter, longer = sorted((left, right), key=len)
+    if len(longer) != len(shorter) + 1:
+        return False
+    offset = next((index for index, (first, second) in enumerate(zip(shorter, longer)) if first != second), len(shorter))
+    return shorter[offset:] == longer[offset + 1:]
+
+
+def nearby_catalog_variants(service: str, variants, *, telephone: bool) -> list[dict]:
+    requested = normalize(service)
+    if len(requested) < 5:
+        return []
+    aliases = {normalize(label) for key, label in GENERAL_SERVICES.items() if _one_edit(requested, key)}
+    matches = {}
+    for variant in variants:
+        remote, service_id = variant.get("isTelemedicine"), variant.get("id")
+        if type(remote) is not bool or (telephone and not remote) or type(service_id) is not int or service_id <= 0:
+            continue
+        name = normalize(variant["name"])
+        if name in aliases or _one_edit(requested, name):
+            matches[name, remote] = variant
+    return sorted(matches.values(), key=lambda variant: normalize(variant["name"]))
 
 
 def parse_search(text: str, aliases: dict[str, str], children: set[str], cities: dict, *, today: dt.date | None = None) -> Criteria | None:
