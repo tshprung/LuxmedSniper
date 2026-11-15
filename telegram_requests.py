@@ -82,11 +82,28 @@ SEARCH_PREFIX = re.compile(
     r"^(?:please\s+)?(?:(?:can|could|would)\s+you\s+(?:please\s+)?)?(?:find|(?:look|search|check)\s+for)\s+",
     re.IGNORECASE,
 )
+APPOINTMENTS_REQUEST = re.compile(
+    r"(?:(?:please )?(?:(?:can|could|would) you (?:please )?)?"
+    r"(?:(?:show|list|check)(?: me)?|let me see|what are) )?"
+    r"(?:all )?(?:my |the |(?P<possessor>[\w -]{1,80}?)['’]s )?"
+    r"(?:(?:upcoming|next|scheduled|booked) )*(?:lux med )?(?:appointments?|visits?|bookings?)"
+    r"(?: for (?P<patient>.+?))?(?: please)?"
+)
 
 
 def normalize(text: str) -> str:
     decomposed = unicodedata.normalize("NFKD", text.casefold().replace("ł", "l"))
     return " ".join("".join(char for char in decomposed if not unicodedata.combining(char)).split())
+
+
+def appointments_request(text: str) -> str | None:
+    key = normalize(text.strip().rstrip("?.!"))
+    command, _, argument = key.partition(" ")
+    if command in {"/appointments", "/visits", "/bookings"}:
+        return argument.removeprefix("for ") or "me"
+    if match := APPOINTMENTS_REQUEST.fullmatch(key):
+        return match["patient"] or match["possessor"] or "me"
+    return None
 
 
 def city_catalog() -> dict[str, tuple[int, str]]:

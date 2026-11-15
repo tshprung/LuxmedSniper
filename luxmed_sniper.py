@@ -26,6 +26,12 @@ from pydantic import BaseModel, Field, model_validator
 
 WARSAW = ZoneInfo("Europe/Warsaw")
 PORTAL_TIMEOUT = (5, 15)
+BOOKED_STATUSES = (1, 2)  # Reserved and Confirmed in the Patient Portal.
+# Visit and examination types in the portal's scheduled timeline.
+SCHEDULED_VISIT_MODES = {
+    1: "", 2: "", 4: "", 5: "Online consultation", 7: "Phone consultation", 9: "Video consultation",
+    12: "", 13: "", 14: "Phone consultation", 101: "",
+}
 IN_PERSON_SERVICE_NAMES = (
     {"internista", "konsultacja internisty", "konsultacja internistyczna"},
     {"alergolog", "konsultacja alergologiczna"},
@@ -98,6 +104,15 @@ class Appointment:
     requires_preparation: bool = False
 
 
+@dataclass(frozen=True, repr=False)
+class ScheduledVisit:
+    starts_at: datetime.datetime
+    service: str
+    clinic: str
+    clinician: str
+    mode: str
+
+
 class Luxmed(BaseModel):
     password: str
     login: str | None = None
@@ -143,6 +158,7 @@ class LuxMedPortal:
     DICTIONARY_SERVICES_URL = f'{DICTIONARY_URL}/serviceVariantsGroups'
     DICTIONARY_FACILITIES_AND_DOCTORS = f'{DICTIONARY_URL}/facilitiesAndDoctors'
     UPCOMING_VISITS_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/DashboardMedicalSection/GetUpcomingVisits'
+    SCHEDULED_VISITS_URL = f"{NEW_PORTAL_URL}/Timeline/GetStartEvents"
     NON_SHOW_PENALTIES_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Reservation/CheckUserNonShowPenalties'
 
     def __init__(self, credentials: Luxmed, *, trusted_device: dict | None = None):
@@ -393,12 +409,57 @@ class LuxMedPortal:
             status = event.get("status")
             if type(status) is not int or not 0 <= status <= 6:
                 raise PortalError("unexpected-upcoming-visits", suspend=True, stage="booking-verification")
-            if status in (1, 2):  # Reserved, Confirmed.
+            if status in BOOKED_STATUSES:
                 visit_id = event.get("eventId")
                 if type(visit_id) is not int or visit_id <= 0:
                     raise PortalError("unexpected-upcoming-visits", suspend=True, stage="booking-verification")
                 booked.add(visit_id)
         return booked
+
+    def scheduled_visits(self, now: datetime.datetime) -> list[ScheduledVisit]:
+        """Return future reserved and confirmed appointments from the scheduled timeline."""
+        content = self._portal_json("GET", self.SCHEDULED_VISITS_URL, stage="scheduled-visits")
+        events = content.get("events") if isinstance(content, dict) else None
+        if not isinstance(events, list):
+            raise PortalError("unexpected-scheduled-visits", stage="scheduled-visits")
+        cutoff = now.timestamp()
+        visits = []
+        seen = set()
+        for event in events:
+            if not isinstance(event, dict) or type(event.get("eventType")) is not int:
+                raise PortalError("unexpected-scheduled-visits", stage="scheduled-visits")
+            kind = event["eventType"]
+            if kind not in SCHEDULED_VISIT_MODES:
+                continue
+            status = event.get("status")
+            if type(status) is not int:
+                raise PortalError("unexpected-scheduled-visits", stage="scheduled-visits")
+            if status not in BOOKED_STATUSES:
+                continue
+            try:
+                date = event["date"]
+                if not isinstance(date, str) or len(date) < 16:
+                    raise ValueError("Scheduled visit requires a date and time")
+                starts = datetime.datetime.fromisoformat(date)
+                starts = starts.astimezone(WARSAW) if starts.tzinfo else starts.replace(tzinfo=WARSAW)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                raise PortalError("unexpected-scheduled-visits", stage="scheduled-visits") from None
+            if starts.timestamp() < cutoff:
+                continue
+            event_id = event.get("eventId")
+            if type(event_id) is int and event_id > 0:
+                if (kind, event_id) in seen:
+                    continue
+                seen.add((kind, event_id))
+            mode = SCHEDULED_VISIT_MODES[kind]
+            clinic = event.get("externalClinic") or event.get("clinic")
+            doctor = event.get("doctor")
+            visits.append(ScheduledVisit(
+                starts, visit_label(event.get("title"), 160) or "LUX MED appointment",
+                visit_label(clinic.get("name"), 100) if isinstance(clinic, dict) and not mode else "",
+                visit_label(doctor.get("name"), 100) if isinstance(doctor, dict) else "", mode,
+            ))
+        return sorted(visits, key=lambda visit: visit.starts_at.timestamp())
 
     def has_booking_conflict(self, start: datetime.datetime, end: datetime.datetime) -> bool:
         """Check overlaps against the upcoming events used on the portal search page."""
@@ -616,6 +677,10 @@ def service_variants(catalog: Any) -> Iterable[dict]:
             yield from service_variants(children)
         else:
             yield node
+
+
+def visit_label(value: Any, limit: int) -> str:
+    return " ".join(value.split())[:limit] if isinstance(value, str) else ""
 
 
 class LuxMedSniper(LuxMedPortal):

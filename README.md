@@ -254,9 +254,11 @@ history, results, and portal credentials stay local. The model interprets
 search intent, visit mode, and timing. The worker applies filters, matches
 the live catalog, and controls account access and scheduling.
 
-A planned Telegram feature is a list of upcoming LUX MED bookings by
-patient. Example requests include “Show my next appointments” and “Show
-upcoming appointments for Daniel.”
+Ask “Show my next appointments,” “Show upcoming visits for Daniel,” or
+`/appointments <patient>` for the selected patient's scheduled LUX MED
+visits. The bot reads the Patient Portal timeline, including appointments
+booked in the portal. It displays times in Europe/Warsaw and handles this
+request locally.
 
 How to use LuxmedSniper?
 --------------------

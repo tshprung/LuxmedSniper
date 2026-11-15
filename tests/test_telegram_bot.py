@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import requests
 from nacl.public import PrivateKey, SealedBox
 
-from luxmed_sniper import WARSAW, Appointment, LuxMedPortal, Luxmed, PortalError
+from luxmed_sniper import WARSAW, Appointment, LuxMedPortal, Luxmed, PortalError, ScheduledVisit
 from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import SECRET_KEYS, booking_patients, package_settings, trusted_devices
@@ -140,6 +140,47 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.state.active(), [])
         self.assertIsNone(self.state.next_message())
         self.assertEqual(self.state.get_setting("offset"), "3")
+
+    def test_appointments_read_the_requested_patient_timeline_without_ai_or_booking(self):
+        self.bot.free_text = MagicMock()
+        clients = {patient: MagicMock() for patient in self.profiles}
+        starts = dt.datetime(2030, 4, 1, 13, tzinfo=WARSAW)
+        clients["patient1"].scheduled_visits.return_value = []
+        clients["patient2"].scheduled_visits.return_value = [
+            ScheduledVisit(starts, "Fixture service", "Fixture clinic", "Fixture clinician", ""),
+        ]
+        clients["patient3"].scheduled_visits.return_value = []
+        with patch.object(self.bot, "portal_for", side_effect=clients.__getitem__) as portal_for:
+            self.update(1, "Show my next appointments", sender=200, chat_id=200)
+            self.update(2, "Show upcoming visits for Child", chat_id=-100, chat_type="group")
+            portal_for.assert_not_called()
+            self.update(3, "Show me the next LUX MED booking for me")
+            self.assertIn("no upcoming appointments for Adult", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(4, "Could you show me Child’s next appointments?")
+            text = self.state.next_message()["text"]
+            self.assertIn("for Child (Warsaw time)", text)
+            self.assertIn("01 Apr 2030, 13:00 · Fixture service", text)
+            self.assertIn("Fixture clinic · Fixture clinician", text)
+            self.bot.flush()
+            self.update(5, "/appointments Other")
+            self.bot.flush()
+            self.update(6, "Show upcoming visits for Child or Other")
+            self.assertIn("Whose appointments", self.state.next_message()["text"])
+        self.assertEqual([call.args[0] for call in portal_for.call_args_list], ["patient1", "patient2", "patient3"])
+        self.bot.free_text.criteria.assert_not_called()
+        for client in clients.values():
+            client.reserve_standard_visit.assert_not_called()
+        self.assertEqual(self.state.active(), [])
+
+    def test_appointments_respect_an_account_pause_even_before_first_search(self):
+        with patch.object(self.bot, "portal_for", side_effect=PortalError("access-denied", suspend=True, stage="login")) as portal:
+            self.update(1, "Show next appointments for Child")
+            self.bot.flush()
+            self.update(2, "Show next appointments for Child")
+            self.assertIn("access for Child is paused", self.state.next_message()["text"])
+        portal.assert_called_once_with("patient2")
+        self.assertTrue(self.state.account_paused("patient2"))
 
     def test_pediatric_clarification_survives_restart_and_queues_after_hours(self):
         self.now = local_timestamp(30, 23, 15)

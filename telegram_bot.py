@@ -19,7 +19,7 @@ from telegram_free_text import FreeText
 from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences
 from telegram_requests import (
     INTERNIST_PHONE_SERVICE, PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria,
-    PatientServiceMismatch, RequestError, check_patient_service, city_catalog,
+    PatientServiceMismatch, RequestError, appointments_request, check_patient_service, city_catalog,
     matching_catalog_variants, normalize, parse_search, pediatric_choice, pediatric_menu,
 )
 from telegram_state import SearchState, next_search_time
@@ -186,6 +186,8 @@ class SearchBot:
             self.stop(argument, reply)
         elif key in {"/active", "active", "show active searches", "show running searches"}:
             self.show_active()
+        elif len(text) <= 600 and (patient_name := appointments_request(text)) is not None:
+            self.show_appointments(patient_name)
         elif command in {"/change", "change"}:
             self.change(text, reply)
         elif command in {"book", "/book", "details", "/details"} or key in {
@@ -219,6 +221,42 @@ class SearchBot:
             self.handle_search(text)
         else:
             self.help()
+
+    def show_appointments(self, patient_name: str) -> None:
+        patient = self.aliases.get(patient_name)
+        if patient is None:
+            names = ", ".join(profile.name for profile in self.profiles.values())
+            self.state.queue_message(f"Whose appointments should I show? Say “me” or use a patient’s name ({names}).")
+            return
+        name = self.profiles[patient].name
+        paused = f"LUX MED access for {name} is paused. Once access is restored, send /resume {name} and ask again."
+        if self.state.account_paused(patient):
+            self.state.queue_message(paused)
+            return
+        try:
+            portal = self.portal_for(patient)
+            visits = portal.scheduled_visits(dt.datetime.fromtimestamp(self.clock(), WARSAW))
+        except PortalError as error:
+            status = f"I couldn’t load the LUX MED appointments for {name}. Try again in a moment."
+            if error.suspend:
+                self.close_portal(patient)
+                if error.stage == "login" or error.http_status == 429:
+                    self.state.suspend(patient)
+                    status = paused
+            self.state.queue_message(status)
+            return
+        if not visits:
+            self.state.queue_message(f"LUX MED shows no upcoming appointments for {name}.")
+            return
+        heading = f"Upcoming LUX MED appointments for {name} (Warsaw time)"
+        entries = []
+        for visit in visits:
+            date = visit.starts_at.strftime("%d %b %Y, %H:%M")
+            details = " · ".join(part for part in (visit.mode, visit.clinic, visit.clinician) if part)
+            entries.append(f"• {date} · {visit.service}" + (f"\n  {details}" if details else ""))
+        # Five bounded entries fit Telegram's message limit even with Unicode labels.
+        for first in range(0, len(entries), 5):
+            self.state.queue_message("\n\n".join([heading, *entries[first:first + 5]]))
 
     def handle_search(self, text: str) -> None:
         error_message = None
@@ -290,6 +328,7 @@ class SearchBot:
             f"{title}\n"
             "Find an internist phone call for me\nFind a pediatrician for <patient>\n"
             "Find an internist for <patient> next week after 16:00\n"
+            "Show my next appointments or /appointments <patient>\n"
             "/find patient | portal service | city | optional filters\n"
             "/active · Stop <number>\n"
             "Change 123 to after 16:00\n/change number | service | city | optional filters\n"
