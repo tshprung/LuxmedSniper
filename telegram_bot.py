@@ -439,7 +439,7 @@ class SearchBot:
         elif status == "queued":
             due = next_search_time(now)
             timing = "Checking the exact slot and booking conditions." if due == now else f"Queued for {local_time(due)} Warsaw time."
-            self.state.queue_message(f"{description}\nBooking request {booking['id']}. {timing}", search_id)
+            self.state.queue_message(f"{description}\n{timing}", search_id)
         elif status in {"checking", "submitting", "verifying"}:
             self.state.queue_message(f"{description}\nThis booking is already being processed.", search_id)
         else:
@@ -447,7 +447,8 @@ class SearchBot:
 
     def send_booking_approval(self, booking, description: str, reason: str) -> None:
         self.state.queue_message(
-            f"{description}\n{reason}\nReply Approve {booking['id']} to proceed or Stop booking {booking['id']} to drop this request.",
+            f"{description}\n{reason}\nApproval code: {booking['id']}\n"
+            f"Reply Approve {booking['id']} to book this option or Stop booking {booking['id']} to drop this request.",
             booking["search_id"],
         )
 
