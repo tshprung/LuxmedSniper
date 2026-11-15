@@ -14,7 +14,7 @@ from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import SECRET_KEYS, booking_patients, package_settings, trusted_devices
 from telegram_free_text import FreeText, redacted_request
-from telegram_requests import INTERNIST_PHONE_SERVICE
+from telegram_requests import INTERNIST_PHONE_SERVICE, pediatric_choice
 from telegram_state import SearchState, next_search_time
 
 
@@ -749,6 +749,13 @@ class BotTests(unittest.TestCase):
             self.bot.search_due()
             self.assertEqual(client.search.call_count, 3)
             client.reserve_standard_visit.assert_called_once()
+
+    def test_sick_child_phone_and_nfz_results_explain_the_questionnaire(self):
+        for choice in ("sick visit by phone", "sick kids NFZ"):
+            with self.subTest(choice=choice):
+                notice, = self.bot.portal_notices(pediatric_choice(choice), [])
+                self.assertIn("requires a medical questionnaire", notice)
+        self.assertEqual(self.bot.portal_notices(pediatric_choice("routine visit"), []), [])
 
     def test_sick_child_search_shows_questionnaire_and_preparation_with_portal_handoff(self):
         self.update(1, "/find Child | sick kids")

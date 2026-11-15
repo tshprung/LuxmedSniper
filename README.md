@@ -117,10 +117,11 @@ slots already shown and respecting the search's next hourly check.
 Reply to a result message to select that list. Standalone commands use the
 latest list.
 
-The standard sick-child pediatric visit has a LUX MED questionnaire. The
-bot can list times, and `Details 2` links to the Patient Portal to complete
-the questionnaire and reserve the visit there. When LUX MED flags a visit
-as requiring preparation, the bot points you to the portal instructions.
+The sick-child pediatric clinic, phone, and NFZ clinic variants have a
+LUX MED questionnaire. The bot can list times, and `Details 2` links to
+the Patient Portal to complete the questionnaire and reserve the visit
+there. When LUX MED flags a visit as requiring preparation, the bot points
+you to the portal instructions.
 
 ### Direct Telegram booking pilot
 

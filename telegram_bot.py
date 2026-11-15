@@ -29,7 +29,9 @@ RESULTS_PER_PAGE = 3
 SHORT_NOTICE_SECONDS = 6 * 3600
 CALENDAR_RETRY_SECONDS = 15 * 60
 PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
-SICK_CHILD_VISIT = normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[0][2])
+SICK_CHILD_SERVICES = {
+    normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[index][2]) for index in (0, 1, 2)
+}
 SUPPORTED_BOOKING_SERVICES = {"internista", normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[3][2])}
 QUESTIONNAIRE_NOTICE = "LUX MED requires a medical questionnaire for this visit. Complete it in the Patient Portal."
 PREPARATION_NOTICE = "LUX MED lists preparation instructions for this visit. Open “Zobacz szczegóły” in the Patient Portal."
@@ -49,6 +51,8 @@ BOOKING_FAILURES = {
     "booking-details-missing": "I couldn't verify all the details for this slot. Check it in the Patient Portal.",
     "booking-limit": "LUX MED didn't clear its booking limit check. Check the Patient Portal.",
     "booking-eligibility": "LUX MED didn't confirm that this service is covered and available to book online.",
+    "booking-referrals-unconfirmed": "I couldn’t verify the referral requirements. Check this visit in the Patient Portal.",
+    "booking-referral-review": "LUX MED returned a referral for this service. Review it in the Patient Portal to book.",
     "portal-questions": QUESTIONNAIRE_NOTICE,
     "questionnaire-response-unrecognized": "I couldn't verify LUX MED's questionnaire response. Check this visit in the Patient Portal.",
     "portal-preparation": PREPARATION_NOTICE,
@@ -359,7 +363,7 @@ class SearchBot:
     @staticmethod
     def portal_notices(service: str, slots: list[dict]) -> list[str]:
         notices = []
-        if normalize(service) == SICK_CHILD_VISIT:
+        if normalize(service) in SICK_CHILD_SERVICES:
             notices.append(QUESTIONNAIRE_NOTICE)
         if any(slot.get("requires_preparation") is True for slot in slots):
             notices.append(PREPARATION_NOTICE)
@@ -681,7 +685,7 @@ class SearchBot:
         try:
             if slot["start"] <= now:
                 raise PortalError("slot-gone")
-            if normalize(criteria.service) == SICK_CHILD_VISIT:
+            if normalize(criteria.service) in SICK_CHILD_SERVICES:
                 raise PortalError("portal-questions")
             if slot.get("requires_preparation") is True:
                 raise PortalError("portal-preparation")

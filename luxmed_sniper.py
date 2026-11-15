@@ -521,11 +521,11 @@ class LuxMedPortal:
         referrals = self._portal_json(
             "GET", f"{self.NEW_PORTAL_URL}/Reservation/GetReferralsForReservation", stage="referrals",
         )
-        if not isinstance(referrals, dict) or not isinstance(referrals.get("referrals"), list) or any(
-            not isinstance(referral, dict) or referral.get("serviceVariantId") == service_variant_id
-            for referral in referrals["referrals"]
-        ):
-            raise PortalError("booking-needs-portal")
+        entries = referrals.get("referrals") if isinstance(referrals, dict) else None
+        if not isinstance(entries, list) or any(not isinstance(referral, dict) for referral in entries):
+            raise PortalError("booking-referrals-unconfirmed", stage="referrals")
+        if any(referral.get("serviceVariantId") == service_variant_id for referral in entries):
+            raise PortalError("booking-referral-review", stage="referrals")
         params = {"locationId": city_id, "serviceVariantId": service_variant_id, "process": 4}
         triage = self._portal_json(
             "GET", f"{self.NEW_PORTAL_URL}/PNM/Index",
