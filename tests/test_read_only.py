@@ -345,6 +345,22 @@ class AuditCliTests(unittest.TestCase):
                 self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", *["GET"] * 4])
                 self.assertTrue(request.call_args.args[1].endswith("/PNM/Index"))
 
+    def test_booking_preflight_distinguishes_referral_review_from_unknown_data(self):
+        for referrals, expected in (
+            ({"referrals": [{"serviceVariantId": 30, "details": "private-fixture"}]}, "booking-referral-review"),
+            ({"referrals": ["private-fixture"]}, "booking-referrals-unconfirmed"),
+        ):
+            with self.subTest(expected=expected):
+                with patch.object(requests.Session, "request", side_effect=[
+                    response({"token": "fixture-token"}), response({"canReserve": True}), response(referrals),
+                ]) as request:
+                    portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
+                    with portal.session, self.assertRaises(PortalError) as failure:
+                        portal.check_booking_eligibility(5, 30)
+                self.assertEqual((str(failure.exception), failure.exception.stage), (expected, "referrals"))
+                self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", "GET", "GET"])
+                self.assertTrue(request.call_args.args[1].endswith("/GetReferralsForReservation"))
+
     def test_booking_preflight_checks_eligibility_penalty_and_verification_without_holding(self):
         for triage in (None, {"questions": []}):
             with self.subTest(triage=triage):
