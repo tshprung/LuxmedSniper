@@ -1860,6 +1860,21 @@ class BotTests(unittest.TestCase):
         self.assertEqual((row["patient"], row["service"], row["telephone"]),
                          ("patient1", "Konsultacja alergologiczna", 0))
 
+    def test_plain_reply_can_answer_a_patient_question_for_the_current_search(self):
+        request = "Find an allergist for someone tomorrow after 16:00"
+        self.update(1, request)
+        self.assertIn("Who is the appointment for?", self.state.next_message()["text"])
+        self.bot.flush()
+        self.update(2, "/start")
+        self.update(3, "For Child, please.")
+        self.assertEqual(self.state.active(), [])
+        self.update(4, request)
+        self.update(5, "For Child, please.")
+        row, = self.state.active()
+        criteria = self.state.criteria(row)
+        self.assertEqual((criteria.patient, criteria.service), ("patient2", "Konsultacja alergologiczna"))
+        self.assertEqual((criteria.preferences.first_date, criteria.preferences.start_minute), ("2030-03-31", 960))
+
     def test_unspecified_adult_specialty_offers_choices_with_original_filters(self):
         self.update(1, "Find a doctor for me tomorrow after 16:00")
         message = self.state.next_message()
@@ -1956,9 +1971,30 @@ class BotTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(redacted_request(text, self.bot.aliases, self.bot.cities))
 
-    def test_english_help_and_portal_service_names(self):
+    def test_welcome_and_clarifications_use_conversational_replies(self):
+        self.bot.free_text = MagicMock()
+        expected = "LUX MED Personal Assistant\nHow may I help you today?"
         self.update(1, "/start")
-        self.assertIn("LUX MED appointment assistant", self.state.next_message()["text"])
+        self.assertEqual(self.state.next_message()["text"], expected)
+        self.assertIsNone(self.state.next_message()["buttons"])
+        self.bot.flush()
+        self.update(2, "Hello!")
+        self.assertEqual(self.state.next_message()["text"], expected)
+        self.bot.flush()
+        self.update(3, "Thanks!")
+        self.assertEqual(self.state.next_message()["text"], "You’re welcome.")
+        self.bot.free_text.chat_action.assert_not_called()
+        self.bot.free_text.criteria.assert_not_called()
+        self.bot.free_text = None
+        self.bot.flush()
+        self.update(4, "Some words I can't interpret")
+        self.assertIn("Could you say it another way", self.state.next_message()["text"])
+        self.assertTrue(self.state.next_message()["buttons"])
+        self.assertEqual(self.state.active(), [])
+
+    def test_english_help_and_portal_service_names(self):
+        self.update(1, "/help")
+        self.assertIn("/find patient", self.state.next_message()["text"])
         self.assertNotIn("/szukaj", self.state.next_message()["text"])
         self.update(2, "/find Adult | Dermatolog | Wrocław")
         row, = self.state.active()

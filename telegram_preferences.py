@@ -135,7 +135,8 @@ def parse_preferences(text: str, today: dt.date, base: Preferences = Preferences
         match = FILTER.match(text)
         if match is None:
             raise UnrecognizedPreferences(
-                "I couldn't read those filters. Try Friday or Monday, after 16:00, with Dr Smith, or clinic followed by its name."
+                "I didn’t quite catch the filters. Could you rephrase the request using a day, time, doctor, or clinic? "
+                "For example, “Find a cardiologist for me on Friday or Monday after 16:00.”"
             )
         kind = match.lastgroup
         field = "time" if kind == "between" else kind
