@@ -839,22 +839,26 @@ def visit_label(value: Any, limit: int) -> str:
     return " ".join(value.split())[:limit] if isinstance(value, str) else ""
 
 
-def package_item_text(item: Any) -> str:
+def package_item_labels(item: Any) -> Iterable[str]:
     texts = item.get("itemTexts") if isinstance(item, dict) else None
     if not isinstance(texts, list):
-        return ""
-    plain = " ".join(visible_text(text.get("htmlText")) for text in texts if isinstance(text, dict))
-    decomposed = unicodedata.normalize("NFKD", plain.casefold().replace("ł", "l"))
-    return " ".join("".join(char for char in decomposed if not unicodedata.combining(char)).split())
+        return
+    for text in texts:
+        plain = visible_text(text.get("htmlText")) if isinstance(text, dict) else ""
+        if plain:
+            decomposed = unicodedata.normalize("NFKD", plain.casefold().replace("ł", "l"))
+            yield " ".join("".join(char for char in decomposed if not unicodedata.combining(char)).split())
 
 
 def parse_package_coverage(details: dict) -> PackageCoverage:
-    header = package_item_text(details.get("header"))
+    headers = list(package_item_labels(details.get("header")))
+    header = " ".join(headers)
     sections = details.get("executingConditions")
     labels = [
-        package_item_text(item)
+        label
         for section in sections if isinstance(section, dict) and isinstance(section.get("items"), list)
         for item in section["items"]
+        for label in package_item_labels(item)
     ] if isinstance(sections, list) else []
     conditions = " ".join(labels)
     summary = f"{header} {conditions}"
@@ -868,7 +872,7 @@ def parse_package_coverage(details: dict) -> PackageCoverage:
         status = "copay"
     elif any(re.fullmatch(
         r"(?:(?:ta )?usluga (?:jest )?(?:platna|odplatna)|this service is (?:paid|payable|chargeable))[.!]?", label,
-    ) for label in [header, *labels]):
+    ) for label in [*headers, *labels]):
         status = "paid"
     elif outside:
         status = "outside"
