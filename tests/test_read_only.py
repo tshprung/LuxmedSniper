@@ -256,6 +256,41 @@ class SearchTests(unittest.TestCase):
         self.assertEqual((later.clinic, later.clinician), ("Fixture clinic", "Fixture doctor"))
         self.assertNotIn("fixture private data", repr(later))
 
+    def test_latest_completed_visit_skips_non_consultations_and_checks_the_same_visit_for_notes(self):
+        completed = {
+            "eventType": 7, "eventId": 41, "status": 4, "assignedFromReservationId": False,
+            "date": "2030-03-28T09:30:00Z", "title": "Fixture consultation",
+            "doctor": {"name": "Fixture clinician"},
+        }
+        first_page = [
+            {**completed, "eventType": 2, "eventId": 42, "date": "2030-03-30T15:10:00"},
+            {**completed, "status": 6, "eventId": 43, "date": "2030-03-30T10:10:00"},
+            {**completed, "status": 5, "eventId": 44, "date": "2030-03-29T10:10:00"},
+        ]
+        notes = {**completed, "recommendations": "<p>Fixture line 1</p><p>Fixture line 2</p>",
+                 "prescriptions": [{"code": "excluded fixture code"}]}
+        with patch.object(requests.Session, "request", side_effect=[
+            response({"token": "fixture"}), response({"events": first_page, "isEndOfList": False}),
+            response({"events": [completed, {**completed, "eventId": 45, "date": "2030-03-27T10:00:00"}],
+                      "isEndOfList": True}),
+            response(notes), response({**notes, "eventId": 99}), response({**notes, "recommendations": None}),
+        ]) as request:
+            portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
+            with portal.session:
+                visit = portal.latest_completed_visit(NOW)
+                self.assertEqual(visit.starts_at.isoformat(), "2030-03-28T10:30:00+01:00")
+                self.assertEqual(visit.service, "Fixture consultation")
+                self.assertEqual(portal.visit_recommendations(visit), "Fixture line 1\nFixture line 2")
+                with self.assertRaisesRegex(PortalError, "unexpected-visit-details"):
+                    portal.visit_recommendations(visit)
+                self.assertEqual(portal.visit_recommendations(visit), "")
+        self.assertEqual(request.call_args_list[2].args, ("GET", LuxMedPortal.HISTORICAL_VISITS_URL))
+        self.assertEqual(request.call_args_list[2].kwargs["params"], {"beforeDate": "2030-03-29 10:10:00"})
+        self.assertEqual(request.call_args_list[3].args, ("GET", LuxMedPortal.VISIT_DETAILS_URL))
+        self.assertEqual(request.call_args_list[3].kwargs["params"],
+                         {"eventId": "41", "eventType": "7", "assignedFromReservationId": "false"})
+        self.assertTrue(all(call.args[0] == "GET" for call in request.call_args_list[1:]))
+
     def test_cancellation_uses_the_timeline_action_and_exact_reservation(self):
         visit = {
             "eventType": 1, "status": 2, "eventId": 41, "serviceInstanceId": 72,

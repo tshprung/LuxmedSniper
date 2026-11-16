@@ -16,8 +16,8 @@ import requests
 from luxmed_prices import PublicPriceList
 from luxmed_questionnaire import Questionnaire, QuestionnaireError, QuestionnaireReceipt, visible_text
 from luxmed_sniper import (
-    WARSAW, BookingQuestionnaireRequired, CancellationTerms, DoctorLocator, Luxmed, LuxMedPortal,
-    PackageCoverage, PortalError, ScheduledVisit, service_variants,
+    WARSAW, BookingQuestionnaireRequired, CancellationTerms, CompletedVisit, DoctorLocator, Luxmed, LuxMedPortal,
+    PackageCoverage, PortalError, ScheduledVisit, VisitSummary, service_variants,
 )
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_settings, trusted_devices, validate, worker_settings
@@ -26,7 +26,7 @@ from telegram_preferences import PreferenceError, Preferences, UnrecognizedPrefe
 from telegram_requests import (
     ALLERGY_SERVICE, GENERAL_SERVICES, INTERNIST_PHONE_SERVICE, PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria,
     PatientChoiceNeeded, PatientServiceMismatch, RequestError, ServiceChoiceNeeded, VisitModeChoiceNeeded,
-    appointments_request, check_patient_service, city_catalog, coverage_request,
+    appointments_request, check_patient_service, city_catalog, coverage_request, last_visit_request,
     matching_catalog_variants, matching_package_services, nearby_catalog_variants, normalize, parse_search,
     pediatric_choice, pediatric_menu,
     phone_service, requests_phone, requests_remote, split_clinician_first_search,
@@ -40,6 +40,7 @@ APPROVAL_CUTOFF_SECONDS = 3600
 CALENDAR_RETRY_SECONDS = 15 * 60
 PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
 APPOINTMENTS_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Timeline"
+VISIT_HISTORY_PORTAL_URL = f"{APPOINTMENTS_PORTAL_URL}/Realized"
 COVERAGE_HELP = "Try “Is a cardiologist visit covered for me?” or /coverage patient | exact service name."
 WELCOME_MESSAGE = "LUX MED Personal Assistant\nHow may I help you today?"
 SICK_CHILD_SERVICES = {
@@ -241,6 +242,7 @@ class SearchBot:
         self.questionnaire_booking: QuestionnaireBooking | None = None
         self.patient_question: str | None = None
         self.appointment_list: AppointmentList | None = None
+        self.last_visit: tuple[str, CompletedVisit] | None = None
         self.cancellation_review: CancellationReview | None = None
         self.cities = city_catalog()
         self.children = {key for key, profile in profiles.items() if profile.child}
@@ -292,6 +294,8 @@ class SearchBot:
             self.show_visit_cancellation(int(match[2]), message, token=match[1])
         elif match := re.fullmatch(r"cancel review ([a-f0-9]{12}) (yes|keep)", action):
             self.respond_to_cancellation(match[2] == "yes", message, token=match[1])
+        elif match := re.fullmatch(r"visit notes ([a-f0-9]{12})", action):
+            self.show_last_visit_notes(match[1])
         elif match := re.fullmatch(r"coverage (patient[123]) ([1-9][0-9]{0,9})", action):
             self.show_coverage(match[1], (), service_id=int(match[2]))
         elif action == "stop questionnaire":
@@ -364,6 +368,8 @@ class SearchBot:
             self.show_patient_buttons(appointments=key == "pick visits")
         elif command == "services" and argument in self.profiles:
             self.handle_search(f"/find {argument} | doctor")
+        elif len(text) <= 600 and (visit_action := last_visit_request(text)) is not None:
+            self.show_last_visit(with_notes=visit_action == "notes")
         elif len(text) <= 600 and (patient_name := appointments_request(text)) is not None:
             self.show_appointments(patient_name)
         elif command in {"/change", "change"}:
@@ -534,21 +540,15 @@ class SearchBot:
             self.show_patient_buttons(appointments=True)
             return
         name = self.profiles[patient].name
-        paused = f"LUX MED access for {name} is paused. Once access is restored, send /resume {name} and ask again."
         if self.state.account_paused(patient):
-            self.state.queue_message(paused)
+            self.state.queue_message(self.appointment_access_paused(patient))
             return
         try:
             portal = self.portal_for(patient)
             visits = portal.scheduled_visits(dt.datetime.fromtimestamp(self.clock(), WARSAW))
         except PortalError as error:
-            status = f"I couldn’t load the LUX MED appointments for {name}. Try again in a moment."
-            if error.suspend:
-                self.close_portal(patient)
-                if error.stage == "login" or error.http_status == 429:
-                    self.state.suspend(patient)
-                    status = paused
-            self.state.queue_message(status)
+            self.appointment_lookup_error(patient, error,
+                                          f"I couldn’t load the LUX MED appointments for {name}. Try again in a moment.")
             return
         if not visits:
             self.state.queue_message(f"LUX MED shows no upcoming appointments for {name}.")
@@ -556,7 +556,7 @@ class SearchBot:
         heading = f"Upcoming LUX MED appointments for {name} (Warsaw time)"
         snapshot = AppointmentList(patient, uuid.uuid4().hex[:12], visits)
         self.appointment_list = snapshot
-        entries = [f"{number}. {self.upcoming_visit_details(visit)}" for number, visit in enumerate(visits, 1)]
+        entries = [f"{number}. {self.visit_details(visit)}" for number, visit in enumerate(visits, 1)]
         instructions = "Tap a cancellation button or type Cancel followed by the visit number to see how to cancel it."
         # Five bounded entries fit Telegram's message limit even with Unicode labels.
         for first in range(0, len(entries), 5):
@@ -565,10 +565,84 @@ class SearchBot:
             self.state.queue_message("\n\n".join([heading, *entries[first:first + 5], instructions]), buttons=buttons)
 
     @staticmethod
-    def upcoming_visit_details(visit: ScheduledVisit) -> str:
+    def visit_details(visit: VisitSummary) -> str:
         date = visit.starts_at.strftime("%d %b %Y, %H:%M")
         details = " · ".join(part for part in (visit.mode, visit.clinic, visit.clinician) if part)
         return f"{date} · {visit.service}" + (f"\n  {details}" if details else "")
+
+    def appointment_access_paused(self, patient: str) -> str:
+        name = self.profiles[patient].name
+        return f"LUX MED access for {name} is paused. Once access is restored, send /resume {name} and ask again."
+
+    def appointment_lookup_error(self, patient: str, error: PortalError, message: str) -> None:
+        if error.suspend:
+            self.close_portal(patient)
+            if error.stage == "login" or error.http_status == 429:
+                self.state.suspend(patient)
+                message = self.appointment_access_paused(patient)
+        self.state.queue_message(message)
+
+    def show_last_visit(self, *, with_notes: bool) -> None:
+        self.last_visit = None
+        patient = self.aliases.get("me")
+        if patient is None:
+            self.state.queue_message("I don’t have a LUX MED profile for you.")
+            return
+        if self.state.account_paused(patient):
+            self.state.queue_message(self.appointment_access_paused(patient))
+            return
+        try:
+            portal = self.portal_for(patient)
+            visit = portal.latest_completed_visit(dt.datetime.fromtimestamp(self.clock(), WARSAW))
+        except PortalError as error:
+            self.appointment_lookup_error(patient, error, "I couldn’t load your completed visits. Try again in a moment.")
+            return
+        if visit is None:
+            self.state.queue_message("LUX MED shows no completed consultations in your visit history.")
+            return
+        token = uuid.uuid4().hex[:12]
+        self.last_visit = (token, visit)
+        if with_notes:
+            self.show_last_visit_notes(token)
+        else:
+            self.state.queue_message(
+                f"Your last completed LUX MED appointment\n{self.visit_details(visit)}",
+                buttons=[[("Doctor’s recommendations", f"visit notes {token}")]],
+            )
+
+    def show_last_visit_notes(self, token: str) -> None:
+        patient = self.aliases.get("me")
+        if patient is None or self.last_visit is None or self.last_visit[0] != token:
+            self.state.queue_message("Could you ask me to show your last appointment again? I’ll open the notes from there.")
+            return
+        if self.state.account_paused(patient):
+            self.state.queue_message(self.appointment_access_paused(patient))
+            return
+        visit = self.last_visit[1]
+        try:
+            notes = self.portal_for(patient).visit_recommendations(visit)
+        except PortalError as error:
+            self.appointment_lookup_error(
+                patient, error, f"I couldn’t verify the recommendations for this visit.\n{VISIT_HISTORY_PORTAL_URL}",
+            )
+            return
+        if not notes:
+            self.state.queue_message(
+                f"{self.visit_details(visit)}\n\nLUX MED hasn’t published any recommendations for this visit. "
+                f"You can open the visit details here.\n{VISIT_HISTORY_PORTAL_URL}"
+            )
+            return
+        # Send on demand so clinical text never enters the SQLite outbox.
+        message = f"Doctor’s recommendations from LUX MED\n{self.visit_details(visit)}\n\n{notes}"
+        while len(message) > 2000:  # Fits Telegram’s text limit even with Unicode pairs.
+            split = message.rfind("\n", 0, 2000)
+            if split < 1000:
+                split = message.rfind(" ", 0, 2000)
+            if split < 1000:
+                split = 2000
+            self.telegram.send(message[:split])
+            message = message[split:].lstrip()
+        self.telegram.send(message)
 
     def show_visit_cancellation(self, number: int, reply: dict, *, token: str | None = None) -> None:
         snapshot = self.appointment_list
@@ -609,7 +683,7 @@ class SearchBot:
             if terms.no_show:
                 warning += "LUX MED flagged its no-show process, which may affect future booking.\n"
         self.state.queue_message(
-            f"Appointment {number} for {name}\n{self.upcoming_visit_details(visit)}\n\n"
+            f"Appointment {number} for {name}\n{self.visit_details(visit)}\n\n"
             f"{warning}Are you sure you want to cancel this visit?\n{instructions}",
             buttons=[[(yes, f"cancel review {review.token} yes"),
                       ("Keep appointment", f"cancel review {review.token} keep")]],
@@ -838,6 +912,7 @@ class SearchBot:
             "Find an internist phone call for me\nFind a pediatrician for <patient>\n"
             "Find an internist for <patient> next week after 16:00\n"
             "Show my next appointments or /appointments <patient>\n"
+            "Show me my last appointment · Show the notes from my last visit\n"
             "Is a cardiologist visit covered for me? · /coverage <patient> | <service>\n"
             "/find patient | portal service | city | optional filters\n"
             "/active · Change or stop a search\n"
@@ -1595,7 +1670,7 @@ class SearchBot:
             if (visit is None or not self.can_cancel_visit(patient, visit)
                     or self.visit_signature(visit) != request["signature"]):
                 raise PortalError("cancellation-visit-changed")
-            description = f"{name}\n{self.upcoming_visit_details(visit)}"
+            description = f"{name}\n{self.visit_details(visit)}"
             approved_terms = CancellationTerms(request["late_hours"], bool(request["no_show"]))
             if portal.cancellation_terms(visit) != approved_terms:
                 raise PortalError("cancellation-terms-changed")

@@ -13,7 +13,7 @@ from nacl.public import PrivateKey, SealedBox
 from luxmed_prices import ListedPrice
 from luxmed_questionnaire import Questionnaire, QuestionnaireError
 from luxmed_sniper import (
-    WARSAW, Appointment, BookingQuestionnaireRequired, CancellationTerms, LuxMedPortal,
+    WARSAW, Appointment, BookingQuestionnaireRequired, CancellationTerms, CompletedVisit, LuxMedPortal,
     Luxmed, PackageCoverage, PortalError, ScheduledVisit,
 )
 from telegram_bot import Profile, SearchBot, Telegram, TelegramError
@@ -214,6 +214,40 @@ class BotTests(unittest.TestCase):
         self.bot.free_text.criteria.assert_not_called()
         for client in clients.values():
             client.reserve_standard_visit.assert_not_called()
+        self.assertEqual(self.state.active(), [])
+
+    def test_last_visit_and_notes_use_the_owners_history_and_an_explicit_request(self):
+        self.bot.free_text = MagicMock()
+        portal = MagicMock()
+        visit = CompletedVisit(dt.datetime(2030, 3, 28, 10, tzinfo=WARSAW),
+                               "Fixture visit", "Fixture clinic", "Fixture clinician", "", 41, 1, False)
+        portal.latest_completed_visit.return_value = visit
+        portal.visit_recommendations.return_value = "Fixture recommendation text"
+        with patch.object(self.bot, "portal_for", return_value=portal) as portal_for:
+            self.update(1, "Show me my last appointment", chat_type="group")
+            portal_for.assert_not_called()
+            self.update(2, "Show me my last appointment")
+            message = self.state.next_message()
+            self.assertIn("Your last completed LUX MED appointment", message["text"])
+            self.assertIn("Fixture visit", message["text"])
+            self.assertNotIn("Fixture recommendation text", message["text"])
+            button = json.loads(message["buttons"])[0][0][1]
+            portal.visit_recommendations.assert_not_called()
+            self.bot.flush()
+            self.tap(3, button, sender=200, chat_id=200)
+            portal.visit_recommendations.assert_not_called()
+            self.tap(4, button)
+            self.assertIn("Fixture recommendation text", self.telegram.send.call_args.args[0])
+            self.assertIsNone(self.state.next_message())
+            portal.visit_recommendations.assert_called_once_with(visit)
+
+            portal.visit_recommendations.return_value = ""
+            self.update(5, "What did the doctor write in my last appointment?")
+            self.assertIn("hasn’t published any recommendations", self.state.next_message()["text"])
+            portal.scheduled_visits.assert_not_called()
+            self.assertTrue(all(call.args == ("patient1",) for call in portal_for.call_args_list))
+        self.bot.free_text.chat_action.assert_not_called()
+        self.bot.free_text.criteria.assert_not_called()
         self.assertEqual(self.state.active(), [])
 
     def test_coverage_checks_both_requested_services_and_no_booking_actions(self):
@@ -1787,10 +1821,14 @@ class BotTests(unittest.TestCase):
 
     def test_clinician_first_nfz_search_keeps_two_separate_dates(self):
         self.now = int(dt.datetime(2026, 11, 16, 10, tzinfo=WARSAW).timestamp())
-        for number, dates in enumerate(("next friday or monday", "friday or monay"), 1):
-            self.update(number, f"Find appointment for me with Marta Babiarczyk internista na NFZ on {dates}")
+        for number, text in enumerate((
+            "Find appointment for me with Marta Babiarczyk internista na NFZ on next Friday or Monday",
+            "Find appointment for me with Marta Babiarczyk internista na NFZ on Friday or monay",
+            "Find me appointment for internista NFZ with Marta Babiarczyk on next Friday or Monday",
+        ), 1):
+            self.update(number, text)
         rows = self.state.active()
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         for row in rows:
             criteria = self.state.criteria(row)
             self.assertEqual(criteria.patient, "patient1")
