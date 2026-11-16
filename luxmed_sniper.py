@@ -510,39 +510,28 @@ class LuxMedPortal:
         return sorted(visits, key=lambda visit: visit.starts_at.timestamp())
 
     def latest_completed_visit(self, now: datetime.datetime) -> CompletedVisit | None:
-        before = None
         cutoff = now.timestamp()
+        # Today's completed visits can remain in the start feed until the history updates.
+        start = self._portal_json("GET", self.SCHEDULED_VISITS_URL, stage="visit-history")
+        events = start.get("events") if isinstance(start, dict) else None
+        if not isinstance(events, list):
+            raise PortalError("unexpected-visit-history", stage="visit-history")
+        latest = latest_completed_in(events, cutoff)
+        before = None
         while True:
             params = {} if before is None else {"beforeDate": before.strftime("%Y-%m-%d %H:%M:%S")}
             page = self._portal_json("GET", self.HISTORICAL_VISITS_URL, stage="visit-history", params=params)
             events = page.get("events") if isinstance(page, dict) else None
             if not isinstance(events, list) or type(page.get("isEndOfList")) is not bool:
                 raise PortalError("unexpected-visit-history", stage="visit-history")
-            latest = None
-            for event in events:
-                if not isinstance(event, dict) or type(event.get("eventType")) is not int:
-                    raise PortalError("unexpected-visit-history", stage="visit-history")
-                kind = event["eventType"]
-                if kind not in CONSULTATION_TYPES:
-                    continue
-                if type(event.get("status")) is not int:
-                    raise PortalError("unexpected-visit-history", stage="visit-history")
-                if event["status"] != COMPLETED_VISIT_STATUS:
-                    continue
-                starts = timeline_visit_date(event.get("date"), stage="visit-history")
-                if starts.timestamp() > cutoff or (latest and starts.timestamp() <= latest.starts_at.timestamp()):
-                    continue
-                event_id = event.get("eventId")
-                if type(event_id) is not int or event_id <= 0:
-                    raise PortalError("unexpected-visit-history", stage="visit-history")
-                assigned = event.get("assignedFromReservationId")
-                latest = CompletedVisit(starts, *timeline_visit_summary(event, kind), event_id, kind,
-                                        assigned if type(assigned) in (bool, int) else None)
-            if latest is not None or page["isEndOfList"]:
+            latest = latest_completed_in(events, cutoff, latest)
+            if page["isEndOfList"]:
                 return latest
             if not events:
                 raise PortalError("unexpected-visit-history", stage="visit-history")
             cursor = timeline_visit_date(events[-1].get("date"), stage="visit-history")
+            if latest is not None and cursor.timestamp() <= latest.starts_at.timestamp():
+                return latest
             if before is not None and cursor.timestamp() >= before.timestamp():
                 raise PortalError("unexpected-visit-history", stage="visit-history")
             before = cursor
@@ -915,6 +904,29 @@ def timeline_visit_summary(event: dict, kind: int) -> tuple[str, str, str, str]:
         visit_label(doctor.get("name"), 100) if isinstance(doctor, dict) else "",
         mode,
     )
+
+
+def latest_completed_in(events: list, cutoff: float, latest: CompletedVisit | None = None) -> CompletedVisit | None:
+    for event in events:
+        if not isinstance(event, dict) or type(event.get("eventType")) is not int:
+            raise PortalError("unexpected-visit-history", stage="visit-history")
+        kind = event["eventType"]
+        if kind not in CONSULTATION_TYPES:
+            continue
+        if type(event.get("status")) is not int:
+            raise PortalError("unexpected-visit-history", stage="visit-history")
+        if event["status"] != COMPLETED_VISIT_STATUS:
+            continue
+        starts = timeline_visit_date(event.get("date"), stage="visit-history")
+        if starts.timestamp() > cutoff or (latest and starts.timestamp() <= latest.starts_at.timestamp()):
+            continue
+        event_id = event.get("eventId")
+        if type(event_id) is not int or event_id <= 0:
+            raise PortalError("unexpected-visit-history", stage="visit-history")
+        assigned = event.get("assignedFromReservationId")
+        latest = CompletedVisit(starts, *timeline_visit_summary(event, kind), event_id, kind,
+                                assigned if type(assigned) in (bool, int) else None)
+    return latest
 
 
 def package_item_labels(item: Any) -> Iterable[str]:

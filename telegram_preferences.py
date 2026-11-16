@@ -11,7 +11,8 @@ TIME = r"[0-9]{1,2}(?::[0-9]{2})?(?:\s*(?:am|pm))?"
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 WEEKDAY_TYPOS = {"monay": "monday"}
 WEEKDAY = r"(?:" + "|".join((*WEEKDAYS, *WEEKDAY_TYPOS)) + ")"
-WEEKDAY_DATE = rf"(?:next\s+)?{WEEKDAY}"
+RELATIVE_WEEKDAY = r"(?:next|comm?ing)"
+WEEKDAY_DATE = rf"(?:{RELATIVE_WEEKDAY}\s+)?{WEEKDAY}"
 DATE = (
     rf"(?:today|tomorrow|this week|next week|(?:on\s+)?"
     rf"(?:[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}|{WEEKDAY_DATE}(?:\s+or\s+(?:on\s+)?{WEEKDAY_DATE})*))"
@@ -93,7 +94,7 @@ def clock_minutes(value: str) -> int:
 
 def date_range(value: str, today: dt.date) -> tuple[str, str]:
     day = " ".join(value.casefold().split()).removeprefix("on ")
-    weekday = day.removeprefix("next ")
+    weekday, repeat_next_week = re.subn(rf"^{RELATIVE_WEEKDAY} ", "", day)
     weekday = WEEKDAY_TYPOS.get(weekday, weekday)
     if day in ("this week", "next week"):
         monday = today - dt.timedelta(days=today.weekday())
@@ -106,7 +107,7 @@ def date_range(value: str, today: dt.date) -> tuple[str, str]:
         date = today + dt.timedelta(days=1)
     elif weekday in WEEKDAYS:
         offset = (WEEKDAYS.index(weekday) - today.weekday()) % 7
-        date = today + dt.timedelta(days=offset or (7 if day.startswith("next ") else 0))
+        date = today + dt.timedelta(days=offset or (7 if repeat_next_week else 0))
     else:
         try:
             date = dt.date.fromisoformat(day)

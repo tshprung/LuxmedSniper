@@ -121,6 +121,7 @@ def redacted_request(text: str, aliases: dict, cities: dict):
 
     redacted = re.sub(rf"(?<!\w)(?:{known})(?!\w)", replace_term, clean(text))
     redacted = re.sub(rf"\b{WEEKDAY}\b", lambda match: WEEKDAY_TYPOS.get(match[0], match[0]), redacted)
+    redacted = re.sub(rf"\bcomming(?= {WEEKDAY}\b)", "coming", redacted)
     if not matches["PERSON"] and aliases.get("me") and re.search(r"\b(?:i|me|myself)\b", redacted):
         matches["PERSON"].add(aliases["me"])
     # A generic pediatrician mention can accompany one specific visit type.
