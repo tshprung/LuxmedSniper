@@ -504,6 +504,57 @@ class BotTests(unittest.TestCase):
             client.reserve_standard_visit.assert_called_once()
             self.assertIn("Already booked", self.state.next_message()["text"])
 
+    def test_late_approval_resumes_the_original_search_once_at_next_opening(self):
+        self.now = local_timestamp(30, 21)
+        self.update(1, "/find Child | routine visit | Wrocław | tomorrow, clinic Test Center")
+        client = MagicMock()
+        client.resolve_service.return_value = 12
+        client.is_booking_blocked_by_penalty.return_value = client.has_booking_conflict.return_value = False
+        starts = dt.datetime.fromtimestamp(local_timestamp(31, 6), WARSAW)
+        selected = Appointment(starts, 2, "Test Center", "First fixture", 12, doctor_id=9,
+                               booking_term={"cityId": 5, "end": starts + dt.timedelta(minutes=15)})
+        other = Appointment(starts + dt.timedelta(hours=3), 2, "Test Center", "Second fixture", 12, doctor_id=10)
+        client.search.return_value = [selected, other]
+        with patch.object(self.bot, "portal_for", return_value=client):
+            self.bot.search_due()
+            self.bot.flush()
+            original = self.state.criteria(self.state.results())
+            self.update(2, "Book 1")
+            self.bot.flush()
+            self.bot.booking_due()
+            self.assertIn("Approve by 31.03 05:00 Warsaw time", self.state.next_message()["text"])
+            self.bot.flush()
+            self.now = local_timestamp(31, 5)
+            self.update(3, "Approve 1")
+            self.assertIn("Approval 1 has expired", self.state.next_message()["text"])
+            self.bot.booking_due()
+            self.update(4, "Approve 1")
+            followup, = self.state.active()
+            self.assertEqual(self.state.criteria(followup), original)
+            self.assertEqual(followup["next_due"], local_timestamp(31, 6))
+            self.assertEqual([slot["doctor_id"] for slot in json.loads(followup["excluded_slots"])], [9])
+            self.assertTrue(self.state.booking_approval_expired(1))
+            client.reserve_standard_visit.assert_not_called()
+
+    def test_unanswered_approval_does_not_restart_when_the_search_has_a_booking(self):
+        self.update(1, "/find Child | routine visit")
+        start = self.now + 2 * 3600
+        with self.state.db:
+            self.state.finish(1, "found")
+            self.state.save_results(1, [
+                {"start": start, "doctor": "Fixture A", "clinic": "Test clinic"},
+                {"start": start + 1800, "doctor": "Fixture B", "clinic": "Test clinic"},
+            ])
+            first = self.state.request_booking(1, 1, "patient2", json.dumps([start, 2, 9, 12]))
+            second = self.state.request_booking(1, 2, "patient2", json.dumps([start + 1800, 2, 10, 12]))
+            self.state.booking_status(first["id"], "approval", reason="Fixture approval")
+            self.state.booking_status(second["id"], "booked")
+        self.now = start - 3600
+        self.bot.booking_due()
+        self.assertTrue(self.state.booking_approval_expired(first["id"]))
+        self.assertEqual(self.state.active(), [])
+        self.assertEqual(self.state.results(1)["status"], "found")
+
     def test_additional_allergy_slot_is_identified_and_regular_slot_is_listed_first(self):
         self.update(1, "Find allergist for me")
         self.bot.flush()

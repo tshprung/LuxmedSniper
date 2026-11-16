@@ -10,6 +10,9 @@ from luxmed_sniper import WARSAW
 from telegram_requests import Criteria, Preferences
 
 
+BOOKING_APPROVAL_EXPIRED = "approval-expired"
+
+
 def next_search_time(timestamp: int) -> int:
     local = dt.datetime.fromtimestamp(timestamp, WARSAW)
     if dt.time(6) <= local.time() < dt.time(22, 1):
@@ -190,6 +193,39 @@ class SearchState:
                 WHERE id = ? AND status = 'approval' AND patient IN ({eligible})""",
             (booking_id, *patients),
         ).rowcount == 1
+
+    def due_booking_approvals(self, starts_by: int) -> list[sqlite3.Row]:
+        return self.db.execute(
+            """SELECT * FROM booking_requests WHERE status = 'approval'
+               AND CASE WHEN json_valid(slot_key) THEN json_extract(slot_key, '$[0]') END <= ?
+               ORDER BY id""",
+            (starts_by,),
+        ).fetchall()
+
+    def expire_booking_approval(self, booking_id: int, status: str) -> bool:
+        return self.db.execute(
+            """UPDATE booking_requests SET status = 'ended', reason = ?
+               WHERE id = ? AND status = ?""",
+            (BOOKING_APPROVAL_EXPIRED, booking_id, status),
+        ).rowcount == 1
+
+    def booking_approval_expired(self, booking_id: int) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM booking_requests WHERE id = ? AND status = 'ended' AND reason = ?",
+            (booking_id, BOOKING_APPROVAL_EXPIRED),
+        ).fetchone() is not None
+
+    def expired_booking_options(self, search_id: int) -> set[int]:
+        return {row[0] for row in self.db.execute(
+            "SELECT option_number FROM booking_requests WHERE search_id = ? AND status = 'ended' AND reason = ?",
+            (search_id, BOOKING_APPROVAL_EXPIRED),
+        )}
+
+    def search_has_live_booking(self, search_id: int) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM booking_requests WHERE search_id = ? AND status NOT IN ('ended', 'stopped') LIMIT 1",
+            (search_id,),
+        ).fetchone() is not None
 
     def claim_booking(self, patients: frozenset[str]):
         eligible = ", ".join("?" for _ in patients)
