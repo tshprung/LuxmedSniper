@@ -118,6 +118,12 @@ class ScheduledVisit:
     cancellation_instance: int | None = None
 
 
+@dataclass(frozen=True)
+class CancellationTerms:
+    late_hours: float | None = None
+    no_show: bool = False
+
+
 class Luxmed(BaseModel):
     password: str
     login: str | None = None
@@ -490,14 +496,22 @@ class LuxMedPortal:
             ))
         return sorted(visits, key=lambda visit: visit.starts_at.timestamp())
 
-    def cancellation_is_late(self, visit: ScheduledVisit) -> bool:
+    def cancellation_terms(self, visit: ScheduledVisit) -> CancellationTerms:
         result = self._portal_json(
             "GET", f"{self.VISITS_URL}/isLateCancellation",
             params={"reservationId": str(visit.event_id)}, stage="cancellation-eligibility",
         )
-        if not isinstance(result, dict) or type(result.get("isLate")) is not bool:
+        if (not isinstance(result, dict) or type(result.get("isLate")) is not bool
+                or result.keys() - {"isLate", "parameters", "allowNonShowProcess"}):
             raise PortalError("cancellation-eligibility-unverified", stage="cancellation-eligibility")
-        return result["isLate"]
+        if not result["isLate"]:
+            return CancellationTerms()
+        parameters = result.get("parameters")
+        hours = parameters.get("hours") if isinstance(parameters, dict) else None
+        no_show = result.get("allowNonShowProcess")
+        if type(hours) not in (int, float) or not 0 < hours < sys.float_info.max or type(no_show) is not bool:
+            raise PortalError("cancellation-eligibility-unverified", stage="cancellation-eligibility")
+        return CancellationTerms(hours, no_show)
 
     def cancel_standard_visit(self, visit: ScheduledVisit) -> None:
         if visit.cancellation_instance is None or visit.event_type not in (1, 7) or visit.event_id is None:

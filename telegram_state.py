@@ -60,6 +60,7 @@ class SearchState:
             CREATE TABLE IF NOT EXISTS cancellation_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, patient TEXT NOT NULL, reservation_id INTEGER NOT NULL,
                 event_type INTEGER NOT NULL, starts_at INTEGER NOT NULL, signature TEXT NOT NULL,
+                late_hours REAL, no_show INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'queued', UNIQUE (patient, reservation_id, event_type)
             );
             CREATE TABLE IF NOT EXISTS calendar_sync (
@@ -79,6 +80,11 @@ class SearchState:
                 self.db.execute("ALTER TABLE calendar_sync ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
             if "removal" not in calendar_columns:
                 self.db.execute("ALTER TABLE calendar_sync ADD COLUMN removal TEXT NOT NULL DEFAULT 'none'")
+            cancellation_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(cancellation_requests)")}
+            if "late_hours" not in cancellation_columns:
+                self.db.execute("ALTER TABLE cancellation_requests ADD COLUMN late_hours REAL")
+            if "no_show" not in cancellation_columns:
+                self.db.execute("ALTER TABLE cancellation_requests ADD COLUMN no_show INTEGER NOT NULL DEFAULT 0")
             outbox_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(outbox)")}
             if "buttons" not in outbox_columns:
                 self.db.execute("ALTER TABLE outbox ADD COLUMN buttons TEXT")
@@ -257,14 +263,15 @@ class SearchState:
         ).fetchall()
 
     def queue_cancellation(self, patient: str, reservation_id: int, event_type: int,
-                           starts_at: int, signature: str) -> bool:
+                           starts_at: int, signature: str, *, late_hours: float | None = None, no_show: bool = False) -> bool:
         return self.db.execute(
-            """INSERT INTO cancellation_requests (patient, reservation_id, event_type, starts_at, signature)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO cancellation_requests (patient, reservation_id, event_type, starts_at, signature, late_hours, no_show)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (patient, reservation_id, event_type) DO UPDATE
-               SET starts_at = excluded.starts_at, signature = excluded.signature, status = 'queued'
+               SET starts_at = excluded.starts_at, signature = excluded.signature,
+                   late_hours = excluded.late_hours, no_show = excluded.no_show, status = 'queued'
                WHERE cancellation_requests.status = 'blocked'""",
-            (patient, reservation_id, event_type, starts_at, signature),
+            (patient, reservation_id, event_type, starts_at, signature, late_hours, int(no_show)),
         ).rowcount == 1
 
     def claim_cancellation(self) -> sqlite3.Row | None:
