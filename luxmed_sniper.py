@@ -524,8 +524,8 @@ class LuxMedPortal:
     def check_booking_eligibility(self, city_id: int, service_variant_id: int) -> None:
         """Check the normal portal prerequisites for a visit without a referral."""
         self.check_booking_requirements(service_variant_id)
-        if self.booking_questionnaire(city_id, service_variant_id) is not None:
-            raise PortalError("portal-questions", stage="questionnaire")
+        if (form := self.booking_questionnaire(city_id, service_variant_id)) is not None:
+            raise BookingQuestionnaireRequired(form)
         self.check_booking_coverage(city_id, service_variant_id)
 
     def check_booking_requirements(self, service_variant_id: int) -> None:
@@ -961,6 +961,12 @@ class PortalError(LuxmedSniperError):
         self.suspend = suspend
         self.stage = stage
         self.http_status = http_status
+
+
+class BookingQuestionnaireRequired(PortalError):
+    def __init__(self, form: dict):
+        super().__init__("portal-questions", stage="questionnaire")
+        self.form = form
 
 
 def setup_logging() -> None:

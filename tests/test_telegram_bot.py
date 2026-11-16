@@ -10,7 +10,7 @@ import requests
 from nacl.public import PrivateKey, SealedBox
 
 from luxmed_questionnaire import Questionnaire, QuestionnaireError
-from luxmed_sniper import WARSAW, Appointment, LuxMedPortal, Luxmed, PortalError, ScheduledVisit
+from luxmed_sniper import WARSAW, Appointment, BookingQuestionnaireRequired, LuxMedPortal, Luxmed, PortalError, ScheduledVisit
 from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import SECRET_KEYS, booking_patients, package_settings, trusted_devices
@@ -421,7 +421,7 @@ class BotTests(unittest.TestCase):
             ]
             self.bot.search_due()
         listing = self.state.next_message()["text"]
-        self.assertIn("1. 31.03 10:00 · Fixture clinic\n", listing)
+        self.assertIn("1. 31.03 10:00 · Fixture clinic · Patient Portal\n", listing)
         self.assertNotIn("None", listing)
         self.bot.flush()
         self.update(2, "Details 1")
@@ -804,7 +804,7 @@ class BotTests(unittest.TestCase):
         self.update(2, "Book 1")
         self.bot.booking_due()
         self.bot.flush()
-        first = self.bot.allergy_booking.message_id
+        first = self.bot.questionnaire_booking.message_id
         self.assertIn("Fixture information", self.telegram.send.call_args.args[0])
         self.assertIn(("1. Option A", "answer 1"), self.telegram.send.call_args.kwargs["buttons"][0])
         self.update(3, "Approve 1")
@@ -812,15 +812,15 @@ class BotTests(unittest.TestCase):
         client.reserve_standard_visit.assert_not_called()
         self.tap(4, "answer 1", first)
         self.bot.flush()
-        second = self.bot.allergy_booking.message_id
+        second = self.bot.questionnaire_booking.message_id
         self.assertNotEqual(first, second)
         self.tap(5, "stop questionnaire", first)
-        self.assertEqual(self.bot.allergy_booking.message_id, second)
+        self.assertEqual(self.bot.questionnaire_booking.message_id, second)
         self.assertIn("button has expired", self.state.next_message()["text"])
         self.bot.flush()
         self.tap(6, "options", 41)
         self.assertIn("Available slots", self.state.next_message()["text"])
-        self.assertEqual(self.bot.allergy_booking.message_id, second)
+        self.assertEqual(self.bot.questionnaire_booking.message_id, second)
         self.update(7, "1", reply_to=first)
         self.update(8, "1", reply_to=second, sender=200, chat_id=200)
         self.bot.booking_due()
@@ -844,7 +844,44 @@ class BotTests(unittest.TestCase):
             slot, "Konsultacja alergologiczna", questionnaire=receipt,
         )
         self.assertEqual(client.submit_booking_questionnaire.call_count, 1)
-        self.assertIsNone(self.bot.allergy_booking)
+        self.assertIsNone(self.bot.questionnaire_booking)
+
+    def test_in_person_internist_questionnaire_rechecks_and_requires_approval(self):
+        client = MagicMock()
+        self.bot.portals["patient1"] = (self.now + 900, client)
+        client.resolve_service.return_value = client.resolve_in_person_service.return_value = 12
+        client.is_booking_blocked_by_penalty.return_value = client.has_booking_conflict.return_value = False
+        client.reserve_standard_visit.return_value = 246
+        client.booked_visit_ids.return_value = {246}
+        start = dt.datetime.fromtimestamp(self.now + 8 * 3600, WARSAW)
+        slot = Appointment(start, 2, "Fixture clinic", "Fixture doctor", 12, doctor_id=9,
+                           booking_term={"cityId": 5, "end": start + dt.timedelta(minutes=15)})
+        client.search.return_value = [slot]
+        client.check_booking_eligibility.side_effect = BookingQuestionnaireRequired({
+            "id": "fixture-form", "inputService": {"servaId": 12},
+            "questions": [{"id": "start", "questionType": 1, "name": "Fixture question",
+                           "answers": [{"id": "chosen", "order": 1, "name": "Option A",
+                                        "triageResult": {"discriminator": "ServiceVariantResultDto", "servaId": 12}}]}],
+        })
+        self.update(1, "Find an internist for Adult")
+        self.bot.search_due()
+        self.bot.flush()
+        self.update(2, "Book 1")
+        self.bot.booking_due()
+        self.bot.flush()
+        self.assertIn("Adult · Internista", self.telegram.send.call_args.args[0])
+        client.submit_booking_questionnaire.assert_not_called()
+        self.tap(3, "answer 1", self.bot.questionnaire_booking.message_id)
+        self.bot.booking_due()
+        receipt = client.search.call_args.kwargs["questionnaire"]
+        self.assertEqual(client.submit_booking_questionnaire.call_args.args[0]["selectedAnswers"], [{"id": "chosen"}])
+        client.reserve_standard_visit.assert_not_called()
+        self.assertIn("Please confirm this internist appointment", self.state.next_message()["text"])
+        self.update(4, "Approve 1")
+        self.bot.booking_due()
+        client.reserve_standard_visit.assert_called_once_with(slot, "Internista", questionnaire=receipt)
+        client.submit_booking_questionnaire.assert_called_once()
+        client.check_booking_eligibility.assert_called_once()
 
     def test_questionnaire_cannot_submit_an_alternate_service_outcome(self):
         form = Questionnaire({
@@ -1169,6 +1206,24 @@ class BotTests(unittest.TestCase):
         self.update(4, "/change 1 | pediatrician")
         row, = self.state.active()
         self.assertEqual((row["patient"], row["service"]), ("patient1", "Internista"))
+
+    def test_child_internist_suggests_pediatrics_and_pediatr_opens_the_same_menu(self):
+        self.update(1, "Find an internist for Other tomorrow after 16:00")
+        message = self.state.next_message()
+        self.assertIn("an internist is an adult service", message["text"])
+        self.assertIn("Which type of pediatric visit", message["text"])
+        self.assertEqual(self.state.active(), [])
+        first_choice = json.loads(message["buttons"])[0][0][1]
+        self.bot.flush()
+        self.tap(2, first_choice)
+        row, = self.state.active()
+        criteria = self.state.criteria(row)
+        self.assertEqual((criteria.patient, criteria.service), ("patient3", pediatric_choice("sick visit")))
+        self.assertEqual((criteria.preferences.first_date, criteria.preferences.start_minute), ("2030-03-31", 960))
+        self.bot.flush()
+        self.update(3, "Find pediatr for Other")
+        self.assertIn("Which type of pediatric visit", self.state.next_message()["text"])
+        self.assertEqual(len(self.state.active()), 1)
 
     def test_numbers_reset_when_queue_is_empty_and_old_replies_are_safe(self):
         self.update(1, "Find an internist for Adult")

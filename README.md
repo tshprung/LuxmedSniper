@@ -167,10 +167,10 @@ unclear, check the Patient Portal and reply `Reviewed 1` to allow new
 booking requests for that patient. The worker never retries an uncertain
 reservation.
 
-For `patient1` in-person allergy consultations, `Book <option>` can start
-the LUX MED questionnaire in Telegram. Reply directly to each question
-with an option number. The worker keeps answers in memory and sends the
-completed form to LUX MED on a path that returns the same service. It
+For `patient1` in-person allergist and internist visits, `Book <option>` can
+start the LUX MED questionnaire in Telegram. Tap an answer or reply directly
+to the question with an option number. The worker keeps answers in memory
+and sends the completed form to LUX MED on a path that returns the same service. It
 rechecks the exact slot and asks for approval before booking. Send
 `Stop questionnaire` to end the request. If the signed-in session expires,
 start with a fresh search.

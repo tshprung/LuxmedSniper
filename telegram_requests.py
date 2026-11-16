@@ -4,7 +4,7 @@ import datetime as dt
 import json
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from telegram_preferences import Preferences, contains_words, name_words, parse_preferences, split_preferences
@@ -90,7 +90,10 @@ GENERAL_SERVICES = {
     "blood draw": "Pobranie krwi",
     "fasting blood draw": "Pobranie krwi - i innych materiałów - na czczo",
 }
-PEDIATRIC_REQUESTS = {"pediatrician", "paediatrician", "pediatric consultation", "pediatric visit", "pediatra", "pediatre", "pediatry"}
+PEDIATRIC_REQUESTS = {
+    "pediatrician", "paediatrician", "pediatric consultation", "pediatric visit",
+    "pediatr", "pediatra", "pediatre", "pediatry",
+}
 PEDIATRIC_ALIASES = {
     "sick child": "sick visit",
     "sick kids": "sick visit",
@@ -149,9 +152,10 @@ class RequestError(ValueError):
 
 
 class PatientServiceMismatch(RequestError):
-    def __init__(self, patient: str, reason: str):
+    def __init__(self, patient: str, reason: str, *, pediatric_search: Criteria | None = None):
         super().__init__(reason)
         self.patient = patient
+        self.pediatric_search = pediatric_search
 
 
 class PatientChoiceNeeded(RequestError):
@@ -184,7 +188,8 @@ def phone_service(service: str) -> str:
     return service if requests_remote(service) else f"{service} - telefoniczna"
 
 
-def check_patient_service(patient: str, service: str, children: set[str]) -> None:
+def check_patient_service(criteria: Criteria, children: set[str]) -> None:
+    patient, service = criteria.patient, criteria.service
     key = normalize(service)
     if patient not in children and (
         key in PEDIATRIC_REQUESTS or pediatric_choice(service, allow_number=False)
@@ -192,7 +197,10 @@ def check_patient_service(patient: str, service: str, children: set[str]) -> Non
     ):
         raise PatientServiceMismatch(patient, "is configured as an adult, and pediatrics is for children.")
     if patient in children and re.match(r"^(?:internista|konsultacja internisty|konsultacja internistyczna)\b", key):
-        raise PatientServiceMismatch(patient, "is configured as a child, and an internist is an adult service.")
+        raise PatientServiceMismatch(
+            patient, "is configured as a child, and an internist is an adult service.",
+            pediatric_search=replace(criteria, service="", telephone=False),
+        )
 
 
 def matching_catalog_variants(service: str, variants, *, telephone: bool) -> list[dict]:
@@ -322,16 +330,17 @@ def parse_search(text: str, aliases: dict[str, str], children: set[str], cities:
                 service = phone_service(service)
     if phone_after_patient and selected is None and key not in GENERAL_REQUESTS | PEDIATRIC_REQUESTS:
         service = phone_service(service)
-    check_patient_service(patient, selected or service, children)
+    service = selected or service
+    criteria = Criteria(patient, service, city_id, city_name, requests_remote(service), preferences)
+    check_patient_service(criteria, children)
     if key in PEDIATRIC_REQUESTS or (patient in children and key in GENERAL_REQUESTS):
         return Criteria(patient, "", city_id, city_name, preferences=preferences)
     if key in GENERAL_REQUESTS:
         raise ServiceChoiceNeeded(Criteria(patient, "", city_id, city_name, phone_after_patient, preferences))
     if selected:
-        return Criteria(patient, selected, city_id, city_name, requests_remote(selected), preferences)
+        return criteria
     if len(service) > 130 or not service.strip():
         raise RequestError("Use a service name from the portal.")
-    criteria = Criteria(patient, service, city_id, city_name, requests_remote(service), preferences)
     if choose_mode and not criteria.telephone:
         raise VisitModeChoiceNeeded(criteria)
     return criteria
