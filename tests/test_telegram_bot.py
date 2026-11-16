@@ -48,12 +48,12 @@ class CalendarTests(unittest.TestCase):
             existing = get.return_value.__enter__.return_value
             existing.status_code = 200
             existing.json.return_value = {"id": key, "status": "confirmed"}
-            calendar.add_booking("primary", key, start, end)
+            calendar.add_booking("primary", key, start, end, patient_name="Fixture patient")
             existing.json.return_value = {"id": key, "status": "cancelled"}
             with self.assertRaises(CalendarUnavailable):
-                calendar.add_booking("primary", key, start, end)
+                calendar.add_booking("primary", key, start, end, patient_name="Fixture patient")
         self.assertEqual(insert.call_args.kwargs["json"], {
-            "id": key, "summary": "Appointment", "visibility": "private",
+            "id": key, "summary": "Fixture patient · Appointment", "visibility": "private",
             "start": {"dateTime": start.isoformat()}, "end": {"dateTime": end.isoformat()},
         })
         self.assertTrue(get.call_args.args[0].endswith(f"/calendars/primary/events/{key}"))
@@ -72,12 +72,12 @@ class CalendarTests(unittest.TestCase):
             for telephone in (False, True):
                 with self.subTest(telephone=telephone):
                     calendar.add_booking(
-                        "primary", "fixture123", start, end, service="Fixture service",
+                        "primary", "fixture123", start, end, patient_name="Fixture patient", service="Fixture service",
                         clinic="Fixture clinic", clinician="Dr. A & B", telephone=telephone,
                     )
                     payload = insert.call_args.kwargs["json"]
                     self.assertEqual(payload, {
-                        "id": "fixture123", "summary": "Fixture service — LUX MED",
+                        "id": "fixture123", "summary": "Fixture patient · Fixture service — LUX MED",
                         "visibility": "private",
                         "start": {"dateTime": start.isoformat()}, "end": {"dateTime": end.isoformat()},
                         "description": "Telephone consultation<br>Dr. A &amp; B" if telephone else "Dr. A &amp; B",
@@ -201,22 +201,93 @@ class BotTests(unittest.TestCase):
             self.update(2, "Cancel 2")
             self.assertIn("Appointment 2 for Adult", self.state.next_message()["text"])
             self.assertIn("Second fixture visit", self.state.next_message()["text"])
+            self.assertIn("Are you sure", self.state.next_message()["text"])
+            proceed = json.loads(self.state.next_message()["buttons"])[0][0][1]
+            self.bot.flush()
+            self.tap(3, proceed, 41)
             self.assertIn("Odwołaj", self.state.next_message()["text"])
             self.bot.flush()
-            self.update(3, "/appointments Child")
+            self.update(4, "/appointments Child")
             child_button = json.loads(self.state.next_message()["buttons"])[0][0][1]
             self.bot.flush()
-            self.tap(4, child_button, 42)
+            self.tap(5, child_button, 43)
             self.assertIn("Child fixture visit", self.state.next_message()["text"])
             self.bot.flush()
-            self.tap(5, original_buttons[0][0][1], 40)
+            self.tap(6, original_buttons[0][0][1], 40)
             self.assertIn("get the current visit numbers", self.state.next_message()["text"])
             self.bot.flush()
-            self.update(6, "Cancel 1")
+            self.update(7, "Cancel 1")
             self.assertIn("Child fixture visit", self.state.next_message()["text"])
             self.assertEqual(portal_for.call_count, 2)
             for patient in ("patient1", "patient2"):
                 self.assertEqual([call[0] for call in clients[patient].method_calls], ["scheduled_visits"])
+
+    def test_direct_cancellation_requires_confirming_the_exact_displayed_visit(self):
+        self.telegram.send.side_effect = iter(range(40, 100))
+        starts = dt.datetime(2030, 4, 1, 13, tzinfo=WARSAW)
+        visit = ScheduledVisit(starts, "Fixture service", "Fixture clinic", "Fixture clinician", "",
+                               event_id=81, event_type=1, cancellation_instance=82)
+        client = MagicMock()
+        client.scheduled_visits.side_effect = [[visit], [visit], []]
+        client.cancellation_is_late.return_value = False
+        with patch.object(self.bot, "portal_for", return_value=client):
+            self.update(1, "/appointments Adult")
+            self.bot.flush()
+            self.update(2, "Cancel 1")
+            message = self.state.next_message()
+            self.assertIn("Appointment 1 for Adult", message["text"])
+            self.assertIn("01 Apr 2030, 13:00 · Fixture service", message["text"])
+            self.assertIn("Fixture clinic · Fixture clinician", message["text"])
+            self.assertIn("Are you sure", message["text"])
+            confirm, keep = json.loads(message["buttons"])[0]
+            self.bot.flush()
+            self.bot.cancellation_due()
+            client.cancel_standard_visit.assert_not_called()
+            self.tap(3, keep[1], 41)
+            self.assertIn("Appointment kept", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(4, "Cancel 1")
+            self.bot.flush()
+            self.tap(5, confirm[1], 41)
+            self.update(6, "Confirm cancellation", reply_to=43)
+            client.cancel_standard_visit.assert_not_called()
+            self.bot.flush()
+            self.bot.cancellation_due()
+            self.assertIn("Cancelled and verified in LUX MED", self.state.next_message()["text"])
+            self.bot.cancellation_due()
+            client.cancel_standard_visit.assert_called_once_with(visit)
+            self.assertEqual(client.cancellation_is_late.call_count, 3)
+
+    def test_confirmed_cancellation_stops_if_provider_conditions_change(self):
+        starts = dt.datetime(2030, 4, 1, 13, tzinfo=WARSAW)
+        visit = ScheduledVisit(starts, "Fixture service", "Fixture clinic", "", "",
+                               event_id=91, event_type=1, cancellation_instance=92)
+        client = MagicMock()
+        client.scheduled_visits.return_value = [visit]
+        client.cancellation_is_late.side_effect = [False, True]
+        with patch.object(self.bot, "portal_for", return_value=client):
+            self.update(1, "/appointments Adult")
+            self.bot.flush()
+            self.update(2, "Cancel 1")
+            self.bot.flush()
+            self.update(3, "Confirm cancellation", reply_to=42)
+            self.bot.flush()
+            self.bot.cancellation_due()
+            self.assertIn("flags this as a late cancellation", self.state.next_message()["text"])
+            client.cancel_standard_visit.assert_not_called()
+
+    def test_interrupted_cancellation_is_never_resubmitted(self):
+        with self.state.db:
+            self.state.queue_cancellation("patient1", 981, 1, self.now + 7200, "fixture")
+            request = self.state.claim_cancellation()
+            self.state.cancellation_status(request["id"], "submitting")
+        with patch.object(self.bot, "portal_for") as portal_for:
+            self.bot.recover_cancellations()
+            self.assertIn("I couldn’t verify the cancellation", self.state.next_message()["text"])
+            self.bot.cancellation_due()
+            portal_for.assert_not_called()
+        with self.state.db:
+            self.assertFalse(self.state.queue_cancellation("patient1", 981, 1, self.now + 7200, "fixture"))
 
     def test_appointments_respect_an_account_pause_even_before_first_search(self):
         with patch.object(self.bot, "portal_for", side_effect=PortalError("access-denied", suspend=True, stage="login")) as portal:
@@ -687,6 +758,7 @@ class BotTests(unittest.TestCase):
             self.assertEqual(retry.args[0], "primary")
             self.assertEqual(retry.args[2], start)
             self.assertEqual(retry.kwargs, {
+                "patient_name": "Adult",
                 "service": "Internista", "clinic": "Fixture clinic", "clinician": "Fixture doctor",
                 "telephone": False,
             })

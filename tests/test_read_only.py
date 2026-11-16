@@ -185,6 +185,31 @@ class SearchTests(unittest.TestCase):
         self.assertEqual((later.clinic, later.clinician), ("Fixture clinic", "Fixture doctor"))
         self.assertNotIn("fixture private data", repr(later))
 
+    def test_cancellation_uses_the_timeline_action_and_exact_reservation(self):
+        visit = {
+            "eventType": 1, "status": 2, "eventId": 41, "serviceInstanceId": 72,
+            "date": "2030-04-01T13:00:00+02:00", "title": "Fixture visit",
+            "actions": [1, 2], "paymentState": 5,
+        }
+        with patch.object(requests.Session, "request", side_effect=[
+            response({"token": "fixture-token"}), response({"events": [
+                visit, {**visit, "eventId": 42, "paymentState": 1},
+            ]}), response({"isLate": False, "allowNonShowProcess": False}),
+            response({"token": "fixture-request-token"}), response({"isSuccess": True}),
+        ]) as request:
+            portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
+            with portal.session:
+                selected, paid = portal.scheduled_visits(NOW)
+                self.assertIsNone(paid.cancellation_instance)
+                self.assertFalse(portal.cancellation_is_late(selected))
+                portal.cancel_standard_visit(selected)
+        eligibility, _, cancellation = request.call_args_list[-3:]
+        self.assertEqual(eligibility.args, ("GET", f"{LuxMedPortal.VISITS_URL}/isLateCancellation"))
+        self.assertEqual(eligibility.kwargs["params"], {"reservationId": "41"})
+        self.assertEqual(cancellation.args, ("POST", f"{LuxMedPortal.VISITS_URL}/cancelVisit"))
+        self.assertEqual(cancellation.kwargs["json"], {"reservationId": 41, "serviceInstanceId": 72})
+        self.assertEqual(cancellation.kwargs["headers"]["XSRF-TOKEN"], "fixture-request-token")
+
     def test_booking_holds_and_confirms_the_exact_covered_slot(self):
         locator = DoctorLocator(id="5*30*-1*-1")
         term = dict(slot("2030-04-01T10:00:00+02:00"), cityId=5, city="Fixture city",

@@ -113,6 +113,9 @@ class ScheduledVisit:
     clinic: str
     clinician: str
     mode: str
+    event_id: int | None = None
+    event_type: int = 0
+    cancellation_instance: int | None = None
 
 
 class Luxmed(BaseModel):
@@ -161,6 +164,7 @@ class LuxMedPortal:
     DICTIONARY_FACILITIES_AND_DOCTORS = f'{DICTIONARY_URL}/facilitiesAndDoctors'
     UPCOMING_VISITS_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/DashboardMedicalSection/GetUpcomingVisits'
     SCHEDULED_VISITS_URL = f"{NEW_PORTAL_URL}/Timeline/GetStartEvents"
+    VISITS_URL = f"{NEW_PORTAL_URL}/Visits"
     NON_SHOW_PENALTIES_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Reservation/CheckUserNonShowPenalties'
 
     def __init__(self, credentials: Luxmed, *, trusted_device: dict | None = None):
@@ -462,12 +466,51 @@ class LuxMedPortal:
             mode = SCHEDULED_VISIT_MODES[kind]
             clinic = event.get("externalClinic") or event.get("clinic")
             doctor = event.get("doctor")
+            service = visit_label(event.get("title"), 160)
+            instance_id = event.get("serviceInstanceId")
+            actions = event.get("actions")
+            # The timeline exposes CancelTerm (2) and paymentState None (5).
+            standard_cancellation = (
+                kind in (1, 7)
+                and bool(service)
+                and type(event_id) is int and event_id > 0
+                and type(instance_id) is int and instance_id >= 0
+                and isinstance(actions, list) and any(type(action) is int and action == 2 for action in actions)
+                and type(event.get("paymentState")) is int and event["paymentState"] == 5
+                and event.get("fromEreferral", False) is False and event.get("isOutsourced", False) is False
+                and event.get("slotId") in (None, 0)
+                and not any(event.get(key) is not None for key in ("clipId", "externalClinic"))
+            )
             visits.append(ScheduledVisit(
-                starts, visit_label(event.get("title"), 160) or "LUX MED appointment",
+                starts, service or "LUX MED appointment",
                 visit_label(clinic.get("name"), 100) if isinstance(clinic, dict) and not mode else "",
                 visit_label(doctor.get("name"), 100) if isinstance(doctor, dict) else "", mode,
+                event_id if type(event_id) is int and event_id > 0 else None, kind,
+                instance_id if standard_cancellation else None,
             ))
         return sorted(visits, key=lambda visit: visit.starts_at.timestamp())
+
+    def cancellation_is_late(self, visit: ScheduledVisit) -> bool:
+        result = self._portal_json(
+            "GET", f"{self.VISITS_URL}/isLateCancellation",
+            params={"reservationId": str(visit.event_id)}, stage="cancellation-eligibility",
+        )
+        if not isinstance(result, dict) or type(result.get("isLate")) is not bool:
+            raise PortalError("cancellation-eligibility-unverified", stage="cancellation-eligibility")
+        return result["isLate"]
+
+    def cancel_standard_visit(self, visit: ScheduledVisit) -> None:
+        if visit.cancellation_instance is None or visit.event_type not in (1, 7) or visit.event_id is None:
+            raise PortalError("cancellation-refused", stage="cancellation")
+        response = self._portal_json(
+            "POST", f"{self.VISITS_URL}/cancelVisit", headers=self._booking_request_headers(),
+            json={"reservationId": visit.event_id, "serviceInstanceId": visit.cancellation_instance},
+            stage="cancellation",
+        )
+        if isinstance(response, dict) and response.get("isSuccess") is False:
+            raise PortalError("cancellation-refused", stage="cancellation")
+        if not isinstance(response, dict) or response.get("isSuccess") is not True:
+            raise PortalError("cancellation-outcome-unverified", stage="cancellation")
 
     def has_booking_conflict(self, start: datetime.datetime, end: datetime.datetime) -> bool:
         """Check overlaps against the upcoming events used on the portal search page."""
