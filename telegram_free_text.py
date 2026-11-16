@@ -257,4 +257,6 @@ class FreeText:
                 return None
             return json.loads(items[0])
         except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError):
-            raise RequestError("Free-text interpretation is unavailable. Try /find patient | service | city.") from None
+            raise RequestError(
+                "I had trouble understanding that. Could you say it another way?"
+            ) from None

@@ -41,6 +41,7 @@ CALENDAR_RETRY_SECONDS = 15 * 60
 PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
 APPOINTMENTS_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Timeline"
 COVERAGE_HELP = "Try “Is a cardiologist visit covered for me?” or /coverage patient | exact service name."
+WELCOME_MESSAGE = "LUX MED Personal Assistant\nHow may I help you today?"
 SICK_CHILD_SERVICES = {
     normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[index][2]) for index in (0, 1, 2)
 }
@@ -238,6 +239,7 @@ class SearchBot:
         self.device_credentials = device_credentials or {}
         self.portals: dict[str, tuple[float, LuxMedPortal]] = {}
         self.questionnaire_booking: QuestionnaireBooking | None = None
+        self.patient_question: str | None = None
         self.appointment_list: AppointmentList | None = None
         self.cancellation_review: CancellationReview | None = None
         self.cities = city_catalog()
@@ -283,6 +285,7 @@ class SearchBot:
     def handle_callback(self, action, message: dict) -> None:
         if not isinstance(action, str):
             return
+        self.patient_question = None
         if match := re.fullmatch(r"answer ([1-9][0-9]?)", action):
             self.answer_questionnaire(match[1], message.get("message_id"))
         elif match := re.fullmatch(r"cancel visit ([a-f0-9]{12}) ([1-9][0-9]{0,8})", action):
@@ -316,11 +319,19 @@ class SearchBot:
     def handle(self, message: dict) -> None:
         text = message["text"].strip()
         key = normalize(text)
+        conversational_key = key.rstrip("!.?")
         command, _, argument = key.partition(" ")
         reply = message.get("reply_to_message") or {}
         flow = self.questionnaire_booking
         answer = QUESTIONNAIRE_ANSWER.fullmatch(key)
-        if key in {"stop questionnaire", "/stop questionnaire", "cancel questionnaire"}:
+        patient_question, self.patient_question = self.patient_question, None
+        if command == "/start" or conversational_key in {"hi", "hello", "hey", "hi there", "hello there"}:
+            self.state.queue_message(WELCOME_MESSAGE)
+        elif command == "/help" or conversational_key == "help":
+            self.help()
+        elif conversational_key in {"thanks", "thank you", "thanks a lot"}:
+            self.state.queue_message("You’re welcome.")
+        elif key in {"stop questionnaire", "/stop questionnaire", "cancel questionnaire"}:
             self.stop_questionnaire()
         elif key in {"options", "/options", "give me options", "show me options", "show options"}:
             self.show_options(reply)
@@ -392,11 +403,15 @@ class SearchBot:
                                          buttons=[[("Active searches", "active")]])
         elif len(text) <= 600 and (coverage := coverage_request(text)) is not None:
             self.show_coverage(*coverage)
-        elif len(text) <= 600 and key not in {"/start", "/help", "help"}:
+        elif patient_question and not reply and (
+            patient := self.aliases.get(conversational_key.removeprefix("for ").removesuffix(" please").rstrip(","))
+        ):
+            self.choose_patient_button(patient, patient_question)
+        elif len(text) <= 600:
             if not self.handle_chat_text(text, reply):
                 self.handle_search(text)
         else:
-            self.help()
+            self.state.queue_message("Could you tell me in a few words what you’d like help with?")
 
     def handle_chat_text(self, text: str, reply: dict) -> bool:
         if self.free_text is None or text.startswith("/"):
@@ -734,7 +749,7 @@ class SearchBot:
             self.show_pediatric_menu(json.loads(pending))
         else:
             self.state.queue_message(
-                "What would you like to do?",
+                "I’m not sure I caught that. Could you say it another way or pick an option below?",
                 buttons=[[("Find a visit", "pick patient")],
                          [("Upcoming appointments", "pick visits"), ("Active searches", "active")]],
             )
@@ -762,7 +777,8 @@ class SearchBot:
         if "menu" not in choice:
             choice["menu"] = uuid.uuid4().hex[:12]
             self.state.set_setting("pending_patient", json.dumps(choice))
-        self.state.queue_message("Who is the appointment for?", buttons=[[
+        self.patient_question = choice["menu"]
+        self.state.queue_message("Who is the appointment for? You can type a name or tap one below.", buttons=[[
             (profile.name, f"patient {patient} {choice['menu']}") for patient, profile in self.profiles.items()
         ]])
 
