@@ -13,7 +13,7 @@ from pathlib import Path
 import requests
 
 from luxmed_questionnaire import Questionnaire, QuestionnaireError, QuestionnaireReceipt, visible_text
-from luxmed_sniper import WARSAW, DoctorLocator, Luxmed, LuxMedPortal, PortalError, service_variants
+from luxmed_sniper import WARSAW, BookingQuestionnaireRequired, DoctorLocator, Luxmed, LuxMedPortal, PortalError, service_variants
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_settings, trusted_devices, validate, worker_settings
 from telegram_free_text import FreeText
@@ -38,6 +38,7 @@ SICK_CHILD_SERVICES = {
 ALLERGY_SERVICES = {"alergolog", normalize(ALLERGY_SERVICE)}
 QUESTIONNAIRE_PROMPT = "LUX MED questionnaire"
 QUESTIONNAIRE_APPROVAL = "Please confirm this allergy appointment."
+INTERNIST_QUESTIONNAIRE_APPROVAL = "Please confirm this internist appointment."
 QUESTIONNAIRE_EXPIRED = "This questionnaire session has ended. Start a fresh search to try again."
 SUPPORTED_BOOKING_SERVICES = {"internista", normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[3][2])}
 QUESTIONNAIRE_NOTICE = "LUX MED requires a medical questionnaire for this visit. Complete it in the Patient Portal."
@@ -158,10 +159,12 @@ class Profile:
 
 
 @dataclass(repr=False)
-class AllergyBooking:
+class QuestionnaireBooking:
     booking_id: int
     search_id: int
     patient: str
+    service: str
+    approval_reason: str
     portal: LuxMedPortal
     expires_at: float
     form: Questionnaire | None
@@ -204,7 +207,7 @@ class SearchBot:
         )
         self.device_credentials = device_credentials or {}
         self.portals: dict[str, tuple[float, LuxMedPortal]] = {}
-        self.allergy_booking: AllergyBooking | None = None
+        self.questionnaire_booking: QuestionnaireBooking | None = None
         self.cities = city_catalog()
         self.children = {key for key, profile in profiles.items() if profile.child}
         self.aliases = {}
@@ -277,7 +280,7 @@ class SearchBot:
         key = normalize(text)
         command, _, argument = key.partition(" ")
         reply = message.get("reply_to_message") or {}
-        flow = self.allergy_booking
+        flow = self.questionnaire_booking
         if key in {"stop questionnaire", "/stop questionnaire", "cancel questionnaire"}:
             self.stop_questionnaire()
         elif key in {"options", "/options", "give me options", "show me options", "show options"}:
@@ -422,6 +425,7 @@ class SearchBot:
             fields = json.loads(pending)
             fields.pop("polish", None)  # Pending choices saved by the bilingual worker.
             fields.pop("menu", None)
+            fields.pop("explanation", None)
             fields["preferences"] = Preferences(**fields.get("preferences", {}))
             candidate = Criteria(**fields)
             if service := pediatric_choice(text):
@@ -446,9 +450,7 @@ class SearchBot:
             except RequestError as error:
                 error_message = str(error)
         if criteria and not criteria.service:
-            fields = {**asdict(criteria), "menu": uuid.uuid4().hex[:12]}
-            self.state.set_setting("pending", json.dumps(fields))
-            self.show_pediatric_menu(fields)
+            self.offer_pediatric_choices(criteria)
         elif criteria:
             self.state.set_setting("pending", "")
             self.start(criteria)
@@ -500,8 +502,11 @@ class SearchBot:
         if not menu:
             menu = fields["menu"] = uuid.uuid4().hex[:12]
             self.state.set_setting("pending", json.dumps(fields))
+        prompt = pediatric_menu(self.profiles[fields["patient"]].name)
+        if explanation := fields.get("explanation"):
+            prompt = f"{explanation}\n\n{prompt}"
         self.state.queue_message(
-            pediatric_menu(self.profiles[fields["patient"]].name),
+            prompt,
             buttons=[[(choice[0], f"pediatric {number} {menu}")]
                      for number, choice in enumerate(PEDIATRIC_SERVICES, 1)],
         )
@@ -513,10 +518,21 @@ class SearchBot:
             return
         self.handle_search(number)
 
-    def reject_mismatch(self, error: PatientServiceMismatch, search_id: int | None = None) -> None:
+    def offer_pediatric_choices(self, criteria: Criteria, *, explanation: str = "") -> None:
+        fields = {**asdict(criteria), "menu": uuid.uuid4().hex[:12], "explanation": explanation}
+        self.state.set_setting("pending_service", "")
+        self.state.set_setting("pending_patient", "")
+        self.state.set_setting("pending", json.dumps(fields))
+        self.show_pediatric_menu(fields)
+
+    def reject_mismatch(self, error: PatientServiceMismatch, search_id: int | None = None, *,
+                        offer_pediatrics: bool = True) -> None:
         if search_id is None:
             self.state.set_setting("pending", "")
         name = self.profiles[error.patient].name
+        if offer_pediatrics and error.pediatric_search is not None:
+            self.offer_pediatric_choices(error.pediatric_search, explanation=f"{name} {error}")
+            return
         self.state.queue_message(
             f"{name} {error} Please send a new request with the patient and service you intended.", search_id,
         )
@@ -585,8 +601,8 @@ class SearchBot:
         original = self.replied_search(reply)
         if original and self.state.results(original["id"]) is not None:
             self.show_results(original["id"], current=True)
-        elif self.allergy_booking is not None and self.allergy_booking.form is not None:
-            self.queue_question(self.allergy_booking)
+        elif self.questionnaire_booking is not None and self.questionnaire_booking.form is not None:
+            self.queue_question(self.questionnaire_booking)
         elif pending_patient := self.state.get_setting("pending_patient"):
             self.show_search_patient_choices(json.loads(pending_patient))
         elif pending_service := self.state.get_setting("pending_service"):
@@ -620,7 +636,8 @@ class SearchBot:
         notices = self.portal_notices(row["service"], [slot for _, slot in page])
         lines = [heading, *notices, "Available slots (Warsaw time)"]
         for number, slot in page:
-            suffix = " · Patient Portal" if slot.get("is_additional") is True else ""
+            portal_only = slot.get("is_additional") is True or slot.get("requires_preparation") is True
+            suffix = " · Patient Portal" if portal_only else ""
             lines.append(f"{number}. {self.slot_details(slot)}{suffix}")
         more = any(slot["start"] > now for slot in slots[max(row["shown"], page[-1][0]):])
         if more:
@@ -808,7 +825,7 @@ class SearchBot:
                 )
             criteria = replace(criteria, preferences=parse_preferences(filters, today, current.preferences))
         except PatientServiceMismatch as error:
-            self.reject_mismatch(error)
+            self.reject_mismatch(error, offer_pediatrics=False)
             return
         except (ServiceChoiceNeeded, VisitModeChoiceNeeded):
             self.state.queue_message("Choose a specific service and visit type for this search.")
@@ -880,8 +897,8 @@ class SearchBot:
     def stop(self, argument: str, reply: dict) -> None:
         if match := re.fullmatch(r"booking ([1-9][0-9]{0,8})", argument):
             stopped = self.state.stop_booking(int(match[1]))
-            if stopped and self.allergy_booking and self.allergy_booking.booking_id == int(match[1]):
-                self.allergy_booking = None
+            if stopped and self.questionnaire_booking and self.questionnaire_booking.booking_id == int(match[1]):
+                self.questionnaire_booking = None
             self.state.queue_message("Booking request stopped." if stopped else "There’s no pending booking with that number.")
             return
         row = self.replied_search(reply)
@@ -930,7 +947,7 @@ class SearchBot:
             else:
                 sent = self.telegram.send(message["text"])
             self.state.sent(message, sent)
-        flow = self.allergy_booking
+        flow = self.questionnaire_booking
         if flow is not None and flow.prompt is not None:
             choices = [
                 [(f"{number}. {visible_text(choice['name'])[:55]}", f"answer {number}")]
@@ -970,30 +987,30 @@ class SearchBot:
         for patient in tuple(self.portals):
             self.close_portal(patient)
 
-    def queue_question(self, flow: AllergyBooking) -> None:
+    def queue_question(self, flow: QuestionnaireBooking) -> None:
         question = flow.form.prompt()
         name = self.profiles[flow.patient].name
         flow.message_id = None
         flow.prompt = (
-            f"{QUESTIONNAIRE_PROMPT}\n{name} · {ALLERGY_SERVICE}\n\n{question}\n\n"
+            f"{QUESTIONNAIRE_PROMPT}\n{name} · {flow.service}\n\n{question}\n\n"
             "Tap an answer or reply directly with its number. I’ll send your choices to LUX MED when the form is complete. "
             "Send Stop questionnaire to end this request."
         )
 
     def stop_questionnaire(self, message: dict | None = None) -> None:
-        flow = self.allergy_booking
+        flow = self.questionnaire_booking
         if message is not None and (flow is None or flow.message_id is None
                                     or message.get("message_id") != flow.message_id):
             self.state.queue_message("That questionnaire button has expired.")
             return
         if flow is not None and self.state.stop_booking(flow.booking_id):
-            self.allergy_booking = None
+            self.questionnaire_booking = None
             self.state.queue_message("Questionnaire stopped.")
         else:
             self.state.queue_message("There’s no active questionnaire.")
 
     def answer_questionnaire(self, text: str, message_id: int | None) -> None:
-        flow = self.allergy_booking
+        flow = self.questionnaire_booking
         if flow is None or flow.expires_at <= self.clock():
             self.state.queue_message(QUESTIONNAIRE_EXPIRED)
             return
@@ -1015,7 +1032,7 @@ class SearchBot:
                     raise QuestionnaireError()
                 if info:
                     self.state.queue_message(f"LUX MED\n{info}", flow.search_id)
-                self.state.booking_status(flow.booking_id, "queued", reason=QUESTIONNAIRE_APPROVAL)
+                self.state.booking_status(flow.booking_id, "queued", reason=flow.approval_reason)
                 return
             result = flow.form.result
             service = visible_text(result.get("name"))[:160] if result.get("discriminator") == "ServiceVariantResultDto" else ""
@@ -1030,38 +1047,46 @@ class SearchBot:
         except QuestionnaireError:
             message = BOOKING_FAILURES["questionnaire-response-unrecognized"] + f"\n{PATIENT_PORTAL_URL}"
         self.state.booking_status(flow.booking_id, "ended")
-        self.allergy_booking = None
+        self.questionnaire_booking = None
         self.state.queue_message(message, flow.search_id)
 
-    def allergy_preflight(self, booking, criteria: Criteria, slot: dict, portal: LuxMedPortal) -> AllergyBooking:
-        flow = self.allergy_booking
+    def start_questionnaire(self, booking, criteria: Criteria, slot: dict, portal: LuxMedPortal,
+                            service: str, approval_reason: str, raw: dict | None) -> QuestionnaireBooking:
+        if self.questionnaire_booking is not None:
+            raise PortalError("questionnaire-open")
+        try:
+            form = Questionnaire(raw, slot["service_id"], criteria.city_id, self.clock()) if raw is not None else None
+            flow = QuestionnaireBooking(
+                booking["id"], booking["search_id"], criteria.patient, service, approval_reason, portal,
+                min(self.portals[criteria.patient][0], slot["start"]), form,
+            )
+            if form is not None:
+                self.queue_question(flow)
+                with self.state.db:
+                    self.state.booking_status(booking["id"], "questionnaire", reason=approval_reason)
+        except QuestionnaireError:
+            raise PortalError("questionnaire-response-unrecognized", stage="questionnaire") from None
+        self.questionnaire_booking = flow
+        return flow
+
+    def questionnaire_preflight(self, booking, criteria: Criteria, slot: dict, portal: LuxMedPortal,
+                                service: str, approval_reason: str) -> QuestionnaireBooking:
+        flow = self.questionnaire_booking
         service_id = slot["service_id"]
         if flow is not None and flow.booking_id != booking["id"]:
             raise PortalError("questionnaire-open")
         if flow is not None and (flow.portal is not portal or flow.expires_at <= self.clock()):
             raise PortalError("questionnaire-expired")
-        if flow is None and QUESTIONNAIRE_APPROVAL in (booking["reason"] or "").splitlines():
+        if flow is None and approval_reason in (booking["reason"] or "").splitlines():
             raise PortalError("questionnaire-expired")
-        variant = portal.resolve_in_person_service(ALLERGY_SERVICE)
+        variant = portal.resolve_in_person_service(service)
         if variant != service_id:
             raise PortalError("booking-details-missing")
         portal.check_booking_requirements(variant)
         if flow is None:
             raw = portal.booking_questionnaire(criteria.city_id, variant)
-            try:
-                form = Questionnaire(raw, variant, criteria.city_id, self.clock()) if raw is not None else None
-                flow = AllergyBooking(
-                    booking["id"], booking["search_id"], criteria.patient, portal,
-                    min(self.portals[criteria.patient][0], slot["start"]), form,
-                )
-                if form is not None:
-                    self.queue_question(flow)
-                    with self.state.db:
-                        self.state.booking_status(booking["id"], "questionnaire", reason=QUESTIONNAIRE_APPROVAL)
-            except QuestionnaireError:
-                raise PortalError("questionnaire-response-unrecognized", stage="questionnaire") from None
-            self.allergy_booking = flow
-            if form is not None:
+            flow = self.start_questionnaire(booking, criteria, slot, portal, service, approval_reason, raw)
+            if flow.form is not None:
                 return flow
         portal.check_booking_coverage(criteria.city_id, variant)
         if flow.form is not None:
@@ -1077,12 +1102,12 @@ class SearchBot:
 
     def booking_due(self) -> None:
         now = int(self.clock())
-        flow = self.allergy_booking
+        flow = self.questionnaire_booking
         if flow is not None and flow.expires_at <= now:
             with self.state.db:
                 if self.state.stop_booking(flow.booking_id):
                     self.state.queue_message(QUESTIONNAIRE_EXPIRED, flow.search_id)
-            self.allergy_booking = None
+            self.questionnaire_booking = None
         if not self.booking_enabled or not self.allowed_booking_patients or next_search_time(now) != now:
             return
         booking = self.state.claim_booking(self.allowed_booking_patients)
@@ -1094,6 +1119,10 @@ class SearchBot:
         heading = self.search_heading(row["display_number"], criteria)
         description = f"{heading}\nOption {booking['option_number']}. {self.slot_details(slot)}"
         allergy = criteria.patient == "patient1" and not criteria.telephone and normalize(criteria.service) in ALLERGY_SERVICES
+        internist = criteria.patient == "patient1" and not criteria.telephone and normalize(criteria.service) == "internista"
+        service_name = ALLERGY_SERVICE if allergy else criteria.service
+        approval_reason = QUESTIONNAIRE_APPROVAL if allergy else INTERNIST_QUESTIONNAIRE_APPROVAL
+        resuming_questionnaire = approval_reason in (booking["reason"] or "").splitlines()
         reservation_id = None
         try:
             if slot["start"] <= now:
@@ -1121,14 +1150,21 @@ class SearchBot:
                     raise PortalError("booking-details-missing")
             if portal.is_booking_blocked_by_penalty(criteria.city_id, slot["service_id"]):
                 raise PortalError("booking-penalty")
-            receipt = None
-            if allergy:
-                flow = self.allergy_preflight(booking, criteria, slot, portal)
-                if flow.form is not None:
-                    return
-                receipt = flow.receipt
+            questionnaire = None
+            if allergy or (internist and resuming_questionnaire):
+                questionnaire = self.questionnaire_preflight(booking, criteria, slot, portal, service_name, approval_reason)
             else:
-                portal.check_booking_eligibility(criteria.city_id, slot["service_id"])
+                try:
+                    portal.check_booking_eligibility(criteria.city_id, slot["service_id"])
+                except BookingQuestionnaireRequired as error:
+                    if not internist:
+                        raise
+                    questionnaire = self.start_questionnaire(
+                        booking, criteria, slot, portal, service_name, approval_reason, error.form,
+                    )
+            if questionnaire is not None and questionnaire.form is not None:
+                return
+            receipt = questionnaire.receipt if questionnaire is not None else None
             locator = DoctorLocator(id=f"{criteria.city_id}*{slot['service_id']}*-1*{slot['doctor_id']}")
             appointment = self.refresh_booking_slot(
                 portal, locator, slot, nationwide_from=criteria.city if criteria.telephone else None,
@@ -1137,8 +1173,8 @@ class SearchBot:
             start = appointment.AppointmentDate.astimezone(dt.UTC)
             end = appointment.booking_term["end"].astimezone(dt.UTC)
             reasons = self.booking_approval_reasons(portal, start, end)
-            if allergy:
-                reasons.append(QUESTIONNAIRE_APPROVAL)
+            if questionnaire is not None:
+                reasons.append(questionnaire.approval_reason)
             if slot["start"] <= int(self.clock()):
                 raise PortalError("slot-gone")
             checked_at = int(self.clock())
@@ -1154,7 +1190,6 @@ class SearchBot:
                 return
             with self.state.db:
                 self.state.booking_status(booking["id"], "submitting")
-            service_name = ALLERGY_SERVICE if allergy else criteria.service
             reservation_id = (
                 portal.reserve_standard_visit(appointment, service_name, questionnaire=receipt)
                 if receipt else portal.reserve_standard_visit(appointment, service_name)
@@ -1164,12 +1199,12 @@ class SearchBot:
             if reservation_id not in portal.booked_visit_ids(telephone=criteria.telephone):
                 raise PortalError("booking-outcome-unknown")
         except PortalError as error:
-            if self.allergy_booking and self.allergy_booking.booking_id == booking["id"]:
-                self.allergy_booking = None
+            if self.questionnaire_booking and self.questionnaire_booking.booking_id == booking["id"]:
+                self.questionnaire_booking = None
             self.report_booking_failure(booking, description, error, reservation_id)
             return
-        if allergy:
-            self.allergy_booking = None
+        if questionnaire is not None:
+            self.questionnaire_booking = None
         with self.state.db:
             self.state.booking_status(booking["id"], "booked", reservation_id=reservation_id)
             self.state.queue_message(f"{description}\nBooked and verified in LUX MED.", row["id"])
@@ -1433,7 +1468,7 @@ class SearchBot:
             criteria = replace(criteria, service=service["name"], telephone=service["isTelemedicine"])
 
         try:
-            check_patient_service(criteria.patient, criteria.service, self.children)
+            check_patient_service(criteria, self.children)
         except PatientServiceMismatch as error:
             with self.state.db:
                 if self.state.finish(search_id, "service-mismatch"):
@@ -1546,7 +1581,7 @@ class SearchBot:
         fields["preferences"] = Preferences(**fields["preferences"])
         criteria = Criteria(**fields)
         try:
-            check_patient_service(criteria.patient, criteria.service, self.children)
+            check_patient_service(criteria, self.children)
         except PatientServiceMismatch as error:
             self.state.set_setting("pending_service", "")
             self.reject_mismatch(error)
