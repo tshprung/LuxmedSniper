@@ -1966,13 +1966,13 @@ class BotTests(unittest.TestCase):
 
 
 class TelegramTransportTests(unittest.TestCase):
-    def test_protected_messages_always_target_configured_owner(self):
+    def test_copyable_messages_always_target_configured_owner(self):
         api = Telegram("123:fixture", 42)
         response = MagicMock(status_code=200)
         response.json.return_value = {"ok": True, "result": {"message_id": 22}}
         with patch.object(api.session, "post", return_value=response) as request:
             self.assertEqual(api.send("fixture"), 22)
-        self.assertEqual(request.call_args.kwargs["json"], {"chat_id": 42, "text": "fixture", "protect_content": True})
+        self.assertEqual(request.call_args.kwargs["json"], {"chat_id": 42, "text": "fixture"})
         self.assertFalse(request.call_args.kwargs["allow_redirects"])
 
     def test_transport_does_not_expose_request_details(self):

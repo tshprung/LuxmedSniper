@@ -139,7 +139,7 @@ class Telegram:
 
     def send(self, message: str, *, force_reply: bool = False,
              buttons: list[list[tuple[str, str]]] | None = None) -> int:
-        payload = {"chat_id": self.owner, "text": message, "protect_content": True}
+        payload = {"chat_id": self.owner, "text": message}
         if buttons:
             payload["reply_markup"] = {
                 "inline_keyboard": [
