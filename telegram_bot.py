@@ -13,7 +13,9 @@ from pathlib import Path
 import requests
 
 from luxmed_questionnaire import Questionnaire, QuestionnaireError, QuestionnaireReceipt, visible_text
-from luxmed_sniper import WARSAW, BookingQuestionnaireRequired, DoctorLocator, Luxmed, LuxMedPortal, PortalError, service_variants
+from luxmed_sniper import (
+    WARSAW, BookingQuestionnaireRequired, DoctorLocator, Luxmed, LuxMedPortal, PortalError, ScheduledVisit, service_variants,
+)
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_settings, trusted_devices, validate, worker_settings
 from telegram_free_text import FreeText
@@ -32,6 +34,7 @@ RESULTS_PER_PAGE = 3
 SHORT_NOTICE_SECONDS = 6 * 3600
 CALENDAR_RETRY_SECONDS = 15 * 60
 PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
+APPOINTMENTS_PORTAL_URL = "https://portalpacjenta.luxmed.pl/"
 SICK_CHILD_SERVICES = {
     normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[index][2]) for index in (0, 1, 2)
 }
@@ -46,6 +49,8 @@ PREPARATION_NOTICE = "LUX MED lists preparation instructions for this visit. Ope
 ADDITIONAL_SLOT_NOTICE = "LUX MED lists this as an additional slot. Check its booking options in the Patient Portal."
 BOOKING_ACCESS_NOTICE = "Direct booking is paused for this patient. Availability searches can continue. Use /resume with the patient name to clear the pause."
 OPTION_NUMBER = re.compile(r"[1-9][0-9]{0,8}")
+QUESTIONNAIRE_ANSWER = re.compile(r"(?:/?answer |option )?([0-9]{1,2})")
+CANCEL_APPOINTMENT = re.compile(r"/?cancel(?: appointment| visit)? #?([1-9][0-9]{0,8})")
 SEARCH_CHANGE_PROMPT = "Change an active search"
 SEARCH_FILTER_CHOICES = ("Tomorrow", "Next week", "After 16:00", "Any time", "Clear filters")
 CALLBACK_COMMAND = re.compile(
@@ -173,6 +178,14 @@ class QuestionnaireBooking:
     message_id: int | None = None
 
 
+@dataclass(repr=False)
+class AppointmentList:
+    patient: str
+    token: str
+    visits: list[ScheduledVisit]
+    messages: set[int] = field(default_factory=set)
+
+
 def configured_profiles(settings: dict, metadata: dict) -> dict[str, Profile]:
     profiles = {}
     for key in PROFILE_KEYS:
@@ -208,6 +221,7 @@ class SearchBot:
         self.device_credentials = device_credentials or {}
         self.portals: dict[str, tuple[float, LuxMedPortal]] = {}
         self.questionnaire_booking: QuestionnaireBooking | None = None
+        self.appointment_list: AppointmentList | None = None
         self.cities = city_catalog()
         self.children = {key for key, profile in profiles.items() if profile.child}
         self.aliases = {}
@@ -253,6 +267,8 @@ class SearchBot:
             return
         if match := re.fullmatch(r"answer ([1-9][0-9]?)", action):
             self.answer_questionnaire(match[1], message.get("message_id"))
+        elif match := re.fullmatch(r"cancel visit ([a-f0-9]{12}) ([1-9][0-9]{0,8})", action):
+            self.show_visit_cancellation(int(match[2]), message, token=match[1])
         elif action == "stop questionnaire":
             self.stop_questionnaire(message)
         elif match := re.fullmatch(r"patient (patient[123]) ([a-f0-9]{12})", action):
@@ -281,16 +297,21 @@ class SearchBot:
         command, _, argument = key.partition(" ")
         reply = message.get("reply_to_message") or {}
         flow = self.questionnaire_booking
+        answer = QUESTIONNAIRE_ANSWER.fullmatch(key)
         if key in {"stop questionnaire", "/stop questionnaire", "cancel questionnaire"}:
             self.stop_questionnaire()
         elif key in {"options", "/options", "give me options", "show me options", "show options"}:
             self.show_options(reply)
+        elif match := CANCEL_APPOINTMENT.fullmatch(key):
+            self.show_visit_cancellation(int(match[1]), reply)
         elif (
             (flow is not None and flow.message_id is not None and reply.get("message_id") == flow.message_id)
-            or (flow is not None and flow.form is not None and not reply and re.fullmatch(r"[0-9]{1,2}", text))
+            or (flow is not None and flow.form is not None and not reply and answer is not None)
             or str(reply.get("text") or "").startswith(QUESTIONNAIRE_PROMPT + "\n")
+            or command in {"answer", "/answer"}
         ):
-            self.answer_questionnaire(text, reply.get("message_id"))
+            message_id = reply.get("message_id") if reply else (flow.message_id if flow is not None else None)
+            self.answer_questionnaire(answer[1] if answer else text, message_id)
         elif command in {"stop", "/stop"}:
             self.stop(argument, reply)
         elif key in {"/active", "active", "show active searches", "show running searches"}:
@@ -354,6 +375,7 @@ class SearchBot:
             self.help()
 
     def show_appointments(self, patient_name: str) -> None:
+        self.appointment_list = None
         patient = self.aliases.get(patient_name)
         if patient is None:
             self.show_patient_buttons(appointments=True)
@@ -379,14 +401,44 @@ class SearchBot:
             self.state.queue_message(f"LUX MED shows no upcoming appointments for {name}.")
             return
         heading = f"Upcoming LUX MED appointments for {name} (Warsaw time)"
-        entries = []
-        for visit in visits:
-            date = visit.starts_at.strftime("%d %b %Y, %H:%M")
-            details = " · ".join(part for part in (visit.mode, visit.clinic, visit.clinician) if part)
-            entries.append(f"• {date} · {visit.service}" + (f"\n  {details}" if details else ""))
+        snapshot = AppointmentList(patient, uuid.uuid4().hex[:12], visits)
+        self.appointment_list = snapshot
+        entries = [f"{number}. {self.upcoming_visit_details(visit)}" for number, visit in enumerate(visits, 1)]
+        instructions = "Tap a cancellation button or type Cancel followed by the visit number to see how to cancel it."
         # Five bounded entries fit Telegram's message limit even with Unicode labels.
         for first in range(0, len(entries), 5):
-            self.state.queue_message("\n\n".join([heading, *entries[first:first + 5]]))
+            numbers = range(first + 1, min(first + 5, len(entries)) + 1)
+            buttons = [[(f"Cancel {number}", f"cancel visit {snapshot.token} {number}")] for number in numbers]
+            self.state.queue_message("\n\n".join([heading, *entries[first:first + 5], instructions]), buttons=buttons)
+
+    @staticmethod
+    def upcoming_visit_details(visit: ScheduledVisit) -> str:
+        date = visit.starts_at.strftime("%d %b %Y, %H:%M")
+        details = " · ".join(part for part in (visit.mode, visit.clinic, visit.clinician) if part)
+        return f"{date} · {visit.service}" + (f"\n  {details}" if details else "")
+
+    def show_visit_cancellation(self, number: int, reply: dict, *, token: str | None = None) -> None:
+        snapshot = self.appointment_list
+        message_id = reply.get("message_id")
+        if (snapshot is None or (token is not None and token != snapshot.token)
+                or (reply and (type(message_id) is not int or message_id not in snapshot.messages))):
+            self.state.queue_message("Open Upcoming appointments to get the current visit numbers.",
+                                     buttons=[[("Upcoming appointments", "pick visits")]])
+            return
+        if number > len(snapshot.visits):
+            self.state.queue_message("Choose a number from the current upcoming appointments list.")
+            return
+        visit = snapshot.visits[number - 1]
+        if visit.starts_at.timestamp() <= self.clock():
+            self.state.queue_message("That appointment time has passed. Open Upcoming appointments for a fresh list.",
+                                     buttons=[[("Upcoming appointments", "pick visits")]])
+            return
+        name = self.profiles[snapshot.patient].name
+        self.state.queue_message(
+            f"Appointment {number} for {name}\n{self.upcoming_visit_details(visit)}\n\n"
+            "To cancel, open this visit under Leczenie in the Patient Portal, tap Odwołaj and review any conditions.\n"
+            f"{APPOINTMENTS_PORTAL_URL}",
+        )
 
     def handle_search(self, text: str) -> None:
         error_message = None
@@ -466,6 +518,8 @@ class SearchBot:
             )
 
     def show_patient_buttons(self, *, appointments: bool = False) -> None:
+        if appointments:
+            self.appointment_list = None
         prefix = "/appointments" if appointments else "services"
         prompt = "Whose appointments should I show?" if appointments else "Who is the appointment for?"
         self.state.queue_message(prompt, buttons=[[
@@ -943,7 +997,12 @@ class SearchBot:
     def flush(self) -> None:
         while (message := self.state.next_message()) is not None:
             if message["buttons"]:
-                sent = self.telegram.send(message["text"], buttons=json.loads(message["buttons"]))
+                buttons = json.loads(message["buttons"])
+                sent = self.telegram.send(message["text"], buttons=buttons)
+                if self.appointment_list is not None:
+                    prefix = f"cancel visit {self.appointment_list.token} "
+                    if any(action.startswith(prefix) for row in buttons for _, action in row):
+                        self.appointment_list.messages.add(sent)
             else:
                 sent = self.telegram.send(message["text"])
             self.state.sent(message, sent)
@@ -993,7 +1052,8 @@ class SearchBot:
         flow.message_id = None
         flow.prompt = (
             f"{QUESTIONNAIRE_PROMPT}\n{name} · {flow.service}\n\n{question}\n\n"
-            "Tap an answer or reply directly with its number. I’ll send your choices to LUX MED when the form is complete. "
+            "Type the number shown, such as 1 or Option 1, or tap an answer. "
+            "I’ll send your choices to LUX MED when the form is complete. "
             "Send Stop questionnaire to end this request."
         )
 
@@ -1015,10 +1075,10 @@ class SearchBot:
             self.state.queue_message(QUESTIONNAIRE_EXPIRED)
             return
         if flow.form is None or flow.message_id is None or message_id != flow.message_id:
-            self.state.queue_message("Reply to the most recent LUX MED question.")
+            self.state.queue_message("Use the latest LUX MED question. You can type its number or tap an answer.")
             return
         if not re.fullmatch(r"[1-9][0-9]?", text) or int(text) > len(flow.form.choices):
-            self.state.queue_message("Please reply to the question with one of the option numbers shown.")
+            self.state.queue_message("Type one of the numbers shown on the current LUX MED question, or tap its button.")
             return
         try:
             flow.form.choose(int(text))

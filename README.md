@@ -76,6 +76,11 @@ worker asks for a corrected request. When every search has ended, the next
 search is numbered #1. A reply to an older message stays tied to that
 message's original search.
 
+Use `Show my next appointments` or `Show upcoming appointments for <patient>`
+to see the numbered list of booked visits. Tap **Cancel 2** or type
+`Cancel 2` to see the selected appointment and its Patient Portal
+cancellation steps. The number refers to the most recent list.
+
 For example, send “Find a pediatrician for <patient> next week, after 16:00,
 near Dominikańska” and then choose the visit type. The worker shows the
 interpreted filters in the confirmation and in `/active`. Date filters
@@ -168,9 +173,9 @@ booking requests for that patient. The worker never retries an uncertain
 reservation.
 
 For `patient1` in-person allergist and internist visits, `Book <option>` can
-start the LUX MED questionnaire in Telegram. Tap an answer or reply directly
-to the question with an option number. The worker keeps answers in memory
-and sends the completed form to LUX MED on a path that returns the same service. It
+start the LUX MED questionnaire in Telegram. Tap an answer, type its number,
+or type `Option 1` with the appropriate number. The worker keeps answers in
+memory and sends the completed form to LUX MED on a path that returns the same service. It
 rechecks the exact slot and asks for approval before booking. Send
 `Stop questionnaire` to end the request. If the signed-in session expires,
 start with a fresh search.
