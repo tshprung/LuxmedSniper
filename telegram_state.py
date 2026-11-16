@@ -147,6 +147,11 @@ class SearchState:
             "SELECT * FROM searches WHERE status = 'active' AND display_number = ?", (number,),
         ).fetchone()
 
+    def active_by_id(self, search_id: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM searches WHERE status = 'active' AND id = ?", (search_id,),
+        ).fetchone()
+
     def save_results(self, search_id: int, slots: list[dict]) -> None:
         self.db.execute("INSERT INTO search_results (search_id, slots) VALUES (?, ?)", (search_id, json.dumps(slots)))
 

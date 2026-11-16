@@ -125,14 +125,14 @@ class BotTests(unittest.TestCase):
         }
         self.bot = SearchBot(self.telegram, self.state, self.profiles, clock=lambda: self.now, booking_enabled=True)
 
-    def update(self, number, text, *, sender=100, chat_id=100, chat_type="private", reply_to=None):
+    def update(self, number, text, *, sender=100, chat_id=100, chat_type="private", reply_to=None, reply_text=None):
         message = {
             "from": {"id": sender},
             "chat": {"id": chat_id, "type": chat_type},
             "text": text,
         }
         if reply_to is not None:
-            message["reply_to_message"] = {"message_id": reply_to}
+            message["reply_to_message"] = {"message_id": reply_to, "text": reply_text}
         self.bot.accept({"update_id": number, "message": message})
 
     def tap(self, number, action, message_id=42, *, sender=100, chat_id=100, chat_type="private"):
@@ -1026,6 +1026,58 @@ class BotTests(unittest.TestCase):
         self.assertEqual(row["next_due"], self.now)
         self.assertIsNone(row["last_checked"])
         self.assertFalse(row["first_result_sent"])
+
+    def test_active_buttons_edit_filters_and_stop_the_selected_search(self):
+        self.telegram.send.side_effect = iter(range(40, 100))
+        self.update(1, "Find an internist for Adult")
+        self.update(2, "Find an allergist for Adult after 17:00")
+        self.bot.flush()
+        self.update(3, "/active")
+        buttons = json.loads(self.state.next_message()["buttons"])
+        self.assertEqual(buttons, [
+            [["Change #1", "change search 1"], ["Stop #1", "stop search 1"]],
+            [["Change #2", "change search 2"], ["Stop #2", "stop search 2"]],
+        ])
+        self.bot.flush()
+        self.tap(4, "change search 2", 42)
+        prompt = self.state.next_message()["text"]
+        menu = json.loads(self.state.next_message()["buttons"])
+        self.assertIn("Konsultacja alergologiczna", prompt)
+        self.assertIn(["Tomorrow", "filter search 2 Tomorrow"], menu[0])
+        self.bot.flush()
+        self.tap(5, "filter search 2 Tomorrow", 43)
+        first, second = self.state.active()
+        self.assertIsNone(self.state.criteria(first).preferences.first_date)
+        prefs = self.state.criteria(second).preferences
+        self.assertEqual((prefs.first_date, prefs.start_minute), ("2030-03-31", 17 * 60))
+        self.update(6, "near Dominikańska", reply_to=43, reply_text=prompt)
+        self.assertEqual(self.state.criteria(self.state.active()[1]).preferences.clinic, "Dominikańska")
+        self.update(7, "| Kraków | any time", reply_to=43, reply_text=prompt)
+        criteria = self.state.criteria(self.state.active()[1])
+        self.assertEqual((criteria.city, criteria.preferences.start_minute), ("Kraków", None))
+        self.tap(8, "stop search 1", 42)
+        remaining, = self.state.active()
+        self.assertEqual((remaining["id"], remaining["patient"]), (2, "patient1"))
+
+    def test_old_active_buttons_and_edit_reply_cannot_target_reused_search_number(self):
+        self.telegram.send.side_effect = iter(range(40, 100))
+        self.update(1, "Find an internist for Adult")
+        self.update(2, "/active")
+        self.bot.flush()
+        self.tap(3, "change search 1", 41)
+        prompt = self.state.next_message()["text"]
+        self.bot.flush()
+        self.tap(4, "stop search 1", 41)
+        self.update(5, "Find an allergist for Adult")
+        self.bot.flush()
+        self.tap(6, "stop search 1", 41)
+        self.tap(7, "filter search 1 Tomorrow", 42)
+        self.update(8, "after 16:00", reply_to=42, reply_text=prompt)
+        row, = self.state.active()
+        self.assertEqual((row["id"], row["display_number"]), (2, 1))
+        self.assertIsNone(self.state.criteria(row).preferences.start_minute)
+        self.assertIsNone(self.state.criteria(row).preferences.first_date)
+        self.assertIn("That search has ended", self.state.next_message()["text"])
 
     def test_migration_releases_unchecked_searches_and_preserves_recurring_times(self):
         self.update(1, "Find an internist for Adult")

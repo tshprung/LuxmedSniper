@@ -64,10 +64,11 @@ Example requests include `Find an internist for <patient>`,
 `Find a pediatrician for <patient>`, and
 `/find patient | exact portal service | city`. Wrocław is the default city.
 A generic pediatric request asks which visit type to use. Use `/active` to
-list searches with their last result and next check. Use `Stop 123` to stop
-one, or reply `Stop` to a search's message. Use
-`/change 123 | service | city | filters` to update
-an active search. You can leave the service blank to change only the city.
+list searches with their last result and next check. Tap a search's **Stop**
+button to end it, or tap **Change** and choose a filter or reply with a custom
+change. You can also type `Stop 123`, reply `Stop` to a search's message,
+or use `/change 123 | service | city | filters`. Leave the service blank
+to change only the city.
 An update keeps the search ID and patient and checks the new criteria at
 the next eligible time.
 If the requested service conflicts with the named patient's age group, the

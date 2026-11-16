@@ -45,6 +45,8 @@ PREPARATION_NOTICE = "LUX MED lists preparation instructions for this visit. Ope
 ADDITIONAL_SLOT_NOTICE = "LUX MED lists this as an additional slot. Check its booking options in the Patient Portal."
 BOOKING_ACCESS_NOTICE = "Direct booking is paused for this patient. Availability searches can continue. Use /resume with the patient name to clear the pause."
 OPTION_NUMBER = re.compile(r"[1-9][0-9]{0,8}")
+SEARCH_CHANGE_PROMPT = "Change an active search"
+SEARCH_FILTER_CHOICES = ("Tomorrow", "Next week", "After 16:00", "Any time", "Clear filters")
 CALLBACK_COMMAND = re.compile(
     r"(?:select|book|approve|stop booking) [1-9][0-9]{0,8}|more|continue|options|"
     r"active|pick patient|pick visits|"
@@ -257,6 +259,16 @@ class SearchBot:
                 self.choose_catalog_service(match[2], menu_id=match[3])
             else:
                 self.choose_pediatric_button(match[2], match[3])
+        elif match := re.fullmatch(r"(change|stop) search ([1-9][0-9]{0,17})", action):
+            row = self.active_search_for_action(int(match[2]))
+            if row is not None:
+                if match[1] == "change":
+                    self.show_search_change(row)
+                else:
+                    self.stop_search(row["id"], row["display_number"])
+        elif match := re.fullmatch(r"filter search ([1-9][0-9]{0,17}) (.+)", action):
+            if match[2] in SEARCH_FILTER_CHOICES and (row := self.active_search_for_action(int(match[1]))) is not None:
+                self.apply_search_change(row, match[2])
         elif CALLBACK_COMMAND.fullmatch(action):
             self.handle({"text": action, "reply_to_message": message})
 
@@ -324,6 +336,15 @@ class SearchBot:
                 self.state.queue_message(message)
             else:
                 self.state.queue_message("Use /resume followed by a paused patient's name.")
+        elif not text.startswith("/") and str(reply.get("text") or "").startswith(f"{SEARCH_CHANGE_PROMPT}\n"):
+            original = self.replied_search(reply)
+            if original is not None:
+                number = original["display_number"]
+                command = f"/change {number} | {text}" if "|" in text else f"Change {number} to {text}"
+                self.change(command, reply)
+            else:
+                self.state.queue_message("Open Active searches and choose Change again.",
+                                         buttons=[[("Active searches", "active")]])
         elif len(text) <= 600 and key not in {"/start", "/help", "help"}:
             self.handle_search(text)
         else:
@@ -509,7 +530,7 @@ class SearchBot:
             "Find an internist for <patient> next week after 16:00\n"
             "Show my next appointments or /appointments <patient>\n"
             "/find patient | portal service | city | optional filters\n"
-            "/active · Stop <number>\n"
+            "/active · Change or stop a search\n"
             "Change 123 to after 16:00\n/change number | service | city | optional filters\n"
             "From a result list: Details 2 · More · Continue"
             + (" · Book 2\nFor booking approval: Approve <request number> · Stop booking <request number>"
@@ -769,21 +790,28 @@ class SearchBot:
         if original is not None and original["id"] != row["id"]:
             self.state.queue_message("That message refers to a different search. Use /active to see current searches.")
             return
-        search_id = row["id"]
-        current = self.state.criteria(row)
         filters = match[2] or (parts[3] if len(parts) == 4 else "")
+        service = parts[1] if len(parts) >= 2 else ""
+        city = parts[2] if len(parts) >= 3 else ""
+        self.apply_search_change(row, filters, service=service, city=city)
+
+    def apply_search_change(self, row, filters: str, *, service: str = "", city: str = "") -> None:
+        current = self.state.criteria(row)
         now = int(self.clock())
         today = dt.datetime.fromtimestamp(now, WARSAW).date()
         try:
-            if len(parts) == 1:
-                criteria = current
-            else:
-                service = parts[1] or current.service
-                city = parts[2] if len(parts) >= 3 and parts[2] else current.city
-                criteria = parse_search(f"/find {current.patient} | {service} | {city}", self.aliases, self.children, self.cities)
+            criteria = current
+            if service or city:
+                criteria = parse_search(
+                    f"/find {current.patient} | {service or current.service} | {city or current.city}",
+                    self.aliases, self.children, self.cities,
+                )
             criteria = replace(criteria, preferences=parse_preferences(filters, today, current.preferences))
         except PatientServiceMismatch as error:
             self.reject_mismatch(error)
+            return
+        except (ServiceChoiceNeeded, VisitModeChoiceNeeded):
+            self.state.queue_message("Choose a specific service and visit type for this search.")
             return
         except (RequestError, PreferenceError) as error:
             self.state.queue_message(str(error))
@@ -791,11 +819,28 @@ class SearchBot:
         if not criteria.service:
             self.state.queue_message("Choose a specific pediatric visit type in /change, such as routine visit.")
             return
+        number = row["display_number"]
         if criteria == current:
             self.state.queue_message(f"Search #{number} already uses those settings.")
             return
-        due, paused = self.state.revise(search_id, criteria, now)
-        self.confirm_search(search_id, number, criteria, due, paused, now, changed=True)
+        due, paused = self.state.revise(row["id"], criteria, now)
+        self.confirm_search(row["id"], number, criteria, due, paused, now, changed=True)
+
+    def active_search_for_action(self, search_id: int):
+        row = self.state.active_by_id(search_id)
+        if row is None:
+            self.state.queue_message("That search has ended.", buttons=[[("Active searches", "active")]])
+        return row
+
+    def show_search_change(self, row) -> None:
+        heading = self.search_heading(row["display_number"], self.state.criteria(row))
+        choices = [(label, f"filter search {row['id']} {label}") for label in SEARCH_FILTER_CHOICES]
+        self.state.queue_message(
+            f"{SEARCH_CHANGE_PROMPT}\n{heading}\n\n"
+            "Tap a filter or reply to this message with a change like “tomorrow after 17:00”. "
+            "To change the service or city, reply with service | city | filters.",
+            row["id"], buttons=[choices[:2], choices[2:4], choices[4:]],
+        )
 
     def show_active(self) -> None:
         rows = self.state.active()
@@ -804,8 +849,10 @@ class SearchBot:
             return
         for index in range(0, len(rows), 6):
             lines = []
+            buttons = []
             for row in rows[index:index + 6]:
-                heading = self.search_heading(row["display_number"], self.state.criteria(row))
+                number = row["display_number"]
+                heading = self.search_heading(number, self.state.criteria(row))
                 if row["last_checked"] is None:
                     last = "Awaiting a recorded result"
                 else:
@@ -822,7 +869,9 @@ class SearchBot:
                 if row["suspended"]:
                     upcoming = "Paused. Use /resume after checking the portal."
                 lines.append(f"{heading}\n{last}\n{upcoming}")
-            self.state.queue_message("\n\n".join(lines))
+                buttons.append([(f"Change #{number}", f"change search {row['id']}"),
+                                (f"Stop #{number}", f"stop search {row['id']}")])
+            self.state.queue_message("\n\n".join(lines), buttons=buttons)
 
     def replied_search(self, reply: dict):
         message_id = reply.get("message_id")
@@ -865,7 +914,11 @@ class SearchBot:
                 number = row["display_number"]
         if number is None:
             self.state.queue_message("Use Stop with a search number from /active.")
-        elif row is not None and self.state.finish(row["id"], "stopped"):
+            return
+        self.stop_search(row["id"] if row is not None else None, number)
+
+    def stop_search(self, search_id: int | None, number: int) -> None:
+        if search_id is not None and self.state.finish(search_id, "stopped"):
             self.state.queue_message(f"Stopped search #{number}.")
         else:
             self.state.queue_message(f"That search (#{number}) has already ended.")
