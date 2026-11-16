@@ -129,6 +129,38 @@ APPOINTMENTS_REQUEST = re.compile(
     r"(?:(?:upcoming|next|scheduled|booked) )*(?:lux med )?(?:appointments?|visits?|bookings?)"
     r"(?: for (?P<patient>.+?))?(?: please)?"
 )
+COVERAGE_AFTER_SERVICE = re.compile(
+    r"(?P<service>.+?) (?:covered|included|part of (?:my|the) (?:package|plan|subscription|abonament)|"
+    r"in (?:my|the) (?:package|plan|subscription|abonament)|"
+    r"paid|payable|free)(?: (?:by|in|with) (?:my|the) "
+    r"(?:lux med )?(?:package|plan|subscription|abonament))?(?: for (?P<patient>.+))?"
+)
+COVERAGE_BEFORE_SERVICE = re.compile(
+    r"(?:coverage for|does (?:lux med|(?:my|the) (?:lux med )?(?:package|plan|subscription|abonament)) cover|"
+    r"(?:do|would) i (?:have to )?pay for|is there a charge for|how much (?:is|are)|"
+    r"how much (?:does|do)) (?P<service>.+?)(?: cost)?(?: for (?P<patient>.+))?"
+)
+PACKAGE_SERVICE_ALIASES = {
+    "cardiolog": "Konsultacja kardiologiczna",
+    "cardiologist": "Konsultacja kardiologiczna",
+    "cardiology": "Konsultacja kardiologiczna",
+    "cardiology consultation": "Konsultacja kardiologiczna",
+    "kardiolog": "Konsultacja kardiologiczna",
+    "kardiologa": "Konsultacja kardiologiczna",
+    "cardiologist phone consultation": "Konsultacja kardiologiczna - telefoniczna",
+    "holter": "Założenie Holtera",
+    "holter test": "Założenie Holtera",
+    "heart holter": "Założenie Holtera EKG",
+    "heart holter test": "Założenie Holtera EKG",
+    "holter for heart": "Założenie Holtera EKG",
+    "holter test for heart": "Założenie Holtera EKG",
+    "holter ecg": "Założenie Holtera EKG",
+    "ecg holter": "Założenie Holtera EKG",
+    "holter ekg": "Założenie Holtera EKG",
+    "ekg holter": "Założenie Holtera EKG",
+    "blood pressure holter": "Założenie Holtera ciśnieniowego",
+    "holter cisnieniowy": "Założenie Holtera ciśnieniowego",
+}
 
 
 def normalize(text: str) -> str:
@@ -144,6 +176,43 @@ def appointments_request(text: str) -> str | None:
     if match := APPOINTMENTS_REQUEST.fullmatch(key):
         return match["patient"] or match["possessor"] or "me"
     return None
+
+
+def coverage_request(text: str) -> tuple[str, tuple[str, ...]] | None:
+    key = normalize(text.strip().rstrip("?.!"))
+    command, _, rest = key.partition(" ")
+    if command == "/coverage":
+        patient, separator, services = rest.partition("|")
+        patient, services = (patient.strip(), services.strip()) if separator else ("me", rest)
+        return patient, (services,) if services else ()
+    key = re.sub(
+        r"^(?:please )?(?:(?:can|could|would) you (?:please )?)?(?:check (?:if |whether )?)?",
+        "", key,
+    ).removesuffix(" please")
+    subject = re.sub(r"^(?:is|are) ", "", key)
+    match = COVERAGE_AFTER_SERVICE.fullmatch(subject) or COVERAGE_BEFORE_SERVICE.fullmatch(key)
+    if match is None:
+        return None
+    parts = tuple(
+        re.sub(r"^(?:a|an|the) | (?:visit|appointment)$", "", part.strip())
+        for part in re.split(r"\s*(?:, and |,|;|\band\b)\s*", match["service"])
+    )
+    return match["patient"] or "me", parts if all(parts) else ()
+
+
+def matching_package_services(query: str, services: list[dict]) -> tuple[list[dict], bool]:
+    alias = PACKAGE_SERVICE_ALIASES.get(query, GENERAL_SERVICES.get(query, query))
+    names = [(variant, name_words(variant["name"])) for variant in services]
+    candidates = dict.fromkeys((name_words(alias), name_words(query)))
+    for words in candidates:
+        exact = [variant for variant, name in names if words == name]
+        if exact:
+            return exact, True
+    for words in candidates:
+        partial = [variant for variant, name in names if contains_words(name, words)]
+        if partial:
+            return partial, False
+    return [], False
 
 
 def city_catalog() -> dict[str, tuple[int, str]]:

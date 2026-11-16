@@ -11,7 +11,7 @@ import requests
 
 import audit_search
 from luxmed_questionnaire import QuestionnaireReceipt
-from luxmed_sniper import CancellationTerms, DoctorLocator, Luxmed, LuxMedPortal, PortalError
+from luxmed_sniper import CancellationTerms, DoctorLocator, Luxmed, LuxMedPortal, PackageCoverage, PortalError
 from telegram_requests import INTERNIST_PHONE_SERVICE
 
 
@@ -38,6 +38,46 @@ def slot(starts_at, *, doctor=9, clinic_group=6):
 
 
 class SearchTests(unittest.TestCase):
+    def test_medical_package_lookups_use_only_read_only_portal_requests(self):
+        plans = [{"packageId": 123}, {"packageId": 123}]
+        catalog = [{"name": "Tests", "children": [{"id": 456, "name": "Założenie Holtera EKG"}]}]
+        details = {
+            "header": {"itemTexts": [{"htmlText": "<b>Usługa jest poza Twoim abonamentem</b>"}]},
+            "executingConditions": [{"items": [{"itemTexts": [{"htmlText": "Ta usługa jest płatna"}]}]}],
+        }
+        with patch("requests.Session.request", side_effect=map(response, [
+            {"token": "fixture"}, plans, catalog, details,
+        ])) as request:
+            portal = LuxMedPortal(Luxmed(login="fixture", password="dummy"))
+            self.addCleanup(portal.session.close)
+            self.assertEqual(portal.medical_package_ids(), ("123",))
+            self.assertEqual(portal.medical_package_services(), [{"id": 456, "name": "Założenie Holtera EKG"}])
+            self.assertEqual(portal.medical_package_coverage("123", 456), PackageCoverage("paid"))
+        self.assertEqual([call.args for call in request.call_args_list], [
+            ("POST", LuxMedPortal.LUXMED_LOGIN_URL),
+            ("GET", f"{LuxMedPortal.MEDICAL_PACKAGE_URL}/GetActiveBeneficiaries"),
+            ("GET", f"{LuxMedPortal.MEDICAL_PACKAGE_URL}/GetServiceVariantGroups"),
+            ("GET", f"{LuxMedPortal.MEDICAL_PACKAGE_URL}/GetServiceVariantInfo"),
+        ])
+        self.assertEqual(request.call_args.kwargs["params"], {"beneficiaryId": "123", "serviceVariantId": 456})
+
+    def test_package_details_distinguish_coverage_conditions_and_unknown_responses(self):
+        covered = {
+            "header": {"itemTexts": [{"htmlText": "Usługa jest w Twoim abonamencie"}]},
+            "executingConditions": [{"items": [{"itemTexts": [
+                {"htmlText": "Wymagane jest skierowanie"}, {"htmlText": "Limit wykorzystania"},
+            ]}]}],
+        }
+        with patch("requests.Session.request", side_effect=map(response, [
+            {"token": "fixture"}, covered, {"header": {"itemType": 0}}, [{"unrecognized": True}],
+        ])):
+            portal = LuxMedPortal(Luxmed(login="fixture", password="dummy"))
+            self.addCleanup(portal.session.close)
+            self.assertEqual(portal.medical_package_coverage("123", 456), PackageCoverage("covered", True, True))
+            self.assertEqual(portal.medical_package_coverage("123", 456), PackageCoverage("unknown"))
+            with self.assertRaisesRegex(PortalError, "unexpected-response"):
+                portal.medical_package_ids()
+
     def test_phone_booking_catalog_requires_regular_nonvideo_consultation(self):
         variant = {"name": INTERNIST_PHONE_SERVICE, "id": 30, "isTelemedicine": True,
                    "isVideoConsultation": False, "isPoz": False}

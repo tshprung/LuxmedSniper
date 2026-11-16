@@ -6,10 +6,12 @@ import datetime
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
 import typing
+import unicodedata
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -23,7 +25,7 @@ import schedule
 import yaml
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
-from luxmed_questionnaire import QuestionnaireReceipt
+from luxmed_questionnaire import QuestionnaireReceipt, visible_text
 
 WARSAW = ZoneInfo("Europe/Warsaw")
 PORTAL_TIMEOUT = (5, 15)
@@ -124,6 +126,13 @@ class CancellationTerms:
     no_show: bool = False
 
 
+@dataclass(frozen=True)
+class PackageCoverage:
+    status: str
+    referral_required: bool | None = None
+    usage_limit: bool | None = None
+
+
 class Luxmed(BaseModel):
     password: str
     login: str | None = None
@@ -171,6 +180,7 @@ class LuxMedPortal:
     UPCOMING_VISITS_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/DashboardMedicalSection/GetUpcomingVisits'
     SCHEDULED_VISITS_URL = f"{NEW_PORTAL_URL}/Timeline/GetStartEvents"
     VISITS_URL = f"{NEW_PORTAL_URL}/Visits"
+    MEDICAL_PACKAGE_URL = f"{NEW_PORTAL_URL}/MedicalPackage"
     NON_SHOW_PENALTIES_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Reservation/CheckUserNonShowPenalties'
 
     def __init__(self, credentials: Luxmed, *, trusted_device: dict | None = None):
@@ -750,6 +760,38 @@ class LuxMedPortal:
     def get_services(self) -> list[dict]:
         return self._portal_json("GET", self.DICTIONARY_SERVICES_URL, stage="service-catalog")
 
+    def medical_package_ids(self) -> tuple[str, ...]:
+        packages = self._portal_json("GET", f"{self.MEDICAL_PACKAGE_URL}/GetActiveBeneficiaries",
+                                     stage="coverage-packages")
+        if not isinstance(packages, list):
+            raise PortalError("unexpected-response", stage="coverage-packages")
+        package_ids = []
+        for package in packages:
+            package_id = package.get("packageId") if isinstance(package, dict) else None
+            if type(package_id) not in (int, str) or not re.fullmatch(r"[\w-]{1,80}", str(package_id)):
+                raise PortalError("unexpected-response", stage="coverage-packages")
+            package_ids.append(str(package_id))
+        return tuple(dict.fromkeys(package_ids))
+
+    def medical_package_services(self) -> list[dict]:
+        catalog = self._portal_json("GET", f"{self.MEDICAL_PACKAGE_URL}/GetServiceVariantGroups",
+                                    stage="coverage-catalog")
+        return list({
+            variant["id"]: {"id": variant["id"], "name": visit_label(variant["name"], 180)}
+            for variant in service_variants(catalog)
+            if type(variant.get("id")) is int and variant["id"] > 0 and variant["name"].strip()
+        }.values())
+
+    def medical_package_coverage(self, package_id: str, service_variant_id: int) -> PackageCoverage:
+        details = self._portal_json(
+            "GET", f"{self.MEDICAL_PACKAGE_URL}/GetServiceVariantInfo",
+            params={"serviceVariantId": service_variant_id, "beneficiaryId": package_id},
+            stage="coverage-details",
+        )
+        if not isinstance(details, dict):
+            raise PortalError("unexpected-response", stage="coverage-details")
+        return parse_package_coverage(details)
+
     def resolve_in_person_service(self, service_name: str) -> int:
         return self.resolve_service(service_name, self.get_services())
 
@@ -795,6 +837,60 @@ def service_variants(catalog: Any) -> Iterable[dict]:
 
 def visit_label(value: Any, limit: int) -> str:
     return " ".join(value.split())[:limit] if isinstance(value, str) else ""
+
+
+def package_item_text(item: Any) -> str:
+    texts = item.get("itemTexts") if isinstance(item, dict) else None
+    if not isinstance(texts, list):
+        return ""
+    plain = " ".join(visible_text(text.get("htmlText")) for text in texts if isinstance(text, dict))
+    decomposed = unicodedata.normalize("NFKD", plain.casefold().replace("ł", "l"))
+    return " ".join("".join(char for char in decomposed if not unicodedata.combining(char)).split())
+
+
+def parse_package_coverage(details: dict) -> PackageCoverage:
+    header = package_item_text(details.get("header"))
+    sections = details.get("executingConditions")
+    labels = [
+        package_item_text(item)
+        for section in sections if isinstance(section, dict) and isinstance(section.get("items"), list)
+        for item in section["items"]
+    ] if isinstance(sections, list) else []
+    conditions = " ".join(labels)
+    summary = f"{header} {conditions}"
+    outside = re.search(
+        r"\b(?:poza (?:zakresem )?(?:twoim |twojego )?(?:abonamen|pakie)\w*|"
+        r"nie (?:jest objeta|jest dostepna|przysluguje|masz)\b.{0,70}\b(?:abonamen|pakie)\w*|"
+        r"(?:not (?:included|covered)|outside)\b.{0,70}\b(?:package|subscription|plan))", header,
+    )
+    if re.search(r"\b(?:z doplata|(?<!nie )wymaga doplaty|(?<!nie )podlega wspolplatnosci|"
+                 r"co-?payment (?:applies|is required))\b", summary):
+        status = "copay"
+    elif any(re.fullmatch(
+        r"(?:(?:ta )?usluga (?:jest )?(?:platna|odplatna)|this service is (?:paid|payable|chargeable))[.!]?", label,
+    ) for label in [header, *labels]):
+        status = "paid"
+    elif outside:
+        status = "outside"
+    elif re.search(r"\b(?:(?:ta )?usluga (?:jest )?(?:dostepna )?|masz (?:te )?usluge )"
+                   r"w (?:ramach )?(?:twoim |twojego |swoim )?(?:abonamen|pakie)\w*|"
+                   r"\b(?:included|covered) (?:in|by) (?:your|the) (?:package|subscription|plan)\b", header):
+        status = "covered"
+    else:
+        status = "unknown"
+    referral_required = None
+    if re.search(r"\b(?:nie wymaga skierowania|nie potrzebujesz skierowania|bez skierowania|"
+                 r"no referral required|referral is not required)\b", conditions):
+        referral_required = False
+    elif re.search(r"\b(?:wymaga skierowania|wymagane (?:jest )?skierowanie|potrzebujesz skierowania|referral is required)\b",
+                   conditions):
+        referral_required = True
+    usage_limit = None
+    if re.search(r"\b(?:bez limitu|nielimitowana|no usage limit)\b", conditions):
+        usage_limit = False
+    elif re.search(r"\b(?:limit (?:wykorzystania|wykonan|uslug|wizyt)|usluga limitowana|usage limit)\b", conditions):
+        usage_limit = True
+    return PackageCoverage(status, referral_required, usage_limit)
 
 
 class LuxMedSniper(LuxMedPortal):
