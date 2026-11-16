@@ -1,6 +1,7 @@
 """Private Telegram long polling and read-only LUX MED availability searches."""
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -35,7 +36,7 @@ SHORT_NOTICE_SECONDS = 6 * 3600
 APPROVAL_CUTOFF_SECONDS = 3600
 CALENDAR_RETRY_SECONDS = 15 * 60
 PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
-APPOINTMENTS_PORTAL_URL = "https://portalpacjenta.luxmed.pl/"
+APPOINTMENTS_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Timeline"
 SICK_CHILD_SERVICES = {
     normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[index][2]) for index in (0, 1, 2)
 }
@@ -187,6 +188,15 @@ class AppointmentList:
     messages: set[int] = field(default_factory=set)
 
 
+@dataclass(repr=False)
+class CancellationReview:
+    token: str
+    patient: str
+    visit: ScheduledVisit
+    direct: bool
+    message_id: int | None = None
+
+
 def configured_profiles(settings: dict, metadata: dict) -> dict[str, Profile]:
     profiles = {}
     for key in PROFILE_KEYS:
@@ -223,6 +233,7 @@ class SearchBot:
         self.portals: dict[str, tuple[float, LuxMedPortal]] = {}
         self.questionnaire_booking: QuestionnaireBooking | None = None
         self.appointment_list: AppointmentList | None = None
+        self.cancellation_review: CancellationReview | None = None
         self.cities = city_catalog()
         self.children = {key for key, profile in profiles.items() if profile.child}
         self.aliases = {}
@@ -270,6 +281,8 @@ class SearchBot:
             self.answer_questionnaire(match[1], message.get("message_id"))
         elif match := re.fullmatch(r"cancel visit ([a-f0-9]{12}) ([1-9][0-9]{0,8})", action):
             self.show_visit_cancellation(int(match[2]), message, token=match[1])
+        elif match := re.fullmatch(r"cancel review ([a-f0-9]{12}) (yes|keep)", action):
+            self.respond_to_cancellation(match[2] == "yes", message, token=match[1])
         elif action == "stop questionnaire":
             self.stop_questionnaire(message)
         elif match := re.fullmatch(r"patient (patient[123]) ([a-f0-9]{12})", action):
@@ -305,6 +318,8 @@ class SearchBot:
             self.show_options(reply)
         elif match := CANCEL_APPOINTMENT.fullmatch(key):
             self.show_visit_cancellation(int(match[1]), reply)
+        elif key in {"confirm cancellation", "keep appointment"}:
+            self.respond_to_cancellation(key == "confirm cancellation", reply)
         elif (
             (flow is not None and flow.message_id is not None and reply.get("message_id") == flow.message_id)
             or (flow is not None and flow.form is not None and not reply and answer is not None)
@@ -374,6 +389,7 @@ class SearchBot:
 
     def show_appointments(self, patient_name: str) -> None:
         self.appointment_list = None
+        self.cancellation_review = None
         patient = self.aliases.get(patient_name)
         if patient is None:
             self.show_patient_buttons(appointments=True)
@@ -432,11 +448,76 @@ class SearchBot:
                                      buttons=[[("Upcoming appointments", "pick visits")]])
             return
         name = self.profiles[snapshot.patient].name
+        direct = False
+        note = ""
+        if self.can_cancel_visit(snapshot.patient, visit):
+            try:
+                late = self.portal_for(snapshot.patient).cancellation_is_late(visit)
+                direct = late is False
+                if late is True:
+                    note = "LUX MED flags this as a late cancellation. Review any conditions in the Patient Portal.\n"
+            except PortalError as error:
+                self.handle_cancellation_access_error(snapshot.patient, error)
+        review = CancellationReview(uuid.uuid4().hex[:12], snapshot.patient, visit, direct)
+        self.cancellation_review = review
+        yes = "Yes, cancel this visit" if direct else "Continue to portal steps"
+        instructions = (
+            "Reply Confirm cancellation to this message or tap a button." if direct else
+            f"{note}Finish this cancellation in the Patient Portal."
+        )
         self.state.queue_message(
             f"Appointment {number} for {name}\n{self.upcoming_visit_details(visit)}\n\n"
-            "To cancel, open this visit under Leczenie in the Patient Portal, tap Odwołaj and review any conditions.\n"
-            f"{APPOINTMENTS_PORTAL_URL}",
+            f"Are you sure you want to cancel this visit?\n{instructions}",
+            buttons=[[(yes, f"cancel review {review.token} yes"),
+                      ("Keep appointment", f"cancel review {review.token} keep")]],
         )
+
+    def can_cancel_visit(self, patient: str, visit: ScheduledVisit) -> bool:
+        return (
+            patient == "patient1" and self.can_book_for(patient)
+            and visit.cancellation_instance is not None
+            and visit.event_id is not None and not self.state.account_paused(patient)
+        )
+
+    @staticmethod
+    def visit_signature(visit: ScheduledVisit) -> str:
+        identity = [int(visit.starts_at.timestamp()), visit.service, visit.clinic, visit.clinician,
+                    visit.mode, visit.cancellation_instance]
+        return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+    def respond_to_cancellation(self, confirm: bool, reply: dict, *, token: str | None = None) -> None:
+        review = self.cancellation_review
+        if (review is None or review.message_id is None or reply.get("message_id") != review.message_id
+                or (token is not None and token != review.token)):
+            self.state.queue_message("Use the current cancellation prompt to confirm or keep the visit.",
+                                     buttons=[[("Upcoming appointments", "pick visits")]])
+            return
+        self.cancellation_review = None
+        if not confirm:
+            self.state.queue_message("Appointment kept.")
+        elif review.visit.starts_at.timestamp() <= self.clock():
+            self.state.queue_message("The appointment time has passed. Open Upcoming appointments for a fresh list.")
+        elif not review.direct:
+            self.state.queue_message(
+                "Open the selected visit under Leczenie in the Patient Portal, tap Odwołaj and review any conditions.\n"
+                f"{APPOINTMENTS_PORTAL_URL}",
+            )
+        elif self.state.queue_cancellation(
+            review.patient, review.visit.event_id, review.visit.event_type,
+            int(review.visit.starts_at.timestamp()), self.visit_signature(review.visit),
+        ):
+            self.state.queue_message("Confirmed. I’ll recheck the exact visit before cancelling it.")
+        else:
+            self.state.queue_message(
+                f"There's already a cancellation request for this visit. Check its status in the Patient Portal.\n"
+                f"{APPOINTMENTS_PORTAL_URL}",
+            )
+
+    def handle_cancellation_access_error(self, patient: str, error: PortalError) -> None:
+        if error.suspend:
+            self.close_portal(patient)
+            if error.stage == "login" or error.http_status == 429:
+                self.state.suspend(patient)
 
     def handle_search(self, text: str) -> None:
         error_message = None
@@ -518,6 +599,7 @@ class SearchBot:
     def show_patient_buttons(self, *, appointments: bool = False) -> None:
         if appointments:
             self.appointment_list = None
+            self.cancellation_review = None
         prefix = "/appointments" if appointments else "services"
         prompt = "Whose appointments should I show?" if appointments else "Who is the appointment for?"
         self.state.queue_message(prompt, buttons=[[
@@ -1048,6 +1130,10 @@ class SearchBot:
                     prefix = f"cancel visit {self.appointment_list.token} "
                     if any(action.startswith(prefix) for row in buttons for _, action in row):
                         self.appointment_list.messages.add(sent)
+                if self.cancellation_review is not None:
+                    confirm = f"cancel review {self.cancellation_review.token} yes"
+                    if any(action == confirm for row in buttons for _, action in row):
+                        self.cancellation_review.message_id = sent
             else:
                 sent = self.telegram.send(message["text"])
             self.state.sent(message, sent)
@@ -1328,6 +1414,78 @@ class SearchBot:
                     int(start.timestamp()), int(end.timestamp()), int(self.clock()),
                 )
 
+    def cancellation_due(self) -> None:
+        request = self.state.claim_cancellation()
+        if request is None:
+            return
+        request_id, patient = request["id"], request["patient"]
+        name = self.profiles[patient].name
+        description = f"{name} · {local_time(request['starts_at'])} (Warsaw time)"
+        submitting = False
+        status = "blocked"
+        try:
+            now = dt.datetime.fromtimestamp(self.clock(), WARSAW)
+            if self.state.account_paused(patient) or not self.can_book_for(patient):
+                raise PortalError("cancellation-access-paused")
+            portal = self.portal_for(patient)
+            identity = (request["reservation_id"], request["event_type"])
+            visit = next((item for item in portal.scheduled_visits(now)
+                          if (item.event_id, item.event_type) == identity), None)
+            if (visit is None or not self.can_cancel_visit(patient, visit)
+                    or self.visit_signature(visit) != request["signature"]):
+                raise PortalError("cancellation-visit-changed")
+            description = f"{name}\n{self.upcoming_visit_details(visit)}"
+            if portal.cancellation_is_late(visit) is not False:
+                raise PortalError("cancellation-late")
+            if visit.starts_at.timestamp() <= self.clock():
+                raise PortalError("cancellation-visit-changed")
+            with self.state.db:
+                self.state.cancellation_status(request_id, "submitting")
+            submitting = True
+            portal.cancel_standard_visit(visit)
+            if any(
+                (item.event_id, item.event_type) == identity
+                for item in portal.scheduled_visits(dt.datetime.fromtimestamp(self.clock(), WARSAW))
+            ):
+                raise PortalError("cancellation-outcome-unverified")
+            status = "cancelled"
+            message = "Cancelled and verified in LUX MED."
+            self.appointment_list = None
+            self.cancellation_review = None
+        except PortalError as error:
+            code = str(error)
+            with self.state.db:
+                self.handle_cancellation_access_error(patient, error)
+            if submitting and code != "cancellation-refused":
+                status = "unknown"
+                message = "I couldn’t verify the cancellation. Check this visit in the Patient Portal."
+            elif code == "cancellation-late":
+                message = "LUX MED now flags this as a late cancellation. Review any conditions in the Patient Portal."
+            elif code == "cancellation-visit-changed":
+                message = "This visit or its cancellation options changed. Open Upcoming appointments to check it again."
+            elif code == "cancellation-refused":
+                message = "LUX MED declined the cancellation. Check the reason in the Patient Portal."
+            else:
+                message = "I couldn’t verify the cancellation conditions. Check this visit in the Patient Portal."
+            message += f"\n{APPOINTMENTS_PORTAL_URL}"
+        with self.state.db:
+            self.state.cancellation_status(request_id, status)
+            if status == "cancelled":
+                self.state.mark_cancelled_booking(
+                    patient, request["reservation_id"], telephone=request["event_type"] == 7,
+                )
+            self.state.queue_message(f"{description}\n{message}")
+
+    def recover_cancellations(self) -> None:
+        with self.state.db:
+            for request in self.state.recover_cancellations():
+                name = self.profiles[request["patient"]].name
+                starts = local_time(request["starts_at"])
+                self.state.queue_message(
+                    f"{name} · {starts} (Warsaw time)\nI couldn’t verify the cancellation. "
+                    f"Check this visit in the Patient Portal.\n{APPOINTMENTS_PORTAL_URL}",
+                )
+
     def sync_calendar_due(self) -> None:
         if self.calendar is None or not self.calendar_destination:
             return
@@ -1361,7 +1519,7 @@ class SearchBot:
                 self.calendar_destination, event["event_id"],
                 dt.datetime.fromtimestamp(event["starts_at"], WARSAW),
                 dt.datetime.fromtimestamp(event["ends_at"], WARSAW),
-                **details,
+                patient_name=profile, **details,
             )
         except (CalendarUnavailable, PortalError) as error:
             retry = next_search_time(now + CALENDAR_RETRY_SECONDS)
@@ -1762,11 +1920,14 @@ def main() -> int:
 
 def run_worker(bot: SearchBot) -> int:
     bot.recover_bookings()
+    bot.recover_cancellations()
     while True:
         try:
             updates = bot.telegram.poll(int(bot.state.get_setting("offset", "0")))
             for update in updates:
                 bot.accept(update)
+            bot.flush()
+            bot.cancellation_due()
             bot.flush()
             bot.booking_due()
             bot.flush()

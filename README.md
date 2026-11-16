@@ -78,8 +78,12 @@ message's original search.
 
 Use `Show my next appointments` or `Show upcoming appointments for <patient>`
 to see the numbered list of booked visits. Tap **Cancel 2** or type
-`Cancel 2` to see the selected appointment and its Patient Portal
-cancellation steps. The number refers to the most recent list.
+`Cancel 2` to see the selected appointment and choose whether to keep or cancel
+it. The number refers to the most recent list. The `patient1` pilot can cancel
+ordinary covered visits when LUX MED lists the cancellation action and indicates
+that it is on time. The worker rechecks the visit and conditions after approval
+and verifies the outcome. For late or paid visits and other unsupported cases,
+the confirmation menu provides Patient Portal steps.
 
 For example, send “Find a pediatrician for <patient> next week, after 16:00,
 near Dominikańska” and then choose the visit type. The worker shows the
@@ -200,8 +204,9 @@ asks you to check your calendar before approving.
 To check the account's primary calendar, set `"calendar_ids": ["primary"]`.
 To also add new verified bookings there, set `"destination_calendar_id": "primary"`
 and authorize the OAuth credential with the Calendar availability and
-`calendar.events.owned` scopes. By default each event is private with the
-title “Appointment” and the booked time. To include the service, clinician,
+`calendar.events.owned` scopes. Each new event is private and its title starts
+with the patient’s name. The default title is “<patient> · Appointment”. To
+include the service, clinician,
 clinic for in-person visits, and reminders 10 and 30 minutes before a
 visit, set `LUXMED_CALENDAR_DETAILS_PATIENTS` in the worker's environment
 to a comma-separated list of profile keys (such as `patient1`). This

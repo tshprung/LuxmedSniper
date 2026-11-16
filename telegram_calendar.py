@@ -65,13 +65,16 @@ class CalendarAvailability:
         return any(calendars[key]["busy"] for key in ids)
 
     def add_booking(self, calendar_id: str, event_id: str, start: dt.datetime, end: dt.datetime, *,
-                    service: str = "", clinic: str = "", clinician: str = "", telephone: bool = False) -> None:
+                    patient_name: str = "", service: str = "", clinic: str = "",
+                    clinician: str = "", telephone: bool = False) -> None:
+        summary = f"{service} — LUX MED" if service else "Appointment"
+        if patient_name:
+            summary = f"{patient_name} · {summary}"
         event = {
-            "id": event_id, "summary": "Appointment", "visibility": "private",
+            "id": event_id, "summary": summary, "visibility": "private",
             "start": {"dateTime": start.isoformat()}, "end": {"dateTime": end.isoformat()},
         }
         if service:
-            event["summary"] = f"{service} — LUX MED"
             notes = ["Telephone consultation"] if telephone else []
             if clinician:
                 notes.append(escape(clinician))

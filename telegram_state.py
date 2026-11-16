@@ -57,6 +57,11 @@ class SearchState:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS outstanding_booking_slot
                 ON booking_requests (patient, slot_key) WHERE status NOT IN ('stopped', 'ended');
+            CREATE TABLE IF NOT EXISTS cancellation_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, patient TEXT NOT NULL, reservation_id INTEGER NOT NULL,
+                event_type INTEGER NOT NULL, starts_at INTEGER NOT NULL, signature TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued', UNIQUE (patient, reservation_id, event_type)
+            );
             CREATE TABLE IF NOT EXISTS calendar_sync (
                 booking_id INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE,
                 calendar_id TEXT NOT NULL, starts_at INTEGER NOT NULL, ends_at INTEGER NOT NULL,
@@ -247,6 +252,42 @@ class SearchState:
     def booking_recovery(self):
         return self.db.execute(
             "SELECT * FROM booking_requests WHERE status IN ('questionnaire', 'checking', 'submitting', 'verifying')",
+        ).fetchall()
+
+    def queue_cancellation(self, patient: str, reservation_id: int, event_type: int,
+                           starts_at: int, signature: str) -> bool:
+        return self.db.execute(
+            """INSERT INTO cancellation_requests (patient, reservation_id, event_type, starts_at, signature)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (patient, reservation_id, event_type) DO UPDATE
+               SET starts_at = excluded.starts_at, signature = excluded.signature, status = 'queued'
+               WHERE cancellation_requests.status = 'blocked'""",
+            (patient, reservation_id, event_type, starts_at, signature),
+        ).rowcount == 1
+
+    def claim_cancellation(self) -> sqlite3.Row | None:
+        with self.db:
+            return self.db.execute(
+                """UPDATE cancellation_requests SET status = 'checking'
+                   WHERE id = (SELECT id FROM cancellation_requests WHERE status = 'queued' ORDER BY id LIMIT 1)
+                   RETURNING *""",
+            ).fetchone()
+
+    def cancellation_status(self, request_id: int, status: str) -> None:
+        self.db.execute("UPDATE cancellation_requests SET status = ? WHERE id = ?", (status, request_id))
+
+    def mark_cancelled_booking(self, patient: str, reservation_id: int, *, telephone: bool) -> None:
+        self.db.execute(
+            """UPDATE booking_requests SET status = 'ended', reason = 'cancelled'
+               WHERE patient = ? AND reservation_id = ? AND status = 'booked'
+                 AND search_id IN (SELECT id FROM searches WHERE telephone = ?)""",
+            (patient, reservation_id, int(telephone)),
+        )
+
+    def recover_cancellations(self) -> list[sqlite3.Row]:
+        self.db.execute("UPDATE cancellation_requests SET status = 'queued' WHERE status = 'checking'")
+        return self.db.execute(
+            "UPDATE cancellation_requests SET status = 'unknown' WHERE status = 'submitting' RETURNING *",
         ).fetchall()
 
     def queue_calendar_event(self, booking_id: int, event_id: str, calendar_id: str, start: int, end: int, now: int) -> None:
