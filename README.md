@@ -80,10 +80,10 @@ Use `Show my next appointments` or `Show upcoming appointments for <patient>`
 to see the numbered list of booked visits. Tap **Cancel 2** or type
 `Cancel 2` to see the selected appointment and choose whether to keep or cancel
 it. The number refers to the most recent list. The `patient1` pilot can cancel
-ordinary covered visits when LUX MED lists the cancellation action and indicates
-that it is on time. The worker rechecks the visit and conditions after approval
-and verifies the outcome. For late or paid visits and other unsupported cases,
-the confirmation menu provides Patient Portal steps.
+ordinary covered visits when LUX MED lists the cancellation action. The prompt
+shows any recognized late-cancellation warning before approval. The worker
+rechecks the visit and conditions after approval and verifies the outcome.
+For paid visits and unsupported conditions, the menu provides Patient Portal steps.
 
 For example, send “Find a pediatrician for <patient> next week, after 16:00,
 near Dominikańska” and then choose the visit type. The worker shows the
@@ -274,7 +274,11 @@ Set `OPENAI_API_KEY` as a secret in the same GitHub environment and repeat
 the encrypted configuration handoff. Use an OpenAI API project key. The
 worker uses one Responses API call per new plain-English availability
 request it can redact, such as “I’d like an internist to call me tomorrow
-afternoon.” Explicit `/find` commands and scheduled checks run locally.
+afternoon.” It can also interpret redacted requests to review cancellations,
+list appointments or searches, and ask for more options. Patient names and
+visit option numbers in these requests are replaced by placeholders.
+Explicit commands, approvals, questionnaire answers, and scheduled checks
+run locally.
 The local parser can also handle explicit requests if the API is unavailable.
 
 The worker recognizes the patient, service, and city locally. Only a small

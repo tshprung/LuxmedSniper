@@ -37,6 +37,25 @@ SCHEDULING_WORDS = frozenset("""
     monday tuesday wednesday thursday friday saturday sunday
 """.split())
 TIME_TOKEN = re.compile(r"(?:[0-9]{1,2}(?::[0-9]{2})?(?:am|pm)?|[0-9]{4}-[0-9]{2}-[0-9]{2})")
+CHAT_MARKERS = frozenset("appointments appointment booked cancel continue more options running searches status visits".split())
+CHAT_WORDS = SCHEDULING_WORDS | CHAT_MARKERS | frozenset("""
+    active already booked bookings care cancel cancelled different else keep latest list mine number of on one
+    other pending scheduled schedule second still tell them third upcoming ve which
+""".split()) | {"PERSON", "NUMBER"}
+CHAT_ACTIONS = ("appointments", "active", "cancel", "more", "continue")
+CHAT_SCHEMA = {
+    "type": "object",
+    "properties": {"intent": {"type": "string", "enum": [*CHAT_ACTIONS, "clarify"]}},
+    "required": ["intent"],
+    "additionalProperties": False,
+}
+CHAT_INSTRUCTIONS = """
+Interpret a redacted appointment assistant message. PERSON is a configured profile and NUMBER an option
+number. Return appointments to list scheduled visits, active to list running searches, cancel for a clear
+request to review cancellation, more for more options from the current list, or continue to keep searching.
+Return clarify if the user is uncertain, negates the action, wants to book, asks a medical question, or
+is requesting a new search. This classification never confirms a cancellation or booking.
+""".strip()
 
 SCHEMA = {
     "type": "object",
@@ -115,10 +134,47 @@ def redacted_request(text: str, aliases: dict, cities: dict):
     return redacted, patient, service, city
 
 
+def redacted_chat_request(text: str, aliases: dict):
+    normalized = clean(text.replace("#", " "))
+    if not set(normalized.split()) & CHAT_MARKERS:
+        return None
+    people = set()
+    names = {clean(name): patient for name, patient in aliases.items() if name not in ("me", "myself")}
+    names.pop("", None)
+    if names:
+        known = "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+
+        def replace_name(match: re.Match) -> str:
+            people.add(names[match[0]])
+            return "PERSON"
+
+        normalized = re.sub(rf"(?<!\w)(?:{known})(?!\w)", replace_name, normalized)
+    if not people and aliases.get("me") and re.search(r"\b(?:my|mine|myself|for me|i have|i ve)\b", normalized):
+        people.add(aliases["me"])
+    digits = set(re.findall(r"(?<!\w)[0-9]+(?!\w)", normalized))
+    if len(people) > 1 or any(len(value) > 9 for value in digits):
+        return None
+    redacted = re.sub(r"(?<!\w)[0-9]+(?!\w)", "NUMBER", normalized)
+    if any(word not in CHAT_WORDS for word in redacted.split()):
+        return None
+    number = int(next(iter(digits))) if len(digits) == 1 else None
+    return redacted, next(iter(people), None), number
+
+
 class FreeText:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.session = requests.Session()
+
+    def chat_action(self, text: str, aliases: dict) -> tuple[str, str | None, int | None] | None:
+        prepared = redacted_chat_request(text, aliases)
+        if prepared is None:
+            return None
+        redacted, patient, number = prepared
+        parsed = self.interpret(redacted, CHAT_INSTRUCTIONS, "telegram_chat_intent", CHAT_SCHEMA)
+        if not isinstance(parsed, dict) or parsed.get("intent") not in CHAT_ACTIONS:
+            return None
+        return parsed["intent"], patient, number if number and number > 0 else None
 
     def criteria(self, text: str, aliases: dict, children: set, cities: dict, *,
                  today: dt.date, local: Criteria | None = None) -> Criteria | None:
@@ -141,18 +197,37 @@ class FreeText:
             redacted, patient, service, city = prepared
             if local is not None:
                 patient, service, city = local.patient, local.service, local.city
+        parsed = self.interpret(redacted, INSTRUCTIONS, "telegram_search_intent", SCHEMA)
+        if not isinstance(parsed, dict) or parsed.get("intent") != "search":
+            return None
+        mode, when = parsed.get("mode"), parsed.get("when")
+        if mode not in ("phone", "in_person", "unspecified") or not isinstance(when, str) or len(when) > 120:
+            return None
+        if local is not None and (prepared is None or not service):
+            return local
+        key = normalize(service)
+        if mode == "phone" and requests_phone(redacted) and key not in PEDIATRIC_REQUESTS | GENERAL_REQUESTS:
+            service = phone_service(service)
+        if preferences == Preferences() and when:
+            preferences = parse_preferences(when, today)
+            if preferences.clinic or preferences.doctor:
+                return None
+        criteria = parse_search(f"/find {patient} | {service} | {city}", aliases, children, cities)
+        return replace(criteria, preferences=preferences)
+
+    def interpret(self, redacted: str, instructions: str, schema_name: str, schema: dict) -> dict | None:
         try:
             response = self.session.post(
                 "https://api.openai.com/v1/responses",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json={
                     "model": "gpt-5.4-nano",
-                    "instructions": INSTRUCTIONS,
+                    "instructions": instructions,
                     "input": redacted,
                     "store": False,
                     "reasoning": {"effort": "none"},
                     "max_output_tokens": 128,
-                    "text": {"format": {"type": "json_schema", "name": "telegram_search_intent", "strict": True, "schema": SCHEMA}},
+                    "text": {"format": {"type": "json_schema", "name": schema_name, "strict": True, "schema": schema}},
                 },
                 timeout=(4, 8),
                 allow_redirects=False,
@@ -169,23 +244,6 @@ class FreeText:
             ]
             if len(items) != 1:
                 return None
-            parsed = json.loads(items[0])
-            mode, when = parsed["mode"], parsed["when"]
-            if parsed["intent"] != "search" or mode not in {"phone", "in_person", "unspecified"}:
-                return None
-            if not isinstance(when, str) or len(when) > 120:
-                return None
+            return json.loads(items[0])
         except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError):
             raise RequestError("Free-text interpretation is unavailable. Try /find patient | service | city.") from None
-
-        if local is not None and (prepared is None or not service):
-            return local
-        key = normalize(service)
-        if mode == "phone" and requests_phone(redacted) and key not in PEDIATRIC_REQUESTS | GENERAL_REQUESTS:
-            service = phone_service(service)
-        if preferences == Preferences() and when:
-            preferences = parse_preferences(when, today)
-            if preferences.clinic or preferences.doctor:
-                return None
-        criteria = parse_search(f"/find {patient} | {service} | {city}", aliases, children, cities)
-        return replace(criteria, preferences=preferences)

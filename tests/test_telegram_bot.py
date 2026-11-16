@@ -10,7 +10,10 @@ import requests
 from nacl.public import PrivateKey, SealedBox
 
 from luxmed_questionnaire import Questionnaire, QuestionnaireError
-from luxmed_sniper import WARSAW, Appointment, BookingQuestionnaireRequired, LuxMedPortal, Luxmed, PortalError, ScheduledVisit
+from luxmed_sniper import (
+    WARSAW, Appointment, BookingQuestionnaireRequired, CancellationTerms, LuxMedPortal,
+    Luxmed, PortalError, ScheduledVisit,
+)
 from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import SECRET_KEYS, booking_patients, package_settings, trusted_devices
@@ -272,7 +275,7 @@ class BotTests(unittest.TestCase):
                                event_id=81, event_type=1, cancellation_instance=82)
         client = MagicMock()
         client.scheduled_visits.side_effect = [[visit], [visit], []]
-        client.cancellation_is_late.return_value = False
+        client.cancellation_terms.return_value = CancellationTerms(6, True)
         with patch.object(self.bot, "portal_for", return_value=client):
             self.update(1, "/appointments Adult")
             self.bot.flush()
@@ -282,6 +285,8 @@ class BotTests(unittest.TestCase):
             self.assertIn("01 Apr 2030, 13:00 · Fixture service", message["text"])
             self.assertIn("Fixture clinic · Fixture clinician", message["text"])
             self.assertIn("Are you sure", message["text"])
+            self.assertIn("within 6 hours", message["text"])
+            self.assertIn("may affect future booking", message["text"])
             confirm, keep = json.loads(message["buttons"])[0]
             self.bot.flush()
             self.bot.cancellation_due()
@@ -316,7 +321,7 @@ class BotTests(unittest.TestCase):
             self.assertIsNone(self.state.due_calendar_removal("primary", self.now))
             self.bot.cancellation_due()
             client.cancel_standard_visit.assert_called_once_with(visit)
-            self.assertEqual(client.cancellation_is_late.call_count, 3)
+            self.assertEqual(client.cancellation_terms.call_count, 3)
 
     def test_confirmed_cancellation_stops_if_provider_conditions_change(self):
         starts = dt.datetime(2030, 4, 1, 13, tzinfo=WARSAW)
@@ -324,7 +329,7 @@ class BotTests(unittest.TestCase):
                                event_id=91, event_type=1, cancellation_instance=92)
         client = MagicMock()
         client.scheduled_visits.return_value = [visit]
-        client.cancellation_is_late.side_effect = [False, True]
+        client.cancellation_terms.side_effect = [CancellationTerms(), CancellationTerms(6, True)]
         with patch.object(self.bot, "portal_for", return_value=client):
             self.update(1, "/appointments Adult")
             self.bot.flush()
@@ -333,7 +338,9 @@ class BotTests(unittest.TestCase):
             self.update(3, "Confirm cancellation", reply_to=42)
             self.bot.flush()
             self.bot.cancellation_due()
-            self.assertIn("flags this as a late cancellation", self.state.next_message()["text"])
+            message = self.state.next_message()
+            self.assertIn("cancellation conditions changed", message["text"])
+            self.assertIn("Upcoming appointments", message["buttons"])
             client.cancel_standard_visit.assert_not_called()
 
     def test_interrupted_cancellation_is_never_resubmitted(self):
@@ -1525,6 +1532,46 @@ class BotTests(unittest.TestCase):
         self.assertEqual(next_search_time(local_timestamp(30, 22)), local_timestamp(30, 22))
         self.assertEqual(next_search_time(local_timestamp(30, 22, 1)), local_timestamp(31, 6))
         self.assertEqual(next_search_time(local_timestamp(31, 5, 59)), local_timestamp(31, 6))
+
+    def test_ai_chat_routes_cancellation_review_to_the_named_patient(self):
+        self.bot.free_text = FreeText("fixture-key")
+        reply = MagicMock(status_code=200)
+        reply.json.return_value = {
+            "status": "completed", "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": '{"intent":"cancel"}'},
+            ]}],
+        }
+        starts = dt.datetime(2030, 4, 1, 13, tzinfo=WARSAW)
+        clients = {patient: MagicMock() for patient in self.profiles}
+        for patient in ("patient1", "patient2"):
+            clients[patient].scheduled_visits.return_value = [ScheduledVisit(starts, "Fixture visit", "", "", "")]
+        with (patch.object(self.bot, "portal_for", side_effect=clients.__getitem__),
+              patch.object(self.bot.free_text.session, "post", return_value=reply) as api):
+            self.update(1, "/appointments Adult")
+            self.bot.flush()
+            self.update(2, "Could you cancel appointment number 1 for Child please?")
+            self.assertEqual(api.call_args.kwargs["json"]["input"],
+                             "could you cancel appointment number NUMBER for PERSON please")
+            self.assertIn("Upcoming LUX MED appointments for Child", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(3, "Could you cancel appointment number 1 please?")
+            self.assertIn("Appointment 1 for Child", self.state.next_message()["text"])
+            self.assertIn("Are you sure", self.state.next_message()["text"])
+            self.bot.cancellation_due()
+            for client in clients.values():
+                client.cancel_standard_visit.assert_not_called()
+
+    def test_added_specialties_resolve_to_their_in_person_catalog_names(self):
+        choices = (
+            ("endocrinologist", "Endokrynolog"), ("gastrologa", "Gastroenterolog (Gastrolog)"),
+            ("rheumatologist", "Reumatolog"), ("nephrologist", "Nefrolog"),
+            ("pulmonologist", "Pulmonolog"), ("diabetologist", "Diabetolog"),
+            ("hematologist", "Hematolog"),
+        )
+        for update_id, (alias, _) in enumerate(choices, 1):
+            self.update(update_id, f"Find {alias} for Adult")
+        self.assertEqual([(row["service"], row["telephone"]) for row in self.state.active()],
+                         [(service, 0) for _, service in choices])
 
     def test_free_text_path_keeps_names_and_service_local(self):
         self.bot.free_text = FreeText("fixture-key")

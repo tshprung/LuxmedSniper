@@ -11,7 +11,7 @@ import requests
 
 import audit_search
 from luxmed_questionnaire import QuestionnaireReceipt
-from luxmed_sniper import DoctorLocator, Luxmed, LuxMedPortal, PortalError
+from luxmed_sniper import CancellationTerms, DoctorLocator, Luxmed, LuxMedPortal, PortalError
 from telegram_requests import INTERNIST_PHONE_SERVICE
 
 
@@ -194,14 +194,14 @@ class SearchTests(unittest.TestCase):
         with patch.object(requests.Session, "request", side_effect=[
             response({"token": "fixture-token"}), response({"events": [
                 visit, {**visit, "eventId": 42, "paymentState": 1},
-            ]}), response({"isLate": False, "allowNonShowProcess": False}),
+            ]}), response({"isLate": True, "allowNonShowProcess": True, "parameters": {"hours": 6}}),
             response({"token": "fixture-request-token"}), response({"isSuccess": True}),
         ]) as request:
             portal = LuxMedPortal(Luxmed(login="fixture", password="fixture"))
             with portal.session:
                 selected, paid = portal.scheduled_visits(NOW)
                 self.assertIsNone(paid.cancellation_instance)
-                self.assertFalse(portal.cancellation_is_late(selected))
+                self.assertEqual(portal.cancellation_terms(selected), CancellationTerms(6, True))
                 portal.cancel_standard_visit(selected)
         eligibility, _, cancellation = request.call_args_list[-3:]
         self.assertEqual(eligibility.args, ("GET", f"{LuxMedPortal.VISITS_URL}/isLateCancellation"))
