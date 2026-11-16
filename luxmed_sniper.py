@@ -30,6 +30,8 @@ from luxmed_questionnaire import QuestionnaireReceipt, visible_text
 WARSAW = ZoneInfo("Europe/Warsaw")
 PORTAL_TIMEOUT = (5, 15)
 BOOKED_STATUSES = (1, 2)  # Reserved and Confirmed in the Patient Portal.
+COMPLETED_VISIT_STATUS = 4  # Realized in the Patient Portal.
+CONSULTATION_TYPES = frozenset({1, 5, 7, 9, 12, 14})
 # Visit and examination types in the portal's scheduled timeline.
 SCHEDULED_VISIT_MODES = {
     1: "", 2: "", 4: "", 5: "Online consultation", 7: "Phone consultation", 9: "Video consultation",
@@ -109,15 +111,26 @@ class Appointment:
 
 
 @dataclass(frozen=True, repr=False)
-class ScheduledVisit:
+class VisitSummary:
     starts_at: datetime.datetime
     service: str
     clinic: str
     clinician: str
     mode: str
+
+
+@dataclass(frozen=True, repr=False)
+class ScheduledVisit(VisitSummary):
     event_id: int | None = None
     event_type: int = 0
     cancellation_instance: int | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class CompletedVisit(VisitSummary):
+    event_id: int
+    event_type: int
+    assigned_from_reservation: bool | int | None
 
 
 @dataclass(frozen=True)
@@ -179,6 +192,8 @@ class LuxMedPortal:
     DICTIONARY_FACILITIES_AND_DOCTORS = f'{DICTIONARY_URL}/facilitiesAndDoctors'
     UPCOMING_VISITS_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/DashboardMedicalSection/GetUpcomingVisits'
     SCHEDULED_VISITS_URL = f"{NEW_PORTAL_URL}/Timeline/GetStartEvents"
+    HISTORICAL_VISITS_URL = f"{NEW_PORTAL_URL}/Timeline/GetHistoricalEvents"
+    VISIT_DETAILS_URL = f"{NEW_PORTAL_URL}/Timeline/geteventdetails"
     VISITS_URL = f"{NEW_PORTAL_URL}/Visits"
     MEDICAL_PACKAGE_URL = f"{NEW_PORTAL_URL}/MedicalPackage"
     NON_SHOW_PENALTIES_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Reservation/CheckUserNonShowPenalties'
@@ -464,14 +479,7 @@ class LuxMedPortal:
                 raise PortalError("unexpected-scheduled-visits", stage="scheduled-visits")
             if status not in BOOKED_STATUSES:
                 continue
-            try:
-                date = event["date"]
-                if not isinstance(date, str) or len(date) < 16:
-                    raise ValueError("Scheduled visit requires a date and time")
-                starts = datetime.datetime.fromisoformat(date)
-                starts = starts.astimezone(WARSAW) if starts.tzinfo else starts.replace(tzinfo=WARSAW)
-            except (KeyError, TypeError, ValueError, OverflowError):
-                raise PortalError("unexpected-scheduled-visits", stage="scheduled-visits") from None
+            starts = timeline_visit_date(event.get("date"), stage="scheduled-visits")
             if starts.timestamp() < cutoff:
                 continue
             event_id = event.get("eventId")
@@ -479,16 +487,13 @@ class LuxMedPortal:
                 if (kind, event_id) in seen:
                     continue
                 seen.add((kind, event_id))
-            mode = SCHEDULED_VISIT_MODES[kind]
-            clinic = event.get("externalClinic") or event.get("clinic")
-            doctor = event.get("doctor")
-            service = visit_label(event.get("title"), 160)
+            summary = timeline_visit_summary(event, kind)
             instance_id = event.get("serviceInstanceId")
             actions = event.get("actions")
             # The timeline exposes CancelTerm (2) and paymentState None (5).
             standard_cancellation = (
                 kind in (1, 7)
-                and bool(service)
+                and bool(visit_label(event.get("title"), 160))
                 and type(event_id) is int and event_id > 0
                 and type(instance_id) is int and instance_id >= 0
                 and isinstance(actions, list) and any(type(action) is int and action == 2 for action in actions)
@@ -498,13 +503,65 @@ class LuxMedPortal:
                 and not any(event.get(key) is not None for key in ("clipId", "externalClinic"))
             )
             visits.append(ScheduledVisit(
-                starts, service or "LUX MED appointment",
-                visit_label(clinic.get("name"), 100) if isinstance(clinic, dict) and not mode else "",
-                visit_label(doctor.get("name"), 100) if isinstance(doctor, dict) else "", mode,
+                starts, *summary,
                 event_id if type(event_id) is int and event_id > 0 else None, kind,
                 instance_id if standard_cancellation else None,
             ))
         return sorted(visits, key=lambda visit: visit.starts_at.timestamp())
+
+    def latest_completed_visit(self, now: datetime.datetime) -> CompletedVisit | None:
+        before = None
+        cutoff = now.timestamp()
+        while True:
+            params = {} if before is None else {"beforeDate": before.strftime("%Y-%m-%d %H:%M:%S")}
+            page = self._portal_json("GET", self.HISTORICAL_VISITS_URL, stage="visit-history", params=params)
+            events = page.get("events") if isinstance(page, dict) else None
+            if not isinstance(events, list) or type(page.get("isEndOfList")) is not bool:
+                raise PortalError("unexpected-visit-history", stage="visit-history")
+            latest = None
+            for event in events:
+                if not isinstance(event, dict) or type(event.get("eventType")) is not int:
+                    raise PortalError("unexpected-visit-history", stage="visit-history")
+                kind = event["eventType"]
+                if kind not in CONSULTATION_TYPES:
+                    continue
+                if type(event.get("status")) is not int:
+                    raise PortalError("unexpected-visit-history", stage="visit-history")
+                if event["status"] != COMPLETED_VISIT_STATUS:
+                    continue
+                starts = timeline_visit_date(event.get("date"), stage="visit-history")
+                if starts.timestamp() > cutoff or (latest and starts.timestamp() <= latest.starts_at.timestamp()):
+                    continue
+                event_id = event.get("eventId")
+                if type(event_id) is not int or event_id <= 0:
+                    raise PortalError("unexpected-visit-history", stage="visit-history")
+                assigned = event.get("assignedFromReservationId")
+                latest = CompletedVisit(starts, *timeline_visit_summary(event, kind), event_id, kind,
+                                        assigned if type(assigned) in (bool, int) else None)
+            if latest is not None or page["isEndOfList"]:
+                return latest
+            if not events:
+                raise PortalError("unexpected-visit-history", stage="visit-history")
+            cursor = timeline_visit_date(events[-1].get("date"), stage="visit-history")
+            if before is not None and cursor.timestamp() >= before.timestamp():
+                raise PortalError("unexpected-visit-history", stage="visit-history")
+            before = cursor
+
+    def visit_recommendations(self, visit: CompletedVisit) -> str:
+        if visit.assigned_from_reservation is None:
+            raise PortalError("visit-reference-unavailable", stage="visit-details")
+        details = self._portal_json("GET", self.VISIT_DETAILS_URL, stage="visit-details", params={
+            "eventId": str(visit.event_id),
+            "eventType": str(visit.event_type),
+            "assignedFromReservationId": str(visit.assigned_from_reservation).lower(),
+        })
+        if (not isinstance(details, dict) or details.get("eventId") != visit.event_id
+                or details.get("eventType") != visit.event_type or details.get("status") != COMPLETED_VISIT_STATUS):
+            raise PortalError("unexpected-visit-details", stage="visit-details")
+        recommendations = details.get("recommendations")
+        if recommendations is not None and not isinstance(recommendations, str):
+            raise PortalError("unexpected-visit-details", stage="visit-details")
+        return visible_text(recommendations)
 
     def cancellation_terms(self, visit: ScheduledVisit) -> CancellationTerms:
         result = self._portal_json(
@@ -837,6 +894,27 @@ def service_variants(catalog: Any) -> Iterable[dict]:
 
 def visit_label(value: Any, limit: int) -> str:
     return " ".join(value.split())[:limit] if isinstance(value, str) else ""
+
+def timeline_visit_date(value: Any, *, stage: str) -> datetime.datetime:
+    try:
+        if not isinstance(value, str) or len(value) < 16:
+            raise ValueError("Visit requires a date and time")
+        starts = datetime.datetime.fromisoformat(value)
+        return starts.astimezone(WARSAW) if starts.tzinfo else starts.replace(tzinfo=WARSAW)
+    except (TypeError, ValueError, OverflowError):
+        raise PortalError(f"unexpected-{stage}", stage=stage) from None
+
+
+def timeline_visit_summary(event: dict, kind: int) -> tuple[str, str, str, str]:
+    mode = SCHEDULED_VISIT_MODES[kind]
+    clinic = event.get("externalClinic") or event.get("clinic")
+    doctor = event.get("doctor")
+    return (
+        visit_label(event.get("title"), 160) or "LUX MED appointment",
+        visit_label(clinic.get("name"), 100) if isinstance(clinic, dict) and not mode else "",
+        visit_label(doctor.get("name"), 100) if isinstance(doctor, dict) else "",
+        mode,
+    )
 
 
 def package_item_labels(item: Any) -> Iterable[str]:

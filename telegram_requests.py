@@ -127,12 +127,22 @@ SEARCH_PREFIX = re.compile(
 CLINICIAN_FIRST_SEARCH = re.compile(
     r"(?:an?\s+)?(?:appointment|visit)\s+for\s+(.+?)\s+(with\s+.+)", re.IGNORECASE,
 )
+SELF_APPOINTMENT_SEARCH = re.compile(
+    r"me\s+(?:(?:an?|the)\s+)?(?:appointment|visit)\s+for\s+(.+)", re.IGNORECASE,
+)
 APPOINTMENTS_REQUEST = re.compile(
     r"(?:(?:please )?(?:(?:can|could|would) you (?:please )?)?"
     r"(?:(?:show|list|check)(?: me)?|let me see|what are) )?"
     r"(?:all )?(?:my |the |(?P<possessor>[\w -]{1,80}?)['’]s )?"
     r"(?:(?:upcoming|next|scheduled|booked) )*(?:lux med )?(?:appointments?|visits?|bookings?)"
     r"(?: for (?P<patient>.+?))?(?: please)?"
+)
+LAST_VISIT = r"(?:my |the )?(?:last|most recent|previous) (?:completed )?(?:appointment|visit|consultation)(?: for me)?"
+LAST_VISIT_REQUEST = re.compile(rf"(?:(?:show|tell) me (?:about )?|show )?{LAST_VISIT}")
+LAST_VISIT_NOTES_REQUEST = re.compile(
+    r"(?:(?:(?:show|read)(?: me)? )?(?:the |my )?(?:doctor['’]s )?(?:notes|recommendations)|"
+    r"what did (?:the|my) doctor (?:write|say|recommend)|show me what (?:the|my) doctor (?:wrote|said|recommended)) "
+    rf"(?:from|at|in|during|after|for|about) {LAST_VISIT}"
 )
 COVERAGE_AFTER_SERVICE = re.compile(
     r"(?P<service>.+?) (?:covered|included|part of (?:my|the) (?:package|plan|subscription|abonament)|"
@@ -183,6 +193,16 @@ def appointments_request(text: str) -> str | None:
     return None
 
 
+def last_visit_request(text: str) -> str | None:
+    key = normalize(text.strip().rstrip("?.!"))
+    key = re.sub(r"^(?:please )?(?:(?:can|could|would) you (?:please )?)?", "", key).removesuffix(" please")
+    if key == "/lastnotes" or LAST_VISIT_NOTES_REQUEST.fullmatch(key):
+        return "notes"
+    if key == "/lastvisit" or LAST_VISIT_REQUEST.fullmatch(key):
+        return "visit"
+    return None
+
+
 def coverage_request(text: str) -> tuple[str, tuple[str, ...]] | None:
     key = normalize(text.strip().rstrip("?.!"))
     command, _, rest = key.partition(" ")
@@ -228,13 +248,17 @@ def split_clinician_first_search(text: str) -> tuple[str, str]:
     patient, details = match.groups()
     clinician_and_service, filters = split_preferences(details)
     parts = clinician_and_service.split()
-    known_services = GENERAL_SERVICES.keys() | {normalize(name) for name in GENERAL_SERVICES.values()}
     for index in range(2, len(parts)):
         service = " ".join(parts[index:])
-        if normalize(service) in known_services:
+        if known_search_service(service):
             clinician = " ".join(parts[:index]).rstrip(",")
             return f"Find {service} for {patient} {filters}".strip(), clinician
     return text, ""
+
+
+def known_search_service(service: str) -> bool:
+    key = normalize(service)
+    return key in GENERAL_SERVICES or any(key == normalize(name) for name in GENERAL_SERVICES.values())
 
 
 def city_catalog() -> dict[str, tuple[int, str]]:
@@ -377,6 +401,13 @@ def parse_search(text: str, aliases: dict[str, str], children: set[str], cities:
         if prefix is None:
             return None
         phrase = text[prefix.end():].rstrip(" ?.!")
+        if self_request := SELF_APPOINTMENT_SEARCH.fullmatch(phrase):
+            specialty_location, filters = split_preferences(self_request[1])
+            specialty, *city = re.split(r"\s+in\s+", specialty_location, maxsplit=1, flags=re.IGNORECASE)
+            specialty = re.sub(r"^(?:a|an)\s+", "", specialty, flags=re.IGNORECASE)
+            if known_search_service(specialty):
+                patient = f"me in {city[0]}" if city else "me"
+                phrase = f"{specialty} for {patient} {filters}".strip()
         # Only the part after the service can contain search filters.
         patient_separator = re.search(r"\s+for\s+", phrase, re.IGNORECASE)
         if patient_separator is None:
