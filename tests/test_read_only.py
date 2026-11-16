@@ -43,7 +43,11 @@ class SearchTests(unittest.TestCase):
         catalog = [{"name": "Tests", "children": [{"id": 456, "name": "Założenie Holtera EKG"}]}]
         details = {
             "header": {"itemTexts": [{"htmlText": "<b>Usługa jest poza Twoim abonamentem</b>"}]},
-            "executingConditions": [{"items": [{"itemTexts": [{"htmlText": "Ta usługa jest płatna"}]}]}],
+            "executingConditions": [{"items": [{"itemTexts": [
+                {"htmlText": "Ta usługa jest płatna", "additionalData": None},
+                {"htmlText": "Szczegóły usługi", "additionalData": None},
+                {"htmlText": "Więcej informacji", "additionalData": None},
+            ]}]}],
         }
         with patch("requests.Session.request", side_effect=map(response, [
             {"token": "fixture"}, plans, catalog, details,
