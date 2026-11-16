@@ -66,7 +66,7 @@ class SearchState:
                 booking_id INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE,
                 calendar_id TEXT NOT NULL, starts_at INTEGER NOT NULL, ends_at INTEGER NOT NULL,
                 next_attempt INTEGER NOT NULL, synced INTEGER NOT NULL DEFAULT 0,
-                attempts INTEGER NOT NULL DEFAULT 0
+                attempts INTEGER NOT NULL DEFAULT 0, removal TEXT NOT NULL DEFAULT 'none'
             );
         """)
         with self.db:
@@ -77,6 +77,8 @@ class SearchState:
             calendar_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(calendar_sync)")}
             if "attempts" not in calendar_columns:
                 self.db.execute("ALTER TABLE calendar_sync ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            if "removal" not in calendar_columns:
+                self.db.execute("ALTER TABLE calendar_sync ADD COLUMN removal TEXT NOT NULL DEFAULT 'none'")
             outbox_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(outbox)")}
             if "buttons" not in outbox_columns:
                 self.db.execute("ALTER TABLE outbox ADD COLUMN buttons TEXT")
@@ -276,12 +278,18 @@ class SearchState:
     def cancellation_status(self, request_id: int, status: str) -> None:
         self.db.execute("UPDATE cancellation_requests SET status = ? WHERE id = ?", (status, request_id))
 
-    def mark_cancelled_booking(self, patient: str, reservation_id: int, *, telephone: bool) -> None:
-        self.db.execute(
+    def mark_cancelled_booking(self, patient: str, reservation_id: int, now: int, *, telephone: bool) -> None:
+        bookings = self.db.execute(
             """UPDATE booking_requests SET status = 'ended', reason = 'cancelled'
                WHERE patient = ? AND reservation_id = ? AND status = 'booked'
-                 AND search_id IN (SELECT id FROM searches WHERE telephone = ?)""",
+                 AND search_id IN (SELECT id FROM searches WHERE telephone = ?)
+               RETURNING id""",
             (patient, reservation_id, int(telephone)),
+        ).fetchall()
+        self.db.executemany(
+            """UPDATE calendar_sync SET removal = 'pending', attempts = 0, next_attempt = ?
+               WHERE booking_id = ? AND removal = 'none'""",
+            [(now, booking["id"]) for booking in bookings],
         )
 
     def recover_cancellations(self) -> list[sqlite3.Row]:
@@ -314,6 +322,22 @@ class SearchState:
         self.db.execute(
             "UPDATE calendar_sync SET synced = ?, next_attempt = ?, attempts = attempts + 1 WHERE booking_id = ?",
             (synced, next_attempt, booking_id),
+        )
+
+    def due_calendar_removal(self, calendar_id: str, now: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            """SELECT calendar_sync.*, booking_requests.patient FROM calendar_sync
+               JOIN booking_requests ON booking_requests.id = calendar_sync.booking_id
+               WHERE removal = 'pending' AND calendar_id = ? AND next_attempt <= ?
+               ORDER BY next_attempt, booking_id LIMIT 1""",
+            (calendar_id, now),
+        ).fetchone()
+
+    def finish_calendar_removal(self, booking_id: int, next_attempt: int, removed: bool) -> None:
+        self.db.execute(
+            """UPDATE calendar_sync SET removal = ?, next_attempt = ?, attempts = attempts + 1
+               WHERE booking_id = ? AND removal = 'pending'""",
+            ("removed" if removed else "pending", next_attempt, booking_id),
         )
 
     def stop_booking(self, booking_id: int) -> bool:

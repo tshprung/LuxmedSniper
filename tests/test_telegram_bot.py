@@ -15,7 +15,7 @@ from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import SECRET_KEYS, booking_patients, package_settings, trusted_devices
 from telegram_free_text import FreeText, redacted_request
-from telegram_requests import INTERNIST_PHONE_SERVICE, pediatric_choice
+from telegram_requests import Criteria, INTERNIST_PHONE_SERVICE, pediatric_choice
 from telegram_state import SearchState, next_search_time
 
 
@@ -57,6 +57,34 @@ class CalendarTests(unittest.TestCase):
             "start": {"dateTime": start.isoformat()}, "end": {"dateTime": end.isoformat()},
         })
         self.assertTrue(get.call_args.args[0].endswith(f"/calendars/primary/events/{key}"))
+
+    def test_remove_calendar_event_checks_absence_and_calendar_access(self):
+        calendar = CalendarAvailability({})
+        with (
+            patch.object(calendar, "_headers", return_value={}),
+            patch("telegram_calendar.requests.delete") as delete,
+            patch("telegram_calendar.requests.get") as get,
+        ):
+            removed = delete.return_value.__enter__.return_value
+            listing = get.return_value.__enter__.return_value
+            removed.status_code = 204
+            calendar.remove_booking("primary", "fixture123")
+            removed.status_code = 410
+            removed.json.return_value = {"error": {"errors": [{"reason": "deleted"}]}}
+            calendar.remove_booking("primary", "fixture123")
+            get.assert_not_called()
+            removed.status_code = 404
+            listing.status_code = 200
+            listing.json.return_value = {"kind": "calendar#events", "accessRole": "owner"}
+            calendar.remove_booking("primary", "fixture123")
+            listing.status_code = 404
+            with self.assertRaises(CalendarUnavailable):
+                calendar.remove_booking("primary", "fixture123")
+            self.assertEqual(delete.call_args.args[0],
+                             "https://www.googleapis.com/calendar/v3/calendars/primary/events/fixture123")
+            self.assertEqual(delete.call_args.kwargs["params"], {"sendUpdates": "none"})
+            self.assertEqual(get.call_args.args[0],
+                             "https://www.googleapis.com/calendar/v3/calendars/primary/events")
 
     def test_detailed_calendar_event_uses_clinic_only_for_in_person_visits(self):
         calendar = CalendarAvailability({})
@@ -224,7 +252,22 @@ class BotTests(unittest.TestCase):
 
     def test_direct_cancellation_requires_confirming_the_exact_displayed_visit(self):
         self.telegram.send.side_effect = iter(range(40, 100))
+        self.now = local_timestamp(30, 23)
+        self.bot.calendar = MagicMock()
+        self.bot.calendar_destination = "primary"
+        self.bot.calendar.remove_booking.side_effect = [CalendarUnavailable, None]
         starts = dt.datetime(2030, 4, 1, 13, tzinfo=WARSAW)
+        with self.state.db:
+            for patient, telephone, event_id in (
+                ("patient1", False, "selected"), ("patient1", True, "othermode"), ("patient2", False, "otherpatient"),
+            ):
+                criteria = Criteria(patient, "Fixture service", 5, "Wrocław", telephone)
+                search_id, _, _, _ = self.state.add(criteria, self.now)
+                booking = self.state.request_booking(search_id, 1, patient, event_id)
+                self.state.booking_status(booking["id"], "booked", reservation_id=81)
+                self.state.queue_calendar_event(booking["id"], event_id, "primary", int(starts.timestamp()),
+                                                int(starts.timestamp()) + 900, self.now)
+                self.state.finish_calendar_attempt(booking["id"], self.now, True)
         visit = ScheduledVisit(starts, "Fixture service", "Fixture clinic", "Fixture clinician", "",
                                event_id=81, event_type=1, cancellation_instance=82)
         client = MagicMock()
@@ -242,6 +285,8 @@ class BotTests(unittest.TestCase):
             confirm, keep = json.loads(message["buttons"])[0]
             self.bot.flush()
             self.bot.cancellation_due()
+            self.bot.sync_calendar_due()
+            self.bot.calendar.remove_booking.assert_not_called()
             client.cancel_standard_visit.assert_not_called()
             self.tap(3, keep[1], 41)
             self.assertIn("Appointment kept", self.state.next_message()["text"])
@@ -254,6 +299,21 @@ class BotTests(unittest.TestCase):
             self.bot.flush()
             self.bot.cancellation_due()
             self.assertIn("Cancelled and verified in LUX MED", self.state.next_message()["text"])
+            self.bot.flush()
+            self.bot.sync_calendar_due()
+            self.assertIn("retry removing", self.state.next_message()["text"])
+            self.bot.sync_calendar_due()
+            self.bot.calendar.remove_booking.assert_called_once_with("primary", "selected")
+            self.bot.flush()
+            self.state.db.close()
+            self.state = self.bot.state = SearchState(self.path)
+            self.now += 900
+            self.bot.sync_calendar_due()
+            self.assertIn("Cleared the matching entry from Google Calendar", self.state.next_message()["text"])
+            self.bot.sync_calendar_due()
+            self.assertEqual(self.bot.calendar.remove_booking.call_count, 2)
+            self.bot.calendar.remove_booking.assert_called_with("primary", "selected")
+            self.assertIsNone(self.state.due_calendar_removal("primary", self.now))
             self.bot.cancellation_due()
             client.cancel_standard_visit.assert_called_once_with(visit)
             self.assertEqual(client.cancellation_is_late.call_count, 3)
