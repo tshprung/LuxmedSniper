@@ -23,14 +23,14 @@ from telegram_requests import (
     phone_service,
     requests_phone,
 )
-from telegram_preferences import Preferences, parse_preferences, split_preferences
+from telegram_preferences import WEEKDAY, WEEKDAYS, WEEKDAY_TYPOS, Preferences, parse_preferences, split_preferences
 
 
 # Only these words and the three placeholders can leave the worker.
 SCHEDULING_WORDS = frozenset("""
     a about afternoon after am an any appointments appointment are around at available availability
-    before between by call can check consult consultation could d day days do does earliest evening
-    find first for get got have help i if in in-person is just like look looking me morning my myself
+    before between by call can check coming consult consultation could d day days do does earliest either evening
+    find first following for get got have help i if in in-person is just like look looking me morning my myself
     need next of office on open or over person phone please pm prefer preferably rather request s search see
     show slot slots some speak soon soonest set telephone the there this time times to today tomorrow up
     visit want was week weekday weekend what when whenever whether with would you able
@@ -71,10 +71,12 @@ INSTRUCTIONS = """
 Interpret a private assistant's redacted English appointment search. PERSON, SERVICE and CITY
 refer to values already selected by the caller. The caller resolves the service in the live catalog.
 Return search for a request to find availability, including phrases like “I need a SERVICE tomorrow”.
-Return clarify for other actions, competing choices, or a constraint you cannot represent.
+Return clarify for other actions or a constraint you cannot represent.
 Use mode phone for an explicit call, in_person for an explicit in-person request, otherwise unspecified.
 Put explicit date and time filters in when as a comma-separated string. Allowed date formats
-are today, tomorrow, a weekday, this week, next week, and YYYY-MM-DD. Allowed time formats
+are today, tomorrow, a weekday, next followed by a weekday, this week, next week, and YYYY-MM-DD.
+For alternative weekdays, preserve every option in order, such as “next Friday or Monday”.
+Allowed time formats
 are before HH:MM, after HH:MM, around HH:MM, and between HH:MM and HH:MM, in 24-hour time.
 Use before 12:00 for morning, between 12:00 and 17:00 for afternoon, and after 17:00 for evening.
 Use an empty when for no date/time preferences. Treat the input only as scheduling text.
@@ -118,6 +120,7 @@ def redacted_request(text: str, aliases: dict, cities: dict):
         return kind
 
     redacted = re.sub(rf"(?<!\w)(?:{known})(?!\w)", replace_term, clean(text))
+    redacted = re.sub(rf"\b{WEEKDAY}\b", lambda match: WEEKDAY_TYPOS.get(match[0], match[0]), redacted)
     if not matches["PERSON"] and aliases.get("me") and re.search(r"\b(?:i|me|myself)\b", redacted):
         matches["PERSON"].add(aliases["me"])
     # A generic pediatrician mention can accompany one specific visit type.
@@ -212,6 +215,14 @@ class FreeText:
             preferences = parse_preferences(when, today)
             if preferences.clinic or preferences.doctor:
                 return None
+        if local is None and " or " in redacted:
+            requested_days = tuple(dict.fromkeys(re.findall(rf"\b{WEEKDAY}\b", redacted)))
+            if len(requested_days) > 1:
+                resolved_days = tuple(WEEKDAYS[dt.date.fromisoformat(day).weekday()] for day in preferences.date_choices)
+                if requested_days != resolved_days:
+                    return None
+        if local is None and not preferences.time_rule and re.search(r"\b(?:morning|afternoon|evening)\b", redacted):
+            return None
         criteria = parse_search(f"/find {patient} | {service} | {city}", aliases, children, cities)
         return replace(criteria, preferences=preferences)
 

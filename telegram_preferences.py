@@ -9,7 +9,13 @@ from luxmed_sniper import WARSAW, Appointment
 
 TIME = r"[0-9]{1,2}(?::[0-9]{2})?(?:\s*(?:am|pm))?"
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-DATE = r"(?:today|tomorrow|this week|next week|(?:on\s+)?(?:[0-9]{4}-[0-9]{2}-[0-9]{2}|" + "|".join(WEEKDAYS) + "))"
+WEEKDAY_TYPOS = {"monay": "monday"}
+WEEKDAY = r"(?:" + "|".join((*WEEKDAYS, *WEEKDAY_TYPOS)) + ")"
+WEEKDAY_DATE = rf"(?:next\s+)?{WEEKDAY}"
+DATE = (
+    rf"(?:today|tomorrow|this week|next week|(?:on\s+)?"
+    rf"(?:[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}|{WEEKDAY_DATE}(?:\s+or\s+(?:on\s+)?{WEEKDAY_DATE})*))"
+)
 FILTER = re.compile(
     rf"\s*(?:,\s*)?(?:(?P<date>{DATE})|"
     rf"(?P<between>between\s+{TIME}\s+and\s+{TIME})|"
@@ -29,6 +35,10 @@ class PreferenceError(ValueError):
     pass
 
 
+class UnrecognizedPreferences(PreferenceError):
+    pass
+
+
 @dataclass(frozen=True)
 class Preferences:
     first_date: str | None = None
@@ -39,10 +49,17 @@ class Preferences:
     doctor: str | None = None
     clinic: str | None = None
     preferred_clinic: bool = False
+    date_choices: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if isinstance(self.date_choices, list):
+            object.__setattr__(self, "date_choices", tuple(self.date_choices))
 
     def describe(self) -> str:
         parts = []
-        if self.first_date:
+        if self.date_choices:
+            parts.append(" or ".join(self.date_choices))
+        elif self.first_date:
             parts.append(self.first_date if self.first_date == self.last_date else f"{self.first_date} to {self.last_date}")
         if self.time_rule == "between":
             parts.append(f"between {clock_label(self.start_minute)} and {clock_label(self.end_minute)}")
@@ -76,6 +93,8 @@ def clock_minutes(value: str) -> int:
 
 def date_range(value: str, today: dt.date) -> tuple[str, str]:
     day = " ".join(value.casefold().split()).removeprefix("on ")
+    weekday = day.removeprefix("next ")
+    weekday = WEEKDAY_TYPOS.get(weekday, weekday)
     if day in ("this week", "next week"):
         monday = today - dt.timedelta(days=today.weekday())
         if day == "next week":
@@ -85,8 +104,9 @@ def date_range(value: str, today: dt.date) -> tuple[str, str]:
         date = today
     elif day == "tomorrow":
         date = today + dt.timedelta(days=1)
-    elif day in WEEKDAYS:
-        date = today + dt.timedelta(days=(WEEKDAYS.index(day) - today.weekday()) % 7)
+    elif weekday in WEEKDAYS:
+        offset = (WEEKDAYS.index(weekday) - today.weekday()) % 7
+        date = today + dt.timedelta(days=offset or (7 if day.startswith("next ") else 0))
     else:
         try:
             date = dt.date.fromisoformat(day)
@@ -114,7 +134,9 @@ def parse_preferences(text: str, today: dt.date, base: Preferences = Preferences
     while text.strip():
         match = FILTER.match(text)
         if match is None:
-            raise PreferenceError("I couldn't read those filters. Try next week, after 16:00, with Dr Smith, or clinic followed by its name.")
+            raise UnrecognizedPreferences(
+                "I couldn't read those filters. Try Friday or Monday, after 16:00, with Dr Smith, or clinic followed by its name."
+            )
         kind = match.lastgroup
         field = "time" if kind == "between" else kind
         if field in seen:
@@ -122,8 +144,16 @@ def parse_preferences(text: str, today: dt.date, base: Preferences = Preferences
         seen.add(field)
         value = match[kind].strip()
         if kind == "date":
-            first, last = date_range(value, today)
-            base = replace(base, first_date=first, last_date=last)
+            date_parts = re.split(r"\s+or\s+", value, flags=re.IGNORECASE)
+            first, last = date_range(date_parts[0], today)
+            choices = [first]
+            for day in date_parts[1:]:
+                _, last = date_range(day, dt.date.fromisoformat(last))
+                if last > (today + dt.timedelta(days=14)).isoformat():
+                    raise PreferenceError("Choose dates within the next 14 days.")
+                choices.append(last)
+            base = replace(base, first_date=first, last_date=last,
+                           date_choices=tuple(dict.fromkeys(choices)) if len(date_parts) > 1 else ())
         elif kind == "between":
             begin, end = re.split(r"\s+and\s+", value[8:], flags=re.IGNORECASE)
             lower, upper = clock_minutes(begin), clock_minutes(end)
@@ -179,6 +209,8 @@ def matching_slots(slots: list[Appointment], preferences: Preferences) -> tuple[
     for slot in slots:
         local = slot.AppointmentDate.astimezone(WARSAW)
         day = local.date().isoformat()
+        if preferences.date_choices and day not in preferences.date_choices:
+            continue
         if preferences.first_date and not preferences.first_date <= day <= preferences.last_date:
             continue
         minute = local.hour * 60 + local.minute
