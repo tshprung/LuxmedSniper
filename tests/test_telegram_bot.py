@@ -169,6 +169,7 @@ class BotTests(unittest.TestCase):
             text = self.state.next_message()["text"]
             self.assertIn("for Child (Warsaw time)", text)
             self.assertIn("01 Apr 2030, 13:00 · Fixture service", text)
+            self.assertIn("1. 01 Apr 2030", text)
             self.assertIn("Fixture clinic · Fixture clinician", text)
             self.bot.flush()
             self.update(5, "/appointments Other")
@@ -180,6 +181,42 @@ class BotTests(unittest.TestCase):
         for client in clients.values():
             client.reserve_standard_visit.assert_not_called()
         self.assertEqual(self.state.active(), [])
+
+    def test_numbered_cancel_selection_uses_the_latest_patient_and_rejects_an_old_button(self):
+        self.telegram.send.side_effect = iter(range(40, 100))
+        clients = {patient: MagicMock() for patient in self.profiles}
+        starts = dt.datetime(2030, 4, 1, 13, tzinfo=WARSAW)
+        clients["patient1"].scheduled_visits.return_value = [
+            ScheduledVisit(starts, "First fixture visit", "", "", ""),
+            ScheduledVisit(starts + dt.timedelta(hours=1), "Second fixture visit", "Test clinic", "", ""),
+        ]
+        clients["patient2"].scheduled_visits.return_value = [
+            ScheduledVisit(starts, "Child fixture visit", "", "", ""),
+        ]
+        with patch.object(self.bot, "portal_for", side_effect=clients.__getitem__) as portal_for:
+            self.update(1, "/appointments Adult")
+            original_buttons = json.loads(self.state.next_message()["buttons"])
+            self.assertEqual(original_buttons[1][0][0], "Cancel 2")
+            self.bot.flush()
+            self.update(2, "Cancel 2")
+            self.assertIn("Appointment 2 for Adult", self.state.next_message()["text"])
+            self.assertIn("Second fixture visit", self.state.next_message()["text"])
+            self.assertIn("Odwołaj", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(3, "/appointments Child")
+            child_button = json.loads(self.state.next_message()["buttons"])[0][0][1]
+            self.bot.flush()
+            self.tap(4, child_button, 42)
+            self.assertIn("Child fixture visit", self.state.next_message()["text"])
+            self.bot.flush()
+            self.tap(5, original_buttons[0][0][1], 40)
+            self.assertIn("get the current visit numbers", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(6, "Cancel 1")
+            self.assertIn("Child fixture visit", self.state.next_message()["text"])
+            self.assertEqual(portal_for.call_count, 2)
+            for patient in ("patient1", "patient2"):
+                self.assertEqual([call[0] for call in clients[patient].method_calls], ["scheduled_visits"])
 
     def test_appointments_respect_an_account_pause_even_before_first_search(self):
         with patch.object(self.bot, "portal_for", side_effect=PortalError("access-denied", suspend=True, stage="login")) as portal:
@@ -859,9 +896,13 @@ class BotTests(unittest.TestCase):
         client.search.return_value = [slot]
         client.check_booking_eligibility.side_effect = BookingQuestionnaireRequired({
             "id": "fixture-form", "inputService": {"servaId": 12},
-            "questions": [{"id": "start", "questionType": 1, "name": "Fixture question",
-                           "answers": [{"id": "chosen", "order": 1, "name": "Option A",
-                                        "triageResult": {"discriminator": "ServiceVariantResultDto", "servaId": 12}}]}],
+            "questions": [
+                {"id": "start", "questionType": 1, "name": "Fixture question",
+                 "answers": [{"id": "first", "order": 1, "name": "Option A", "nextQuestionUuid": "finish"}]},
+                {"id": "finish", "questionType": 4, "name": "Second fixture question",
+                 "answers": [{"id": "chosen", "order": 1, "name": "Option B",
+                              "triageResult": {"discriminator": "ServiceVariantResultDto", "servaId": 12}}]},
+            ],
         })
         self.update(1, "Find an internist for Adult")
         self.bot.search_due()
@@ -871,13 +912,18 @@ class BotTests(unittest.TestCase):
         self.bot.flush()
         self.assertIn("Adult · Internista", self.telegram.send.call_args.args[0])
         client.submit_booking_questionnaire.assert_not_called()
-        self.tap(3, "answer 1", self.bot.questionnaire_booking.message_id)
+        self.update(3, "1")
+        self.update(4, "Option 1")
+        self.assertEqual(self.bot.questionnaire_booking.form.answer_ids, ["first"])
+        self.bot.flush()
+        self.update(5, "Option 1")
         self.bot.booking_due()
         receipt = client.search.call_args.kwargs["questionnaire"]
-        self.assertEqual(client.submit_booking_questionnaire.call_args.args[0]["selectedAnswers"], [{"id": "chosen"}])
+        self.assertEqual(client.submit_booking_questionnaire.call_args.args[0]["selectedAnswers"],
+                         [{"id": "first"}, {"id": "chosen"}])
         client.reserve_standard_visit.assert_not_called()
         self.assertIn("Please confirm this internist appointment", self.state.next_message()["text"])
-        self.update(4, "Approve 1")
+        self.update(6, "Approve 1")
         self.bot.booking_due()
         client.reserve_standard_visit.assert_called_once_with(slot, "Internista", questionnaire=receipt)
         client.submit_booking_questionnaire.assert_called_once()
