@@ -166,6 +166,10 @@ available through the Patient Portal. The bot rechecks the slot and asks for
 approval when it starts in less than six hours, it detects a scheduling
 conflict, or a conflict check is unavailable. Use `Approve 1` with the
 request number shown, or `Stop booking 1` to drop a pending request.
+An unanswered approval expires one hour before the visit. The worker
+continues searching with the same filters during Warsaw search hours if
+the date window is still open and there is no other booking in progress
+for that search.
 The bot hands off to the Patient Portal for charges, referrals, changes
 to an existing visit, or a booking restriction. If confirmation is
 unclear, check the Patient Portal and reply `Reviewed 1` to allow new

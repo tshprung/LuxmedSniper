@@ -32,6 +32,7 @@ from telegram_state import SearchState, next_search_time
 PORTAL_REUSE_SECONDS = 3600
 RESULTS_PER_PAGE = 3
 SHORT_NOTICE_SECONDS = 6 * 3600
+APPROVAL_CUTOFF_SECONDS = 3600
 CALENDAR_RETRY_SECONDS = 15 * 60
 PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
 APPOINTMENTS_PORTAL_URL = "https://portalpacjenta.luxmed.pl/"
@@ -338,11 +339,8 @@ class SearchBot:
         }:
             self.handle_results(command, argument, reply)
         elif command in {"approve", "/approve"}:
-            if (
-                self.booking_enabled and re.fullmatch(r"[1-9][0-9]{0,8}", argument)
-                and self.state.approve_booking(int(argument), self.allowed_booking_patients)
-            ):
-                self.state.queue_message("Approved. I’ll recheck the selected appointment before booking.")
+            if re.fullmatch(r"[1-9][0-9]{0,8}", argument):
+                self.approve_booking(int(argument))
             else:
                 self.state.queue_message("Use Approve followed by the booking request number shown in my message.")
         elif command in {"reviewed", "/reviewed"}:
@@ -808,7 +806,10 @@ class SearchBot:
         if status == "booked":
             self.state.queue_message(f"{description}\nAlready booked in LUX MED.", search_id)
         elif status == "approval":
-            self.send_booking_approval(booking, description, booking["reason"])
+            if slot["start"] <= now + APPROVAL_CUTOFF_SECONDS:
+                self.expire_booking_offer(booking, self.state.results(booking["search_id"]), now)
+            else:
+                self.send_booking_approval(booking, description, booking["reason"], slot["start"])
         elif status == "queued":
             due = next_search_time(now)
             timing = "Checking the exact slot and booking conditions." if due == now else f"Queued for {local_time(due)} Warsaw time."
@@ -820,14 +821,58 @@ class SearchBot:
         else:
             self.state.queue_message(f"{description}\nThis booking request has ended. Use More or Continue for another slot.", search_id)
 
-    def send_booking_approval(self, booking, description: str, reason: str) -> None:
+    def send_booking_approval(self, booking, description: str, reason: str, starts_at: int) -> None:
+        deadline = local_time(starts_at - APPROVAL_CUTOFF_SECONDS)
         self.state.queue_message(
             f"{description}\n{reason}\nApproval code: {booking['id']}\n"
+            f"Approve by {deadline} Warsaw time.\n"
             f"Reply Approve {booking['id']} to book this option or Stop booking {booking['id']} to drop this request.",
             booking["search_id"],
             buttons=[[("Approve booking", f"approve {booking['id']}"),
                       ("Stop booking", f"stop booking {booking['id']}")]],
         )
+
+    def approve_booking(self, booking_id: int) -> None:
+        if booking_id in self.expire_due_approvals(int(self.clock())):
+            return
+        if self.booking_enabled and self.state.approve_booking(booking_id, self.allowed_booking_patients):
+            self.state.queue_message("Approved. I’ll recheck the selected appointment before booking.")
+        elif self.state.booking_approval_expired(booking_id):
+            self.state.queue_message(f"Approval {booking_id} has expired.", buttons=[[("Active searches", "active")]])
+        else:
+            self.state.queue_message("Use Approve followed by the booking request number shown in my message.")
+
+    def expire_due_approvals(self, now: int) -> set[int]:
+        due = self.state.due_booking_approvals(now + APPROVAL_CUTOFF_SECONDS)
+        for booking in due:
+            self.expire_booking_offer(booking, self.state.results(booking["search_id"]), now)
+        return {booking["id"] for booking in due}
+
+    def expire_booking_offer(self, booking, row, now: int) -> None:
+        booking_id, search_id = booking["id"], booking["search_id"]
+        if not self.state.expire_booking_approval(booking_id, booking["status"]):
+            return
+        if self.questionnaire_booking is not None and self.questionnaire_booking.booking_id == booking_id:
+            self.questionnaire_booking = None
+        message = f"Approval {booking_id} has expired."
+        if row is None or row["status"] != "found" or self.state.search_has_live_booking(search_id):
+            self.state.queue_message(message, search_id)
+            return
+        criteria = self.state.criteria(row)
+        next_due = next_search_time(max(now, row["next_due"]))
+        next_date = dt.datetime.fromtimestamp(next_due, WARSAW).date().isoformat()
+        if criteria.preferences.last_date and criteria.preferences.last_date < next_date:
+            self.state.queue_message(f"{message} The requested date window has ended.", search_id)
+            return
+        slots = json.loads(row["slots"])
+        excluded = json.loads(row["excluded_slots"])
+        excluded.extend(slots[number - 1] for number in self.state.expired_booking_options(search_id))
+        self.state.mark_continued(search_id)
+        followup, number, due, paused = self.state.add(
+            criteria, now, excluded_slots=[slot for slot in excluded if slot["start"] > now], not_before=next_due,
+        )
+        self.state.queue_message(f"{message} I’ll keep looking with the same filters.", followup)
+        self.confirm_search(followup, number, criteria, due, paused, now)
 
     def confirm_search(self, search_id: int, number: int, criteria: Criteria, due: int, paused: bool, now: int, *, changed: bool = False) -> None:
         if paused:
@@ -1162,6 +1207,8 @@ class SearchBot:
 
     def booking_due(self) -> None:
         now = int(self.clock())
+        with self.state.db:
+            self.expire_due_approvals(now)
         flow = self.questionnaire_booking
         if flow is not None and flow.expires_at <= now:
             with self.state.db:
@@ -1187,6 +1234,10 @@ class SearchBot:
         try:
             if slot["start"] <= now:
                 raise PortalError("slot-gone")
+            if not booking["approved"] and slot["start"] <= now + APPROVAL_CUTOFF_SECONDS:
+                with self.state.db:
+                    self.expire_booking_offer(booking, row, now)
+                return
             if normalize(criteria.service) in SICK_CHILD_SERVICES:
                 raise PortalError("portal-questions")
             if slot.get("requires_preparation") is True:
@@ -1244,9 +1295,12 @@ class SearchBot:
                 return
             if reasons and (not booking["approved"] or not set(reasons) <= set((booking["reason"] or "").splitlines())):
                 with self.state.db:
-                    reason = "\n".join(reasons)
-                    self.state.booking_status(booking["id"], "approval", reason=reason)
-                    self.send_booking_approval(booking, description, reason)
+                    if slot["start"] <= checked_at + APPROVAL_CUTOFF_SECONDS:
+                        self.expire_booking_offer(booking, row, checked_at)
+                    else:
+                        reason = "\n".join(reasons)
+                        self.state.booking_status(booking["id"], "approval", reason=reason)
+                        self.send_booking_approval(booking, description, reason, slot["start"])
                 return
             with self.state.db:
                 self.state.booking_status(booking["id"], "submitting")
