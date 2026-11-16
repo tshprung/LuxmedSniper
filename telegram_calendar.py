@@ -108,3 +108,33 @@ class CalendarAvailability:
                     raise CalendarUnavailable
         except (requests.RequestException, ValueError, AttributeError):
             raise CalendarUnavailable from None
+
+    def remove_booking(self, calendar_id: str, event_id: str) -> None:
+        events_url = f"https://www.googleapis.com/calendar/v3/calendars/{quote(calendar_id, safe='')}/events"
+        event_url = f"{events_url}/{quote(event_id, safe='')}"
+        headers = self._headers()
+        try:
+            with requests.delete(
+                event_url, headers=headers, timeout=(5, 15), allow_redirects=False,
+                params={"sendUpdates": "none"},
+            ) as response:
+                if response.status_code == 204:
+                    return
+                if response.status_code == 410:
+                    errors = response.json().get("error", {}).get("errors", [])
+                    if any(error.get("reason") == "deleted" for error in errors):
+                        return
+                if response.status_code != 404:
+                    raise CalendarUnavailable
+            # A 404 can also mean the account lost access to the calendar.
+            with requests.get(
+                events_url, headers=headers, timeout=(5, 15), allow_redirects=False,
+                params={"maxResults": 1, "fields": "kind,accessRole"},
+            ) as response:
+                if response.status_code == 200:
+                    calendar = response.json()
+                    if calendar.get("kind") == "calendar#events" and calendar.get("accessRole") in ("owner", "writer"):
+                        return
+        except (requests.RequestException, TypeError, ValueError, AttributeError):
+            raise CalendarUnavailable from None
+        raise CalendarUnavailable

@@ -212,7 +212,10 @@ visit, set `LUXMED_CALENDAR_DETAILS_PATIENTS` in the worker's environment
 to a comma-separated list of profile keys (such as `patient1`). This
 applies when creating events. The worker uses the same event ID for
 retries and sends a Telegram update if sync is delayed or succeeds.
-Cancelled appointments already in Google Calendar need to be removed there.
+After a verified Telegram cancellation, the worker removes the exact event
+it logged for that visit in the configured calendar and retries calendar
+errors separately. Visits cancelled in the Patient Portal and events
+created manually need separate calendar cleanup.
 
 ### Read-only booking feasibility
 

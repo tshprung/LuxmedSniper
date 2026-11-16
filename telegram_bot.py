@@ -1472,7 +1472,7 @@ class SearchBot:
             self.state.cancellation_status(request_id, status)
             if status == "cancelled":
                 self.state.mark_cancelled_booking(
-                    patient, request["reservation_id"], telephone=request["event_type"] == 7,
+                    patient, request["reservation_id"], int(self.clock()), telephone=request["event_type"] == 7,
                 )
             self.state.queue_message(f"{description}\n{message}")
 
@@ -1490,6 +1490,10 @@ class SearchBot:
         if self.calendar is None or not self.calendar_destination:
             return
         now = int(self.clock())
+        removal = self.state.due_calendar_removal(self.calendar_destination, now)
+        if removal is not None:
+            self.sync_calendar_removal(removal)
+            return
         if next_search_time(now) != now:
             return
         event = self.state.due_calendar_event(self.calendar_destination, now)
@@ -1540,6 +1544,24 @@ class SearchBot:
         with self.state.db:
             self.state.finish_calendar_attempt(event["booking_id"], now, True)
             self.state.queue_message(f"{appointment}\nAdded the appointment to Google Calendar.", event["search_id"])
+
+    def sync_calendar_removal(self, event) -> None:
+        profile = self.profiles[event["patient"]].name
+        appointment = f"{profile} · {local_time(event['starts_at'])} (Warsaw time)"
+        try:
+            self.calendar.remove_booking(event["calendar_id"], event["event_id"])
+        except CalendarUnavailable:
+            retry = int(self.clock()) + CALENDAR_RETRY_SECONDS
+            with self.state.db:
+                self.state.finish_calendar_removal(event["booking_id"], retry, False)
+                if event["attempts"] == 0:
+                    self.state.queue_message(
+                        f"{appointment}\nThe visit was cancelled. I’ll retry removing its Google Calendar event."
+                    )
+            return
+        with self.state.db:
+            self.state.finish_calendar_removal(event["booking_id"], int(self.clock()), True)
+            self.state.queue_message(f"{appointment}\nCleared the matching entry from Google Calendar.")
 
     @staticmethod
     def refresh_booking_slot(portal, locator: DoctorLocator, slot: dict, *, nationwide_from: str | None = None,
