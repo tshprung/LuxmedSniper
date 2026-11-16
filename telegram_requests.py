@@ -125,7 +125,8 @@ SEARCH_PREFIX = re.compile(
     re.IGNORECASE,
 )
 CLINICIAN_FIRST_SEARCH = re.compile(
-    r"(?:an?\s+)?(?:appointment|visit)\s+for\s+(.+?)\s+(with\s+.+)", re.IGNORECASE,
+    r"(?:an?\s+)?(?:appointment|visit)\s+for\s+(.+?)\s+(with\s+.+|for\s+(?:doctor|dr\.?)\s+.+)",
+    re.IGNORECASE,
 )
 SELF_APPOINTMENT_SEARCH = re.compile(
     r"me\s+(?:(?:an?|the)\s+)?(?:appointment|visit)\s+for\s+(.+)", re.IGNORECASE,
@@ -138,7 +139,7 @@ APPOINTMENTS_REQUEST = re.compile(
     r"(?: for (?P<patient>.+?))?(?: please)?"
 )
 LAST_VISIT = r"(?:my |the )?(?:last|most recent|previous) (?:completed )?(?:appointment|visit|consultation)(?: for me)?"
-LAST_VISIT_REQUEST = re.compile(rf"(?:(?:show|tell) me (?:about )?|show )?{LAST_VISIT}")
+LAST_VISIT_REQUEST = re.compile(rf"(?:(?:show|tell) me (?:about )?|show |(?:what|when) was )?{LAST_VISIT}")
 LAST_VISIT_NOTES_REQUEST = re.compile(
     r"(?:(?:(?:show|read)(?: me)? )?(?:the |my )?(?:doctor['’]s )?(?:notes|recommendations)|"
     r"what did (?:the|my) doctor (?:write|say|recommend)|show me what (?:the|my) doctor (?:wrote|said|recommended)) "
@@ -246,6 +247,7 @@ def split_clinician_first_search(text: str) -> tuple[str, str]:
     if match is None:
         return text, ""
     patient, details = match.groups()
+    details = re.sub(r"^for\s+", "with ", details, flags=re.IGNORECASE)
     clinician_and_service, filters = split_preferences(details)
     parts = clinician_and_service.split()
     for index in range(2, len(parts)):

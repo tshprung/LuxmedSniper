@@ -244,6 +244,10 @@ class BotTests(unittest.TestCase):
             portal.visit_recommendations.return_value = ""
             self.update(5, "What did the doctor write in my last appointment?")
             self.assertIn("hasn’t published any recommendations", self.state.next_message()["text"])
+            self.bot.flush()
+            self.update(6, "what was my last appointment?")
+            self.assertIn("Your last completed LUX MED appointment", self.state.next_message()["text"])
+            self.assertEqual(portal.visit_recommendations.call_count, 2)
             portal.scheduled_visits.assert_not_called()
             self.assertTrue(all(call.args == ("patient1",) for call in portal_for.call_args_list))
         self.bot.free_text.chat_action.assert_not_called()
@@ -1825,10 +1829,11 @@ class BotTests(unittest.TestCase):
             "Find appointment for me with Marta Babiarczyk internista na NFZ on next Friday or Monday",
             "Find appointment for me with Marta Babiarczyk internista na NFZ on Friday or monay",
             "Find me appointment for internista NFZ with Marta Babiarczyk on next Friday or Monday",
+            "find appointment for me for doctor Marta Babiarczyk internist NFZ on comming friday or monday",
         ), 1):
             self.update(number, text)
         rows = self.state.active()
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(rows), 4)
         for row in rows:
             criteria = self.state.criteria(row)
             self.assertEqual(criteria.patient, "patient1")
