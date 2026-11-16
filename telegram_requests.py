@@ -57,7 +57,9 @@ GENERAL_SERVICES = {
     "interniste": "Internista",
     "internal medicine": "Internista",
     "internista nfz": INTERNIST_NFZ_SERVICE,
+    "internista na nfz": INTERNIST_NFZ_SERVICE,
     "internist nfz": INTERNIST_NFZ_SERVICE,
+    "nfz internist": INTERNIST_NFZ_SERVICE,
     "internista poz": INTERNIST_NFZ_SERVICE,
     "internist poz": INTERNIST_NFZ_SERVICE,
     "internist phone consultation": INTERNIST_PHONE_SERVICE,
@@ -121,6 +123,9 @@ GENERAL_REQUESTS = {"doctor", "lekarz", "lekarza"}
 SEARCH_PREFIX = re.compile(
     r"^(?:please\s+)?(?:(?:can|could|would)\s+you\s+(?:please\s+)?)?(?:find|(?:look|search|check)\s+for)\s+",
     re.IGNORECASE,
+)
+CLINICIAN_FIRST_SEARCH = re.compile(
+    r"(?:an?\s+)?(?:appointment|visit)\s+for\s+(.+?)\s+(with\s+.+)", re.IGNORECASE,
 )
 APPOINTMENTS_REQUEST = re.compile(
     r"(?:(?:please )?(?:(?:can|could|would) you (?:please )?)?"
@@ -213,6 +218,23 @@ def matching_package_services(query: str, services: list[dict]) -> tuple[list[di
         if partial:
             return partial, False
     return [], False
+
+
+def split_clinician_first_search(text: str) -> tuple[str, str]:
+    prefix = SEARCH_PREFIX.match(text)
+    match = CLINICIAN_FIRST_SEARCH.fullmatch(text[prefix.end():]) if prefix else None
+    if match is None:
+        return text, ""
+    patient, details = match.groups()
+    clinician_and_service, filters = split_preferences(details)
+    parts = clinician_and_service.split()
+    known_services = GENERAL_SERVICES.keys() | {normalize(name) for name in GENERAL_SERVICES.values()}
+    for index in range(2, len(parts)):
+        service = " ".join(parts[index:])
+        if normalize(service) in known_services:
+            clinician = " ".join(parts[:index]).rstrip(",")
+            return f"Find {service} for {patient} {filters}".strip(), clinician
+    return text, ""
 
 
 def city_catalog() -> dict[str, tuple[int, str]]:

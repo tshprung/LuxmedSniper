@@ -13,6 +13,7 @@ from pathlib import Path
 
 import requests
 
+from luxmed_prices import PublicPriceList
 from luxmed_questionnaire import Questionnaire, QuestionnaireError, QuestionnaireReceipt, visible_text
 from luxmed_sniper import (
     WARSAW, BookingQuestionnaireRequired, CancellationTerms, DoctorLocator, Luxmed, LuxMedPortal,
@@ -21,14 +22,14 @@ from luxmed_sniper import (
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_settings, trusted_devices, validate, worker_settings
 from telegram_free_text import FreeText
-from telegram_preferences import PreferenceError, Preferences, matching_slots, parse_preferences
+from telegram_preferences import PreferenceError, Preferences, UnrecognizedPreferences, matching_slots, parse_preferences
 from telegram_requests import (
     ALLERGY_SERVICE, GENERAL_SERVICES, INTERNIST_PHONE_SERVICE, PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria,
     PatientChoiceNeeded, PatientServiceMismatch, RequestError, ServiceChoiceNeeded, VisitModeChoiceNeeded,
     appointments_request, check_patient_service, city_catalog, coverage_request,
     matching_catalog_variants, matching_package_services, nearby_catalog_variants, normalize, parse_search,
     pediatric_choice, pediatric_menu,
-    phone_service, requests_phone, requests_remote,
+    phone_service, requests_phone, requests_remote, split_clinician_first_search,
 )
 from telegram_state import SearchState, next_search_time
 
@@ -217,6 +218,7 @@ def local_time(timestamp: int) -> str:
 class SearchBot:
     def __init__(self, telegram: Telegram, state: SearchState, profiles: dict[str, Profile], *, clock=time.time,
                  free_text: FreeText | None = None, calendar: CalendarAvailability | None = None,
+                 public_prices: PublicPriceList | None = None,
                  booking_enabled: bool = False, device_credentials: dict | None = None,
                  allowed_booking_patients: frozenset[str] | None = None, calendar_destination: str | None = None,
                  calendar_detail_patients: frozenset[str] = frozenset()):
@@ -225,6 +227,7 @@ class SearchBot:
         self.profiles = profiles
         self.clock = clock
         self.free_text = free_text
+        self.public_prices = public_prices
         self.calendar = calendar
         self.calendar_destination = calendar_destination
         self.calendar_detail_patients = calendar_detail_patients
@@ -454,12 +457,15 @@ class SearchBot:
                     results.append(f"Service {number} · No match in the package catalog. Try the exact LUX MED name.")
                 elif len(variants) == 1 and exact:
                     variant = variants[0]
-                    summaries = [
-                        self.coverage_summary(portal.medical_package_coverage(package, variant["id"]))
-                        for package in packages
-                    ]
+                    coverage = [portal.medical_package_coverage(package, variant["id"]) for package in packages]
+                    quote = None
+                    if self.public_prices is not None and all(item.status in {"paid", "outside"} for item in coverage):
+                        quote = self.public_prices.lookup(variant["name"])
+                    summaries = [self.coverage_summary(item, has_listed_price=quote is not None) for item in coverage]
                     if len(summaries) > 1:
                         summaries = [f"Package {i} · {summary}" for i, summary in enumerate(summaries, 1)]
+                    if quote is not None:
+                        summaries.append(quote.describe())
                     results.append("\n".join([variant["name"], *summaries]))
                 else:
                     choices.append((number, variants))
@@ -490,10 +496,10 @@ class SearchBot:
             )
 
     @staticmethod
-    def coverage_summary(coverage: PackageCoverage) -> str:
+    def coverage_summary(coverage: PackageCoverage, *, has_listed_price: bool = False) -> str:
         status = {
             "covered": "Included in the subscription",
-            "paid": "Payable · price unavailable from this lookup",
+            "paid": "Payable" if has_listed_price else "Payable · price unavailable from this lookup",
             "outside": "Outside the subscription",
             "copay": "LUX MED lists a co-payment · amount unavailable from this lookup",
             "unknown": "LUX MED coverage could not be confirmed",
@@ -645,9 +651,15 @@ class SearchBot:
     def handle_search(self, text: str) -> None:
         error_message = None
         menu_selection = False
+        needs_filter_interpretation = False
         today = dt.datetime.fromtimestamp(self.clock(), WARSAW).date()
+        text, doctor_filter = split_clinician_first_search(text)
+        doctor = None
         try:
-            criteria = parse_search(text, self.aliases, self.children, self.cities, today=today)
+            if doctor_filter:
+                doctor = parse_preferences(doctor_filter, today).doctor
+            local_text = f"{text}, {doctor_filter}" if doctor else text
+            criteria = parse_search(local_text, self.aliases, self.children, self.cities, today=today)
         except PatientChoiceNeeded as error:
             self.show_search_patient_choices({"parts": error.parts})
             return
@@ -668,6 +680,10 @@ class SearchBot:
         except PatientServiceMismatch as error:
             self.reject_mismatch(error)
             return
+        except UnrecognizedPreferences as error:
+            criteria = None
+            error_message = str(error)
+            needs_filter_interpretation = True
         except PreferenceError as error:
             self.state.queue_message(str(error))
             return
@@ -690,7 +706,11 @@ class SearchBot:
                 interpreted = self.free_text.criteria(
                     text, self.aliases, self.children, self.cities, today=today, local=criteria,
                 )
-                if interpreted is not None:
+                if interpreted is not None and (
+                    not needs_filter_interpretation or interpreted.preferences != Preferences()
+                ):
+                    if doctor:
+                        interpreted = replace(interpreted, preferences=replace(interpreted.preferences, doctor=doctor))
                     criteria = interpreted
             except PatientServiceMismatch as error:
                 self.reject_mismatch(error)
@@ -2054,6 +2074,7 @@ def main() -> int:
             raise ValueError("Invalid calendar details patient list")
         bot = SearchBot(Telegram(token, owner), SearchState(path / "telegram.sqlite3"), profiles,
                         free_text=interpreter, calendar=calendar,
+                        public_prices=PublicPriceList(),
                         booking_enabled=bool(allowed_booking_patients),
                         device_credentials=trusted_devices(profiles),
                         allowed_booking_patients=allowed_booking_patients,

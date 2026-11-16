@@ -5,11 +5,13 @@ import json
 import os
 import unittest
 from contextlib import redirect_stdout
+from decimal import Decimal
 from unittest.mock import patch
 
 import requests
 
 import audit_search
+from luxmed_prices import PublicPriceList, wroclaw_prices
 from luxmed_questionnaire import QuestionnaireReceipt
 from luxmed_sniper import CancellationTerms, DoctorLocator, Luxmed, LuxMedPortal, PackageCoverage, PortalError
 from telegram_requests import INTERNIST_PHONE_SERVICE
@@ -38,6 +40,31 @@ def slot(starts_at, *, doctor=9, clinic_group=6):
 
 
 class SearchTests(unittest.TestCase):
+    def test_public_price_uses_the_cheapest_wroclaw_clinic_for_the_exact_service(self):
+        def service(label, clinic_prices):
+            return {"Nazwa_na_www": label, "cities": {"Wrocław": {
+                str(i): {"Nazwa_na_www": label, "city": city, "centerName": name, "cena": price}
+                for i, (city, name, price) in enumerate(clinic_prices)
+            }}}
+
+        label = "Konsultacja kardiologiczna"
+        catalog = {"Consultations": {"Cardiology": {
+            "in_person": service(label, [
+                ("Wrocław", "Swobodna", "329"), ("Wrocław", "Legnicka", "359"),
+                ("Wrocław", "Fabryczna", "329"), ("Poznań", "Outside the city", "199"),
+                ("Wrocław", "Missing price", ""),
+            ]),
+            "phone": service(label + " - telefoniczna", [("Wrocław", "Phone", "299")]),
+        }}}
+        document = '<script>{"priceList":' + json.dumps(catalog) + "}</script>"
+        price_list = PublicPriceList(clock=lambda: 1000)
+        with patch.object(price_list, "load", return_value=wroclaw_prices(document)) as load:
+            quote = price_list.lookup(label)
+            self.assertEqual(quote.amount, Decimal("329"))
+            self.assertEqual(quote.clinics, ("Fabryczna", "Swobodna"))
+            self.assertIsNone(price_list.lookup("Konsultacja kardiochirurgiczna"))
+            load.assert_called_once()
+
     def test_medical_package_lookups_use_only_read_only_portal_requests(self):
         plans = [{"packageId": 123}, {"packageId": 123}]
         catalog = [{"name": "Tests", "children": [{"id": 456, "name": "Założenie Holtera EKG"}]}]

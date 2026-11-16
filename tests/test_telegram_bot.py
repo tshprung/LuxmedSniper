@@ -3,12 +3,14 @@ import datetime as dt
 import json
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import requests
 from nacl.public import PrivateKey, SealedBox
 
+from luxmed_prices import ListedPrice
 from luxmed_questionnaire import Questionnaire, QuestionnaireError
 from luxmed_sniper import (
     WARSAW, Appointment, BookingQuestionnaireRequired, CancellationTerms, LuxMedPortal,
@@ -18,7 +20,8 @@ from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import SECRET_KEYS, booking_patients, package_settings, trusted_devices
 from telegram_free_text import FreeText, redacted_request
-from telegram_requests import Criteria, INTERNIST_PHONE_SERVICE, pediatric_choice
+from telegram_preferences import matching_slots, parse_preferences
+from telegram_requests import Criteria, INTERNIST_NFZ_SERVICE, INTERNIST_PHONE_SERVICE, pediatric_choice
 from telegram_state import SearchState, next_search_time
 
 
@@ -267,6 +270,20 @@ class BotTests(unittest.TestCase):
         self.assertIn("Założenie Holtera EKG", text)
         self.assertIn("Package 1 · Included in the subscription · Referral required", text)
         self.assertIn("Package 2 · LUX MED coverage could not be confirmed", text)
+
+    def test_payable_service_can_include_the_lowest_public_wroclaw_price(self):
+        self.bot.public_prices = MagicMock()
+        self.bot.public_prices.lookup.return_value = ListedPrice(Decimal("329"), ("Clinic A", "Clinic B"))
+        portal = MagicMock()
+        portal.medical_package_ids.return_value = ("package",)
+        portal.medical_package_services.return_value = [{"id": 111, "name": "Konsultacja kardiologiczna"}]
+        portal.medical_package_coverage.return_value = PackageCoverage("paid")
+        with patch.object(self.bot, "portal_for", return_value=portal):
+            self.update(1, "Is a cardiologist covered for me?")
+        result = self.state.next_message()["text"]
+        self.assertIn("Payable\nLowest LUX MED public price in Wrocław · 329 zł · 2 clinics at this price", result)
+        self.assertNotIn("price unavailable", result)
+        self.bot.public_prices.lookup.assert_called_once_with("Konsultacja kardiologiczna")
 
     def test_coverage_does_not_guess_on_a_catalog_miss_or_retry_a_rate_limit(self):
         portal = MagicMock()
@@ -1767,6 +1784,51 @@ class BotTests(unittest.TestCase):
         self.assertFalse(criteria.telephone)
         self.assertEqual((criteria.preferences.first_date, criteria.preferences.last_date), ("2030-03-31",) * 2)
         self.assertEqual(client.search.call_args.args[0].service_id, "15")
+
+    def test_clinician_first_nfz_search_keeps_two_separate_dates(self):
+        self.now = int(dt.datetime(2026, 11, 16, 10, tzinfo=WARSAW).timestamp())
+        for number, dates in enumerate(("next friday or monday", "friday or monay"), 1):
+            self.update(number, f"Find appointment for me with Marta Babiarczyk internista na NFZ on {dates}")
+        rows = self.state.active()
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            criteria = self.state.criteria(row)
+            self.assertEqual(criteria.patient, "patient1")
+            self.assertEqual(criteria.service, INTERNIST_NFZ_SERVICE)
+            self.assertEqual(criteria.preferences.doctor, "Marta Babiarczyk")
+            self.assertEqual(criteria.preferences.date_choices, ("2026-11-20", "2026-11-23"))
+        slots = [
+            Appointment(dt.datetime(2026, 11, day, 13, tzinfo=WARSAW), 1, "Clinic", doctor, 15)
+            for day, doctor in [(20, "Marta Babiarczyk"), (21, "Marta Babiarczyk"),
+                                (23, "Other Clinician"), (23, "Marta Babiarczyk")]
+        ]
+        matching, _ = matching_slots(slots, criteria.preferences)
+        self.assertEqual(matching, [slots[0], slots[3]])
+        self.assertIn("2026-11-20 or 2026-11-23", self.state.next_message()["text"])
+        revised = parse_preferences("next monday", dt.date(2026, 11, 16), criteria.preferences)
+        self.assertEqual(revised.date_choices, ())
+        self.assertEqual(revised.first_date, "2026-11-23")
+
+    def test_ai_interprets_flexible_time_without_receiving_the_clinician_name(self):
+        self.now = int(dt.datetime(2026, 11, 16, 10, tzinfo=WARSAW).timestamp())
+        self.bot.free_text = FreeText("fixture-key")
+        question = "Find appointment for me with Marta Babiarczyk internista na NFZ on Friday or Monday morning"
+        with patch.object(self.bot.free_text, "interpret") as interpret:
+            interpret.return_value = {"intent": "search", "mode": "unspecified", "when": "friday, before 12:00"}
+            self.update(1, question)
+            self.assertEqual(self.state.active(), [])
+            interpret.return_value["when"] = "friday or monday"
+            self.update(2, question)
+            self.assertEqual(self.state.active(), [])
+            interpret.return_value["when"] = "friday or monday, before 12:00"
+            self.update(3, question)
+        for call in interpret.call_args_list:
+            self.assertEqual(call.args[0], "find SERVICE for me on friday or monday morning")
+        row, = self.state.active()
+        preferences = self.state.criteria(row).preferences
+        self.assertEqual(preferences.date_choices, ("2026-11-20", "2026-11-23"))
+        self.assertEqual(preferences.doctor, "Marta Babiarczyk")
+        self.assertEqual((preferences.time_rule, preferences.start_minute), ("before", 720))
 
     def test_remote_catalog_variant_requires_selection_after_an_in_person_miss(self):
         self.update(1, "Find allergist for me")

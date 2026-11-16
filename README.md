@@ -89,13 +89,16 @@ Ask “Are a cardiologist visit and a heart Holter covered for me?” to check
 subscription coverage. Use a patient name or type
 `/coverage patient | exact portal service` for a specific catalog entry.
 The worker reads the patient's active LUX MED packages and offers choices
-when the service name matches multiple variants.
+when the service name matches multiple variants. For payable services it
+also shows the lowest published Wrocław price when the exact service is
+listed in LUX MED's public price list.
 
 For example, send “Find a pediatrician for <patient> next week, after 16:00,
 near Dominikańska” and then choose the visit type. The worker shows the
 interpreted filters in the confirmation and in `/active`. Date filters
 include today, tomorrow, a weekday, this week, next week or a date in
-YYYY-MM-DD format. A week runs Monday to Sunday. Times use Warsaw time.
+YYYY-MM-DD format. “Friday or Monday” searches on those two days only.
+A week runs Monday to Sunday. Times use Warsaw time.
 Use `around 16:00` for a one-hour tolerance in either direction, `after
 16:00`, `before 16:00`, or `between 09:00 and 12:00`. Use `with Dr
 <full name>` to filter for a doctor and `clinic <name>` to filter for a
