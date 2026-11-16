@@ -85,6 +85,12 @@ shows any recognized late-cancellation warning before approval. The worker
 rechecks the visit and conditions after approval and verifies the outcome.
 For paid visits and unsupported conditions, the menu provides Patient Portal steps.
 
+Ask “Are a cardiologist visit and a heart Holter covered for me?” to check
+subscription coverage. Use a patient name or type
+`/coverage patient | exact portal service` for a specific catalog entry.
+The worker reads the patient's active LUX MED packages and offers choices
+when the service name matches multiple variants.
+
 For example, send “Find a pediatrician for <patient> next week, after 16:00,
 near Dominikańska” and then choose the visit type. The worker shows the
 interpreted filters in the confirmation and in `/active`. Date filters

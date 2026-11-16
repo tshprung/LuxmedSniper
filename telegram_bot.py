@@ -16,7 +16,7 @@ import requests
 from luxmed_questionnaire import Questionnaire, QuestionnaireError, QuestionnaireReceipt, visible_text
 from luxmed_sniper import (
     WARSAW, BookingQuestionnaireRequired, CancellationTerms, DoctorLocator, Luxmed, LuxMedPortal,
-    PortalError, ScheduledVisit, service_variants,
+    PackageCoverage, PortalError, ScheduledVisit, service_variants,
 )
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_settings, trusted_devices, validate, worker_settings
@@ -25,8 +25,9 @@ from telegram_preferences import PreferenceError, Preferences, matching_slots, p
 from telegram_requests import (
     ALLERGY_SERVICE, GENERAL_SERVICES, INTERNIST_PHONE_SERVICE, PEDIATRIC_PREFIX, PEDIATRIC_SERVICES, Criteria,
     PatientChoiceNeeded, PatientServiceMismatch, RequestError, ServiceChoiceNeeded, VisitModeChoiceNeeded,
-    appointments_request, check_patient_service, city_catalog,
-    matching_catalog_variants, nearby_catalog_variants, normalize, parse_search, pediatric_choice, pediatric_menu,
+    appointments_request, check_patient_service, city_catalog, coverage_request,
+    matching_catalog_variants, matching_package_services, nearby_catalog_variants, normalize, parse_search,
+    pediatric_choice, pediatric_menu,
     phone_service, requests_phone, requests_remote,
 )
 from telegram_state import SearchState, next_search_time
@@ -38,6 +39,7 @@ APPROVAL_CUTOFF_SECONDS = 3600
 CALENDAR_RETRY_SECONDS = 15 * 60
 PATIENT_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Reservation/Search"
 APPOINTMENTS_PORTAL_URL = "https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Page/Timeline"
+COVERAGE_HELP = "Try “Is a cardiologist visit covered for me?” or /coverage patient | exact service name."
 SICK_CHILD_SERVICES = {
     normalize(PEDIATRIC_PREFIX + PEDIATRIC_SERVICES[index][2]) for index in (0, 1, 2)
 }
@@ -284,6 +286,8 @@ class SearchBot:
             self.show_visit_cancellation(int(match[2]), message, token=match[1])
         elif match := re.fullmatch(r"cancel review ([a-f0-9]{12}) (yes|keep)", action):
             self.respond_to_cancellation(match[2] == "yes", message, token=match[1])
+        elif match := re.fullmatch(r"coverage (patient[123]) ([1-9][0-9]{0,9})", action):
+            self.show_coverage(match[1], (), service_id=int(match[2]))
         elif action == "stop questionnaire":
             self.stop_questionnaire(message)
         elif match := re.fullmatch(r"patient (patient[123]) ([a-f0-9]{12})", action):
@@ -383,6 +387,8 @@ class SearchBot:
             else:
                 self.state.queue_message("Open Active searches and choose Change again.",
                                          buttons=[[("Active searches", "active")]])
+        elif len(text) <= 600 and (coverage := coverage_request(text)) is not None:
+            self.show_coverage(*coverage)
         elif len(text) <= 600 and key not in {"/start", "/help", "help"}:
             if not self.handle_chat_text(text, reply):
                 self.handle_search(text)
@@ -413,6 +419,91 @@ class SearchBot:
         else:
             self.handle_results(intent, "", reply)
         return True
+
+    def show_coverage(self, patient_name: str, services: tuple[str, ...], *, service_id: int | None = None) -> None:
+        if service_id is None and not (1 <= len(services) <= 4 and all(len(service) <= 180 for service in services)):
+            self.state.queue_message(f"Ask about up to four services at a time. {COVERAGE_HELP}")
+            return
+        patient = self.aliases.get(patient_name)
+        if patient is None:
+            names = ", ".join(profile.name for profile in self.profiles.values())
+            self.state.queue_message(f"Use one of these patient names: {names}. {COVERAGE_HELP}")
+            return
+        name = self.profiles[patient].name
+        paused = f"LUX MED access for {name} is paused. Once access is restored, send /resume {name} and ask again."
+        if self.state.account_paused(patient):
+            self.state.queue_message(paused)
+            return
+        heading = f"LUX MED subscription coverage for {name}"
+        results = []
+        choices = []
+        try:
+            portal = self.portal_for(patient)
+            packages = portal.medical_package_ids()
+            if not packages:
+                self.state.queue_message(f"LUX MED shows no active subscription for {name}.")
+                return
+            catalog = portal.medical_package_services()
+            matches = (
+                [([variant for variant in catalog if variant["id"] == service_id], True)]
+                if service_id is not None else
+                [matching_package_services(service, catalog) for service in services]
+            )
+            for number, (variants, exact) in enumerate(matches, 1):
+                if not variants:
+                    results.append(f"Service {number} · No match in the package catalog. Try the exact LUX MED name.")
+                elif len(variants) == 1 and exact:
+                    variant = variants[0]
+                    summaries = [
+                        self.coverage_summary(portal.medical_package_coverage(package, variant["id"]))
+                        for package in packages
+                    ]
+                    if len(summaries) > 1:
+                        summaries = [f"Package {i} · {summary}" for i, summary in enumerate(summaries, 1)]
+                    results.append("\n".join([variant["name"], *summaries]))
+                else:
+                    choices.append((number, variants))
+        except PortalError as error:
+            status = f"I couldn’t verify subscription coverage for {name} right now. Try again in a moment."
+            if error.suspend:
+                self.close_portal(patient)
+                if error.stage == "login" or error.http_status == 429:
+                    self.state.suspend(patient)
+                    status = paused
+            self.state.queue_message(status)
+            return
+        if results:
+            for start in range(0, len(results), 2):
+                self.state.queue_message("\n\n".join([heading, *results[start:start + 2]]))
+        for number, variants in choices:
+            shown = sorted(variants, key=lambda variant: normalize(variant["name"]))[:5]
+            lines = [f"{i}. {variant['name']}" for i, variant in enumerate(shown, 1)]
+            buttons = [
+                [(f"Check {i}", f"coverage {patient} {variant['id']}")]
+                for i, variant in enumerate(shown, 1)
+            ]
+            if len(variants) > len(shown):
+                lines.append("For more matches, ask with a more specific service name.")
+            self.state.queue_message(
+                "\n".join([heading, f"Which variant should I check for service {number}?", *lines]),
+                buttons=buttons,
+            )
+
+    @staticmethod
+    def coverage_summary(coverage: PackageCoverage) -> str:
+        status = {
+            "covered": "Included in the subscription",
+            "paid": "Payable · price unavailable from this lookup",
+            "outside": "Outside the subscription",
+            "copay": "LUX MED lists a co-payment · amount unavailable from this lookup",
+            "unknown": "LUX MED coverage could not be confirmed",
+        }[coverage.status]
+        conditions = [status]
+        if coverage.referral_required is not None:
+            conditions.append("Referral required" if coverage.referral_required else "No referral required")
+        if coverage.usage_limit is not None:
+            conditions.append("Usage limit applies" if coverage.usage_limit else "No usage limit")
+        return " · ".join(conditions)
 
     def show_appointments(self, patient_name: str) -> None:
         self.appointment_list = None
@@ -711,6 +802,7 @@ class SearchBot:
             "Find an internist phone call for me\nFind a pediatrician for <patient>\n"
             "Find an internist for <patient> next week after 16:00\n"
             "Show my next appointments or /appointments <patient>\n"
+            "Is a cardiologist visit covered for me? · /coverage <patient> | <service>\n"
             "/find patient | portal service | city | optional filters\n"
             "/active · Change or stop a search\n"
             "Change 123 to after 16:00\n/change number | service | city | optional filters\n"

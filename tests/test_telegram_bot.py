@@ -12,7 +12,7 @@ from nacl.public import PrivateKey, SealedBox
 from luxmed_questionnaire import Questionnaire, QuestionnaireError
 from luxmed_sniper import (
     WARSAW, Appointment, BookingQuestionnaireRequired, CancellationTerms, LuxMedPortal,
-    Luxmed, PortalError, ScheduledVisit,
+    Luxmed, PackageCoverage, PortalError, ScheduledVisit,
 )
 from telegram_bot import Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
@@ -212,6 +212,84 @@ class BotTests(unittest.TestCase):
         for client in clients.values():
             client.reserve_standard_visit.assert_not_called()
         self.assertEqual(self.state.active(), [])
+
+    def test_coverage_checks_both_requested_services_and_no_booking_actions(self):
+        self.bot.free_text = MagicMock()
+        portal = MagicMock()
+        portal.medical_package_ids.return_value = ("fixture-package",)
+        portal.medical_package_services.return_value = [
+            {"id": 111, "name": "Konsultacja kardiologiczna"},
+            {"id": 112, "name": "Konsultacja kardiologiczna - telefoniczna"},
+            {"id": 221, "name": "Założenie Holtera EKG"},
+            {"id": 222, "name": "Założenie Holtera EKG - z 12 odprowadzeniami"},
+            {"id": 223, "name": "Założenie Holtera ciśnieniowego"},
+        ]
+        portal.medical_package_coverage.side_effect = [PackageCoverage("paid"), PackageCoverage("paid")]
+        with patch.object(self.bot, "portal_for", return_value=portal) as portal_for:
+            self.update(1, "Is cardiolog covered for me?", sender=200)
+            self.update(2, "Is cardiolog covered for me?", chat_type="group")
+            portal_for.assert_not_called()
+            self.update(3, "Are a cardiologist visit and a heart Holter covered for me?")
+        portal_for.assert_called_once_with("patient1")
+        self.assertEqual([(call[0], call.args) for call in portal.method_calls], [
+            ("medical_package_ids", ()), ("medical_package_services", ()),
+            ("medical_package_coverage", ("fixture-package", 111)),
+            ("medical_package_coverage", ("fixture-package", 221)),
+        ])
+        text = self.state.next_message()["text"]
+        self.assertIn("LUX MED subscription coverage for Adult", text)
+        self.assertIn("Konsultacja kardiologiczna\nPayable", text)
+        self.assertIn("Założenie Holtera EKG\nPayable", text)
+        self.assertEqual(self.state.active(), [])
+        self.bot.free_text.chat_action.assert_not_called()
+        self.bot.free_text.criteria.assert_not_called()
+
+    def test_ambiguous_holter_offers_read_only_choices_for_the_named_patient(self):
+        portal = MagicMock()
+        portal.medical_package_ids.return_value = ("plan1", "plan2")
+        portal.medical_package_services.return_value = [
+            {"id": 221, "name": "Założenie Holtera EKG"},
+            {"id": 223, "name": "Założenie Holtera ciśnieniowego"},
+        ]
+        portal.medical_package_coverage.side_effect = [PackageCoverage("covered", True), PackageCoverage("unknown")]
+        with patch.object(self.bot, "portal_for", return_value=portal) as portal_for:
+            self.update(1, "Does my package cover a Holter for Child?")
+            menu = self.state.next_message()
+            self.assertIn("coverage for Child", menu["text"])
+            self.assertIn("Założenie Holtera EKG", menu["text"])
+            actions = {action for row in json.loads(menu["buttons"]) for _, action in row}
+            self.assertEqual(actions, {"coverage patient2 221", "coverage patient2 223"})
+            portal.medical_package_coverage.assert_not_called()
+            self.bot.flush()
+            self.tap(2, "coverage patient2 221")
+        self.assertEqual([call.args[0] for call in portal_for.call_args_list], ["patient2", "patient2"])
+        text = self.state.next_message()["text"]
+        self.assertIn("Założenie Holtera EKG", text)
+        self.assertIn("Package 1 · Included in the subscription · Referral required", text)
+        self.assertIn("Package 2 · LUX MED coverage could not be confirmed", text)
+
+    def test_coverage_does_not_guess_on_a_catalog_miss_or_retry_a_rate_limit(self):
+        portal = MagicMock()
+        portal.medical_package_ids.return_value = ("plan",)
+        portal.medical_package_services.return_value = [{"id": 221, "name": "Założenie Holtera EKG"}]
+        with patch.object(self.bot, "portal_for", return_value=portal) as portal_for:
+            self.update(1, "Is Holter EKG covered for someone else?")
+            portal_for.assert_not_called()
+            self.bot.flush()
+            self.update(2, "/coverage Child | missing fixture service")
+            self.assertIn("No match in the package catalog", self.state.next_message()["text"])
+            portal.medical_package_coverage.assert_not_called()
+            self.bot.flush()
+            portal.medical_package_coverage.side_effect = PortalError(
+                "rate-limited", suspend=True, stage="coverage-details", http_status=429,
+            )
+            self.update(3, "/coverage Child | Holter EKG")
+            self.assertTrue(self.state.account_paused("patient2"))
+            self.assertFalse(self.state.account_paused("patient1"))
+            self.bot.flush()
+            self.update(4, "/coverage Child | Holter EKG")
+            portal.medical_package_coverage.assert_called_once_with("plan", 221)
+            self.assertIn("LUX MED access for Child is paused", self.state.next_message()["text"])
 
     def test_numbered_cancel_selection_uses_the_latest_patient_and_rejects_an_old_button(self):
         self.telegram.send.side_effect = iter(range(40, 100))
