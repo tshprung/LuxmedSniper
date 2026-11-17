@@ -24,7 +24,10 @@ def next_search_time(timestamp: int) -> int:
 
 
 class SearchState:
-    def __init__(self, path, *, clock=time.time):
+    def __init__(self, path, *, clock=time.time, search_interval_minutes: int = 60):
+        if type(search_interval_minutes) is not int or not 60 <= search_interval_minutes <= 1440:
+            raise ValueError("Search interval must be between 60 and 1440 minutes")
+        self.search_interval_minutes = search_interval_minutes
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -472,6 +475,6 @@ class SearchState:
                    ORDER BY next_due, id""",
                 (patient["patient"], now),
             ).fetchall()
-            retry_at = next_search_time(now + 3600)
+            retry_at = next_search_time(now + self.search_interval_minutes * 60)
             self.db.executemany("UPDATE searches SET next_due = ? WHERE id = ?", ((retry_at, row["id"]) for row in rows))
             return rows

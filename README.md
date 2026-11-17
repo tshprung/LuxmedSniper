@@ -129,6 +129,19 @@ before using `/resume <patient>`. Availability is returned in the private
 chat. The first completed check reports whether it found a match. Later
 checks with no matches update `/active` quietly.
 
+The first check still runs at the first eligible time. The GCP service can
+set `LUXMED_SEARCH_INTERVAL_MINUTES` to slow repeat checks from the default
+60 minutes. `LUXMED_MIN_REQUEST_SPACING_SECONDS` controls the minimum time
+between authenticated portal requests across the worker's sessions and
+defaults to one second.
+
+After an HTTP 429 the worker waits at least an hour, including any longer
+`Retry-After` requested by LUX MED. This wait survives a worker restart.
+The affected profile still needs an explicit resume after the cool-down
+and any required verification. Temporary network or server failures use
+increasing wait times. Each booking or cancellation request still follows
+its normal approval and outcome checks.
+
 Results are numbered in groups of three. Tap an option or reply with its number
 to view the slot and its booking actions. Tap `More` for the next page or say
 “give me options” to reopen the current list. For supported visits, use the

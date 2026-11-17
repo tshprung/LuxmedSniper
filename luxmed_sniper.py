@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
 import base64
@@ -5,6 +7,7 @@ import copy
 import datetime
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -15,9 +18,11 @@ import unicodedata
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -147,9 +152,9 @@ class PackageCoverage:
 
 
 class Luxmed(BaseModel):
-    password: str
-    login: str | None = None
-    email: str | None = None
+    password: str = Field(repr=False)
+    login: str | None = Field(default=None, repr=False)
+    email: str | None = Field(default=None, repr=False)
 
     model_config = {"validate_assignment": True, "hide_input_in_errors": True}
 
@@ -198,7 +203,9 @@ class LuxMedPortal:
     MEDICAL_PACKAGE_URL = f"{NEW_PORTAL_URL}/MedicalPackage"
     NON_SHOW_PENALTIES_URL = 'https://portalpacjenta.luxmed.pl/PatientPortal/NewPortal/Reservation/CheckUserNonShowPenalties'
 
-    def __init__(self, credentials: Luxmed, *, trusted_device: dict | None = None):
+    def __init__(self, credentials: Luxmed, *, trusted_device: dict | None = None,
+                 traffic: PortalTraffic | None = None):
+        self.traffic = traffic
         self.session = requests.Session()
         try:
             if trusted_device is not None:
@@ -235,32 +242,50 @@ class LuxMedPortal:
 
     def _portal_json(self, method: str, url: str, *, authenticating: bool = False,
                      stage: str | None = None, allow_empty: bool = False, **kwargs: Any) -> Any:
+        target = urlsplit(url)
+        if target.scheme != "https" or target.netloc != "portalpacjenta.luxmed.pl" or not target.path.startswith("/PatientPortal/"):
+            raise PortalError("unexpected-portal-origin", suspend=True, stage=stage)
+        if self.traffic is not None:
+            self.traffic.before_request(stage)
         try:
             response = self.session.request(
                 method, url, timeout=PORTAL_TIMEOUT, allow_redirects=False, **kwargs,
             )
         except requests.RequestException:
+            if self.traffic is not None:
+                self.traffic.temporary_failure()
             raise PortalError("network-error", stage=stage) from None
         status = response.status_code
         error_context = {"stage": stage, "http_status": status}
         if status == 429:
+            if self.traffic is not None:
+                self.traffic.rate_limited(response.headers.get("Retry-After"))
             raise PortalError("rate-limited", suspend=True, **error_context)
         if status in (401, 403):
             raise PortalError("access-denied", suspend=True, **error_context)
         if 300 <= status < 400:
             raise PortalError("login-unconfirmed" if authenticating else "session-unconfirmed", suspend=True, **error_context)
         if allow_empty and status in (200, 204) and not response.content.strip():
+            if self.traffic is not None:
+                self.traffic.succeeded()
             return None
         if status != 200:
+            if self.traffic is not None and (status == 408 or 500 <= status < 600):
+                self.traffic.temporary_failure()
             raise PortalError("portal-error", suspend=authenticating and status < 500, **error_context)
         try:
-            return response.json()
+            data = response.json()
         except ValueError:
+            html = response.headers.get("Content-Type", "").lower().startswith("text/html")
+            code = "login-unconfirmed" if authenticating else "session-unconfirmed" if html else "unexpected-response"
             raise PortalError(
-                "login-unconfirmed" if authenticating else "unexpected-response",
+                code,
                 suspend=True,
                 **error_context,
             ) from None
+        if self.traffic is not None:
+            self.traffic.succeeded()
+        return data
 
     def search(self, locator: DoctorLocator, *, days: int = 14, date: datetime.date | None = None,
                nationwide_from: str | None = None, questionnaire: QuestionnaireReceipt | None = None) -> list[Appointment]:
@@ -1208,6 +1233,61 @@ class PortalError(LuxmedSniperError):
         self.suspend = suspend
         self.stage = stage
         self.http_status = http_status
+
+
+class PortalTraffic:
+    """Share a request budget across the family worker's authenticated sessions."""
+
+    def __init__(self, *, spacing: int, rate_limit_until: int, save_rate_limit: Callable[[int], None],
+                 clock=time.time, monotonic=time.monotonic, sleep=time.sleep):
+        self.spacing = spacing
+        self.rate_limit_until = rate_limit_until
+        self.save_rate_limit = save_rate_limit
+        self.clock = clock
+        self.monotonic = monotonic
+        self.sleep = sleep
+        self.next_request = 0.0
+        self.transient_until = 0.0
+        self.failures = 0
+
+    def blocked(self) -> bool:
+        return self.clock() < max(self.rate_limit_until, self.transient_until)
+
+    def check(self, stage: str | None = None) -> None:
+        if self.blocked():
+            raise PortalError("portal-cooldown", stage=stage)
+
+    def before_request(self, stage: str | None) -> None:
+        self.check(stage)
+        delay = self.next_request - self.monotonic()
+        if delay > 0:
+            self.sleep(delay)
+        self.next_request = self.monotonic() + self.spacing
+
+    def rate_limited(self, header: str | None) -> None:
+        now = self.clock()
+        requested = now
+        if header:
+            header = header.strip()
+            try:
+                if re.fullmatch(r"[0-9]{1,12}", header):
+                    requested = now + int(header)
+                else:
+                    retry_at = parsedate_to_datetime(header)
+                    if retry_at.tzinfo is not None:
+                        requested = retry_at.timestamp()
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+        self.rate_limit_until = math.ceil(max(self.rate_limit_until, now + 3600, requested))
+        self.save_rate_limit(self.rate_limit_until)
+
+    def temporary_failure(self) -> None:
+        self.transient_until = self.clock() + min(5 * 2 ** self.failures, 300)
+        self.failures = min(self.failures + 1, 6)
+
+    def succeeded(self) -> None:
+        self.failures = 0
+        self.transient_until = 0.0
 
 
 class BookingQuestionnaireRequired(PortalError):
