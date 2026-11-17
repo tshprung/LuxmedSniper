@@ -720,6 +720,41 @@ class BotTests(unittest.TestCase):
         self.telegram.acknowledge.assert_any_call("fixture-6")
         client.reserve_standard_visit.assert_not_called()
 
+    def test_standalone_booking_asks_which_result_list_then_uses_the_replied_search(self):
+        self.telegram.send.side_effect = iter(range(40, 100))
+        self.update(1, "Find an internist for Adult")
+        self.update(2, "/find Child | routine visit")
+        self.bot.flush()
+        clients = {patient: MagicMock() for patient in ("patient1", "patient2")}
+        for number, (patient, client) in enumerate(clients.items(), 1):
+            client.resolve_service.return_value = 12
+            client.search.return_value = [
+                Appointment(dt.datetime.fromtimestamp(self.now + 86400, WARSAW), number,
+                            f"Clinic {number}", "Fixture doctor", 12, doctor_id=9),
+            ]
+        with patch.object(self.bot, "portal_for", side_effect=clients.__getitem__):
+            self.bot.search_due()
+            self.bot.search_due()
+        self.bot.flush()
+        self.state.db.close()
+        self.state = SearchState(self.path)
+        self.bot = SearchBot(self.telegram, self.state, self.profiles, clock=lambda: self.now, booking_enabled=True)
+        self.update(3, "Book 1")
+        prompt = self.state.next_message()
+        self.assertIn("Which search do you mean?", prompt["text"])
+        self.assertIn("Adult", prompt["text"])
+        self.assertIn("Child", prompt["text"])
+        self.assertEqual(self.state.db.execute("SELECT count(*) FROM booking_requests").fetchone()[0], 0)
+        self.bot.flush()
+        self.tap(4, "result list 1", 44)
+        self.assertIn("Adult", self.state.next_message()["text"])
+        self.assertEqual(self.state.db.execute("SELECT count(*) FROM booking_requests").fetchone()[0], 0)
+        self.bot.flush()
+        self.update(5, "Book 1", reply_to=45)
+        booking, = self.state.db.execute("SELECT patient, search_id, status FROM booking_requests")
+        self.assertEqual(tuple(booking), ("patient1", 1, "queued"))
+        self.assertIn("Clinic 1", self.state.next_message()["text"])
+
     def test_numbered_options_support_booking_steps_more_and_continue(self):
         self.update(1, "/find Child | routine visit")
         self.bot.flush()
@@ -1465,7 +1500,7 @@ class BotTests(unittest.TestCase):
         self.update(3, "Book 1", reply_to=43)
         self.assertIn("First doctor", self.state.next_message()["text"])
         self.bot.flush()
-        self.update(4, "Book 1")
+        self.update(4, "Book 1", reply_to=45)
         self.assertIn("Second doctor", self.state.next_message()["text"])
 
     def test_change_keeps_id_and_patient_and_checks_the_new_criteria(self):
@@ -1512,6 +1547,31 @@ class BotTests(unittest.TestCase):
         self.tap(8, "stop search 1", 42)
         remaining, = self.state.active()
         self.assertEqual((remaining["id"], remaining["patient"]), (2, "patient1"))
+
+    def test_any_day_relaxes_only_dates_for_the_selected_search(self):
+        self.update(1, "Find an internist for Adult Friday or Monday after 16:00 with Dr Fixture Clinician, near Dominikańska")
+        self.update(2, "Find an allergist for Adult tomorrow")
+        self.bot.flush()
+        before = self.state.criteria(self.state.active()[0])
+        self.assertEqual(len(before.preferences.date_choices), 2)
+        self.tap(3, "change search 1")
+        menu = json.loads(self.state.next_message()["buttons"])
+        self.assertIn(["Any day", "filter search 1 Any day"], menu[-1])
+        self.bot.flush()
+        self.tap(4, "filter search 1 After 16:00")
+        self.update(5, "any day")
+        first, second = self.state.active()
+        after = self.state.criteria(first)
+        self.assertEqual(after.preferences.first_date, None)
+        self.assertEqual(after.preferences.last_date, None)
+        self.assertEqual(after.preferences.date_choices, ())
+        self.assertEqual(after.preferences.start_minute, 960)
+        self.assertEqual(after.preferences.doctor, "Fixture Clinician")
+        self.assertEqual(after.preferences.clinic, "Dominikańska")
+        self.assertEqual((after.patient, after.service, after.city), (before.patient, before.service, before.city))
+        self.assertIsNotNone(self.state.criteria(second).preferences.first_date)
+        self.update(6, "change search 2 to any day")
+        self.assertIsNone(self.state.criteria(self.state.active()[1]).preferences.first_date)
 
     def test_old_active_buttons_and_edit_reply_cannot_target_reused_search_number(self):
         self.telegram.send.side_effect = iter(range(40, 100))

@@ -108,6 +108,9 @@ continuing to look for the preferred clinic. It does not calculate distances.
 Use `Change 123 to after 17:00` or `Change 123 to clear filters` to update
 an active search in plain English. A search for a fixed date window ends
 once those dates have passed.
+Choose **Any day** in the edit menu or type `Change search 123 to any day`
+to clear the dates and keep the other filters. **Any time** clears only
+the time-of-day filter.
 
 In the owner's private chat, “me” and “myself” select `patient1`.
 For example, “Find a call with an internist for me after 16:00” searches
@@ -149,8 +152,9 @@ to view the slot and its booking actions. Tap `More` for the next page or say
 Portal link. The bot flags selections within six hours of the appointment.
 `Continue` or `Find something else` starts a follow-up with the same filters,
 skipping slots already shown and respecting the search's next hourly check.
-Reply to a result message to select that list. Standalone commands use the
-latest list.
+Reply to a result message to select that list. If more than one result list
+has upcoming slots, a standalone command asks you to pick a list first.
+Open the chosen list and reply to it or use its buttons.
 
 The sick-child pediatric clinic, phone, and NFZ clinic variants have a
 LUX MED questionnaire. The bot can list times, and `Details 2` links to
