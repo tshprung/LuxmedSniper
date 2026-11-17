@@ -13,7 +13,7 @@ import requests
 import audit_search
 from luxmed_prices import PublicPriceList, wroclaw_prices
 from luxmed_questionnaire import QuestionnaireReceipt
-from luxmed_sniper import CancellationTerms, DoctorLocator, Luxmed, LuxMedPortal, PackageCoverage, PortalError
+from luxmed_sniper import CancellationTerms, DoctorLocator, Luxmed, LuxMedPortal, PackageCoverage, PortalError, PortalTraffic
 from telegram_requests import INTERNIST_PHONE_SERVICE
 
 
@@ -40,6 +40,78 @@ def slot(starts_at, *, doctor=9, clinic_group=6):
 
 
 class SearchTests(unittest.TestCase):
+    def test_auth_origin_cannot_leak_session_headers_and_credentials_are_hidden_in_repr(self):
+        credentials = Luxmed(login="fixture-user", password="fixture-password")
+        self.assertNotIn("fixture", repr(credentials))
+        with patch("requests.Session.request", return_value=response({"token": "fixture"})) as request:
+            with (portal := LuxMedPortal(credentials)).session:
+                with self.assertRaisesRegex(PortalError, "unexpected-portal-origin"):
+                    portal._portal_json("GET", "https://example.org/PatientPortal/NewPortal")
+        request.assert_called_once()
+
+    def test_portal_request_budget_spaces_sessions_and_honors_retry_after(self):
+        now = 100.0
+        limits = []
+
+        def sleep(delay):
+            nonlocal now
+            now += delay
+
+        traffic = PortalTraffic(spacing=1, rate_limit_until=0, save_rate_limit=limits.append,
+                                clock=lambda: now, monotonic=lambda: now, sleep=sleep)
+        throttled = response(status=429)
+        throttled.headers["Retry-After"] = "7200"
+        with patch("requests.Session.request", side_effect=[
+            response({"token": "fixture"}), response({"token": "fixture"}), throttled,
+        ]) as request:
+            with (first := LuxMedPortal(Luxmed(login="fixture1", password="fixture"), traffic=traffic)).session:
+                with (second := LuxMedPortal(Luxmed(login="fixture2", password="fixture"), traffic=traffic)).session:
+                    self.assertEqual(now, 101)
+                    with self.assertRaisesRegex(PortalError, "rate-limited"):
+                        first.get_services()
+                    self.assertEqual(limits, [7302])
+                    with self.assertRaisesRegex(PortalError, "portal-cooldown"):
+                        second.get_services()
+        self.assertEqual(request.call_count, 3)
+        restarted = PortalTraffic(spacing=1, rate_limit_until=limits[0], save_rate_limit=limits.append,
+                                  clock=lambda: now)
+        with self.assertRaisesRegex(PortalError, "portal-cooldown"):
+            restarted.check()
+
+    def test_transient_portal_errors_wait_longer_without_replaying_requests(self):
+        now = 100.0
+        traffic = PortalTraffic(spacing=1, rate_limit_until=0, save_rate_limit=lambda _: None,
+                                clock=lambda: now, monotonic=lambda: now, sleep=lambda _: None)
+        with patch("requests.Session.request", side_effect=[
+            response({"token": "fixture"}), response(status=503), response(status=503),
+            response([]), response(status=503),
+        ]) as request:
+            with (portal := LuxMedPortal(Luxmed(login="fixture", password="fixture"), traffic=traffic)).session:
+                now += 1
+                for delay in (5, 10):
+                    with self.assertRaisesRegex(PortalError, "portal-error"):
+                        portal.get_services()
+                    self.assertEqual(traffic.transient_until, now + delay)
+                    with self.assertRaisesRegex(PortalError, "portal-cooldown"):
+                        portal.get_services()
+                    now += delay
+                self.assertEqual(portal.get_services(), [])
+                now += 1
+                with self.assertRaisesRegex(PortalError, "portal-error"):
+                    portal.get_services()
+                self.assertEqual(traffic.transient_until, now + 5)
+        self.assertEqual(request.call_count, 5)
+
+    def test_authenticated_html_challenge_requires_review(self):
+        html = response(raw="<html>fixture verification</html>")
+        html.headers["Content-Type"] = "text/html; charset=utf-8"
+        with patch("requests.Session.request", side_effect=[response({"token": "fixture"}), html]) as request:
+            with (portal := LuxMedPortal(Luxmed(login="fixture", password="fixture"))).session:
+                with self.assertRaisesRegex(PortalError, "session-unconfirmed") as error:
+                    portal.get_services()
+        self.assertTrue(error.exception.suspend)
+        self.assertEqual(request.call_count, 2)
+
     def test_public_price_uses_the_cheapest_wroclaw_clinic_for_the_exact_service(self):
         def service(label, clinic_prices):
             return {"Nazwa_na_www": label, "cities": {"Wrocław": {

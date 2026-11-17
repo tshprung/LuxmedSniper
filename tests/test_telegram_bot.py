@@ -14,9 +14,9 @@ from luxmed_prices import ListedPrice
 from luxmed_questionnaire import Questionnaire, QuestionnaireError
 from luxmed_sniper import (
     WARSAW, Appointment, BookingQuestionnaireRequired, CancellationTerms, CompletedVisit, LuxMedPortal,
-    Luxmed, PackageCoverage, PortalError, ScheduledVisit,
+    Luxmed, PackageCoverage, PortalError, PortalTraffic, ScheduledVisit,
 )
-from telegram_bot import Profile, SearchBot, Telegram, TelegramError
+from telegram_bot import PORTAL_RATE_LIMIT_KEY, Profile, SearchBot, Telegram, TelegramError
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import SECRET_KEYS, booking_patients, package_settings, trusted_devices
 from telegram_free_text import FreeText, redacted_request
@@ -182,6 +182,54 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.state.active(), [])
         self.assertIsNone(self.state.next_message())
         self.assertEqual(self.state.get_setting("offset"), "3")
+
+    def test_portal_rate_limit_pauses_all_network_work_and_blocks_early_resume(self):
+        self.bot.portal_traffic = PortalTraffic(
+            spacing=1, rate_limit_until=0, clock=lambda: self.now, monotonic=lambda: self.now,
+            sleep=lambda _: None,
+            save_rate_limit=lambda until: self.state.set_setting(PORTAL_RATE_LIMIT_KEY, str(until)),
+        )
+        login = requests.Response()
+        login.status_code = 200
+        login._content = b'{"token":"fixture"}'
+        limited = requests.Response()
+        limited.status_code = 429
+        limited.headers["Retry-After"] = "7200"
+        with patch.object(requests.Session, "request", side_effect=[login, limited]) as request:
+            self.update(1, "Find an allergist for Adult")
+            self.update(2, "Find an allergist for Child")
+            self.bot.search_due()
+            self.assertTrue(self.state.account_paused("patient1"))
+            self.assertFalse(self.state.account_paused("patient2"))
+            reopened = SearchState(self.path)
+            try:
+                self.assertEqual(int(reopened.get_setting(PORTAL_RATE_LIMIT_KEY)), self.now + 7200)
+            finally:
+                reopened.db.close()
+            self.bot.search_due()
+            self.update(3, "/resume Adult")
+            self.update(4, "Show upcoming appointments for Child")
+            self.assertTrue(self.state.account_paused("patient1"))
+            self.assertEqual([call.args[0] for call in request.call_args_list], ["POST", "GET"])
+
+    def test_search_interval_can_be_slower_than_hourly_and_keeps_the_first_check_immediate(self):
+        self.state.search_interval_minutes = 120
+        self.update(1, "Find an allergist for Adult")
+        row, = self.state.claim_batch(self.now)
+        revised = self.state.active_by_id(row["id"])
+        self.assertEqual(revised["next_due"], self.now + 7200)
+
+    def test_history_auth_restriction_pauses_only_that_patient(self):
+        portal = MagicMock()
+        portal.latest_completed_visit.side_effect = PortalError(
+            "access-denied", suspend=True, stage="visit-history", http_status=403,
+        )
+        with patch.object(self.bot, "portal_for", return_value=portal) as open_portal:
+            self.update(1, "What was my last appointment?")
+            self.update(2, "Show my next appointments")
+        open_portal.assert_called_once_with("patient1")
+        self.assertTrue(self.state.account_paused("patient1"))
+        self.assertFalse(self.state.account_paused("patient2"))
 
     def test_appointments_read_the_requested_patient_timeline_without_ai_or_booking(self):
         self.bot.free_text = MagicMock()

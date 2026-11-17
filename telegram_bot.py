@@ -11,13 +11,11 @@ import uuid
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
-import requests
-
 from luxmed_prices import PublicPriceList
 from luxmed_questionnaire import Questionnaire, QuestionnaireError, QuestionnaireReceipt, visible_text
 from luxmed_sniper import (
     WARSAW, BookingQuestionnaireRequired, CancellationTerms, CompletedVisit, DoctorLocator, Luxmed, LuxMedPortal,
-    PackageCoverage, PortalError, ScheduledVisit, VisitSummary, service_variants,
+    PackageCoverage, PortalError, PortalTraffic, ScheduledVisit, VisitSummary, service_variants,
 )
 from telegram_calendar import CalendarAvailability, CalendarUnavailable
 from telegram_configuration import PROFILE_KEYS, booking_patients, calendar_settings, trusted_devices, validate, worker_settings
@@ -32,8 +30,11 @@ from telegram_requests import (
     phone_service, requests_phone, requests_remote, split_clinician_first_search,
 )
 from telegram_state import SearchState, next_search_time
+from telegram_transport import Telegram, TelegramError
 
 PORTAL_REUSE_SECONDS = 3600
+PORTAL_RATE_LIMIT_KEY = "portal_rate_limit_until"
+PORTAL_COOLDOWN_NOTICE = "LUX MED requests are paused. Try again later."
 RESULTS_PER_PAGE = 3
 SHORT_NOTICE_SECONDS = 6 * 3600
 APPROVAL_CUTOFF_SECONDS = 3600
@@ -99,70 +100,6 @@ BOOKING_FAILURES = {
 }
 
 
-class TelegramError(Exception):
-    def __init__(self, *, retry_after: int = 5, stop: bool = False):
-        self.retry_after = retry_after
-        self.stop = stop
-
-
-class Telegram:
-    def __init__(self, token: str, owner: int):
-        self.base = f"https://api.telegram.org/bot{token}"
-        self.owner = owner
-        self.session = requests.Session()
-
-    def call(self, method: str, data: dict):
-        try:
-            response = self.session.post(
-                f"{self.base}/{method}", json=data, timeout=(5, 20), allow_redirects=False,
-            )
-            if response.status_code in (401, 403, 409):
-                raise TelegramError(stop=True)
-            body = response.json()
-            if not isinstance(body, dict):
-                raise TelegramError()
-            if response.status_code == 429:
-                parameters = body.get("parameters", {})
-                delay = parameters.get("retry_after") if isinstance(parameters, dict) else None
-                raise TelegramError(retry_after=delay if type(delay) is int and delay > 0 else 5)
-            if response.status_code != 200 or body.get("ok") is not True or "result" not in body:
-                raise TelegramError()
-            return body["result"]
-        except (requests.RequestException, ValueError):
-            raise TelegramError() from None
-
-    def poll(self, offset: int) -> list[dict]:
-        updates = self.call("getUpdates", {
-            "offset": offset, "timeout": 8, "allowed_updates": ["message", "callback_query"],
-        })
-        if not isinstance(updates, list):
-            raise TelegramError()
-        return updates
-
-    def send(self, message: str, *, force_reply: bool = False,
-             buttons: list[list[tuple[str, str]]] | None = None) -> int:
-        payload = {"chat_id": self.owner, "text": message}
-        if buttons:
-            payload["reply_markup"] = {
-                "inline_keyboard": [
-                    [{"text": label, "callback_data": action} for label, action in row] for row in buttons
-                ],
-            }
-        elif force_reply:
-            payload["reply_markup"] = {"force_reply": True}
-        result = self.call("sendMessage", payload)
-        if not isinstance(result, dict) or type(result.get("message_id")) is not int:
-            raise TelegramError()
-        return result["message_id"]
-
-    def acknowledge(self, callback_id: str) -> None:
-        try:
-            self.call("answerCallbackQuery", {"callback_query_id": callback_id})
-        except TelegramError as error:
-            if error.stop:
-                raise
-
-
 @dataclass(frozen=True)
 class Profile:
     name: str
@@ -221,6 +158,7 @@ class SearchBot:
     def __init__(self, telegram: Telegram, state: SearchState, profiles: dict[str, Profile], *, clock=time.time,
                  free_text: FreeText | None = None, calendar: CalendarAvailability | None = None,
                  public_prices: PublicPriceList | None = None,
+                 portal_traffic: PortalTraffic | None = None, portal_factory=None,
                  booking_enabled: bool = False, device_credentials: dict | None = None,
                  allowed_booking_patients: frozenset[str] | None = None, calendar_destination: str | None = None,
                  calendar_detail_patients: frozenset[str] = frozenset()):
@@ -230,6 +168,8 @@ class SearchBot:
         self.clock = clock
         self.free_text = free_text
         self.public_prices = public_prices
+        self.portal_traffic = portal_traffic
+        self.portal_factory = portal_factory
         self.calendar = calendar
         self.calendar_destination = calendar_destination
         self.calendar_detail_patients = calendar_detail_patients
@@ -391,8 +331,10 @@ class SearchBot:
         elif command in {"/resume", "resume"}:
             patient = self.aliases.get(argument)
             booking_paused = patient is not None and self.state.booking_paused(patient)
-            if patient and self.state.resume(patient):
-                message = "Searches resumed for the next eligible hour."
+            if patient and self.portal_traffic is not None and self.portal_traffic.blocked():
+                self.state.queue_message(PORTAL_COOLDOWN_NOTICE)
+            elif patient and self.state.resume(patient):
+                message = "Searches resumed for the next eligible check."
                 if booking_paused:
                     message = "Booking pause cleared. Start a fresh search to request a booking again."
                 self.state.queue_message(message)
@@ -491,13 +433,9 @@ class SearchBot:
                 else:
                     choices.append((number, variants))
         except PortalError as error:
-            status = f"I couldn’t verify subscription coverage for {name} right now. Try again in a moment."
-            if error.suspend:
-                self.close_portal(patient)
-                if error.stage == "login" or error.http_status == 429:
-                    self.state.suspend(patient)
-                    status = paused
-            self.state.queue_message(status)
+            self.appointment_lookup_error(
+                patient, error, f"I couldn’t verify subscription coverage for {name} right now. Try again in a moment.",
+            )
             return
         if results:
             for start in range(0, len(results), 2):
@@ -575,12 +513,20 @@ class SearchBot:
         return f"LUX MED access for {name} is paused. Once access is restored, send /resume {name} and ask again."
 
     def appointment_lookup_error(self, patient: str, error: PortalError, message: str) -> None:
-        if error.suspend:
-            self.close_portal(patient)
-            if error.stage == "login" or error.http_status == 429:
-                self.state.suspend(patient)
-                message = self.appointment_access_paused(patient)
+        if self.handle_read_access_error(patient, error):
+            message = self.appointment_access_paused(patient)
+        elif str(error) == "portal-cooldown":
+            message = PORTAL_COOLDOWN_NOTICE
         self.state.queue_message(message)
+
+    def handle_read_access_error(self, patient: str, error: PortalError) -> bool:
+        if not error.suspend:
+            return False
+        self.close_portal(patient)
+        if error.stage == "login" or error.http_status in (401, 403, 429) or str(error) == "session-unconfirmed":
+            self.state.suspend(patient)
+            return True
+        return False
 
     def show_last_visit(self, *, with_notes: bool) -> None:
         self.last_visit = None
@@ -732,10 +678,7 @@ class SearchBot:
             )
 
     def handle_cancellation_access_error(self, patient: str, error: PortalError) -> None:
-        if error.suspend:
-            self.close_portal(patient)
-            if error.stage == "login" or error.http_status == 429:
-                self.state.suspend(patient)
+        self.handle_read_access_error(patient, error)
 
     def handle_search(self, text: str) -> None:
         error_message = None
@@ -1194,6 +1137,8 @@ class SearchBot:
     def confirm_search(self, search_id: int, number: int, criteria: Criteria, due: int, paused: bool, now: int, *, changed: bool = False) -> None:
         if paused:
             status = "Paused. Check the portal, then use /resume."
+        elif self.portal_traffic is not None and self.portal_traffic.blocked():
+            status = "Your search is queued while LUX MED requests are paused."
         elif due > now:
             status = f"I’ll start looking at {local_time(due)} Warsaw time."
         else:
@@ -1383,6 +1328,8 @@ class SearchBot:
             flow.prompt = None
 
     def portal_for(self, patient: str) -> LuxMedPortal:
+        if self.portal_traffic is not None:
+            self.portal_traffic.check()
         now = self.clock()
         cached = self.portals.get(patient)
         if cached is not None and now < cached[0]:
@@ -1390,10 +1337,13 @@ class SearchBot:
         self.close_portal(patient)
         credentials = self.profiles[patient].credentials
         trusted_device = self.device_credentials.get(patient)
+        factory = self.portal_factory or LuxMedPortal
+        options = {}
+        if self.portal_traffic is not None:
+            options["traffic"] = self.portal_traffic
         if trusted_device is not None and trusted_device["expires"] > now:
-            portal = LuxMedPortal(credentials, trusted_device=trusted_device)
-        else:
-            portal = LuxMedPortal(credentials)
+            options["trusted_device"] = trusted_device
+        portal = factory(credentials, **options)
         reuse_until = now + PORTAL_REUSE_SECONDS
         if type(portal.token_expires_at) is int:
             reuse_until = min(reuse_until, portal.token_expires_at)
@@ -1538,6 +1488,8 @@ class SearchBot:
             self.questionnaire_booking = None
         if not self.booking_enabled or not self.allowed_booking_patients or next_search_time(now) != now:
             return
+        if self.portal_traffic is not None and self.portal_traffic.blocked():
+            return
         booking = self.state.claim_booking(self.allowed_booking_patients)
         if booking is None:
             return
@@ -1650,6 +1602,8 @@ class SearchBot:
                 )
 
     def cancellation_due(self) -> None:
+        if self.portal_traffic is not None and self.portal_traffic.blocked():
+            return
         request = self.state.claim_cancellation()
         if request is None:
             return
@@ -1934,6 +1888,8 @@ class SearchBot:
                 if self.state.finish(row["id"], "date-window-ended"):
                     heading = self.search_heading(row["display_number"], self.state.criteria(row))
                     self.state.queue_message(f"{heading}\nThe requested date window has ended. Search finished.", row["id"])
+        if self.portal_traffic is not None and self.portal_traffic.blocked():
+            return
         batch = self.state.claim_batch(int(self.clock()))
         if not batch:
             return
@@ -2058,7 +2014,9 @@ class SearchBot:
                     status = f"No {kind} slots in {window}."
                     if outside_clinic:
                         status += " Other clinics have matches. Use /change to adjust the clinic filter."
-                    status += f" I’ll check hourly from 06:00 to 22:00 Warsaw time and message you if I find one. Next check: {due}."
+                    interval = self.state.search_interval_minutes
+                    cadence = "hourly" if interval == 60 else f"every {interval} minutes"
+                    status += f" I’ll check {cadence} from 06:00 to 22:00 Warsaw time and message you if I find one. Next check: {due}."
                     self.state.queue_message(f"{heading}\n{status}", search_id)
             return
         with self.state.db:
@@ -2163,9 +2121,20 @@ def main() -> int:
         )
         if not calendar_detail_patients.issubset(PROFILE_KEYS):
             raise ValueError("Invalid calendar details patient list")
-        bot = SearchBot(Telegram(token, owner), SearchState(path / "telegram.sqlite3"), profiles,
+        interval = int(os.environ.get("LUXMED_SEARCH_INTERVAL_MINUTES", "60"))
+        spacing = int(os.environ.get("LUXMED_MIN_REQUEST_SPACING_SECONDS", "1"))
+        if not 1 <= spacing <= 10:
+            raise ValueError("Portal request spacing must be between 1 and 10 seconds")
+        state = SearchState(path / "telegram.sqlite3", search_interval_minutes=interval)
+        traffic = PortalTraffic(
+            spacing=spacing,
+            rate_limit_until=int(state.get_setting(PORTAL_RATE_LIMIT_KEY, "0")),
+            save_rate_limit=lambda until: state.set_setting(PORTAL_RATE_LIMIT_KEY, str(until)),
+        )
+        bot = SearchBot(Telegram(token, owner), state, profiles,
                         free_text=interpreter, calendar=calendar,
                         public_prices=PublicPriceList(),
+                        portal_traffic=traffic,
                         booking_enabled=bool(allowed_booking_patients),
                         device_credentials=trusted_devices(profiles),
                         allowed_booking_patients=allowed_booking_patients,
