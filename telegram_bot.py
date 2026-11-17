@@ -61,7 +61,7 @@ OPTION_NUMBER = re.compile(r"[1-9][0-9]{0,8}")
 QUESTIONNAIRE_ANSWER = re.compile(r"(?:/?answer |option )?([0-9]{1,2})")
 CANCEL_APPOINTMENT = re.compile(r"/?cancel(?: appointment| visit)? #?([1-9][0-9]{0,8})")
 SEARCH_CHANGE_PROMPT = "Change an active search"
-SEARCH_FILTER_CHOICES = ("Tomorrow", "Next week", "After 16:00", "Any time", "Clear filters")
+SEARCH_FILTER_CHOICES = ("Tomorrow", "Next week", "After 16:00", "Any time", "Any day", "Clear filters")
 CALLBACK_COMMAND = re.compile(
     r"(?:select|book|approve|stop booking) [1-9][0-9]{0,8}|more|continue|options|"
     r"active|pick patient|pick visits|"
@@ -181,6 +181,7 @@ class SearchBot:
         self.portals: dict[str, tuple[float, LuxMedPortal]] = {}
         self.questionnaire_booking: QuestionnaireBooking | None = None
         self.patient_question: str | None = None
+        self.editing_search_id: int | None = None
         self.appointment_list: AppointmentList | None = None
         self.last_visit: tuple[str, CompletedVisit] | None = None
         self.cancellation_review: CancellationReview | None = None
@@ -228,6 +229,7 @@ class SearchBot:
         if not isinstance(action, str):
             return
         self.patient_question = None
+        self.editing_search_id = None
         if match := re.fullmatch(r"answer ([1-9][0-9]?)", action):
             self.answer_questionnaire(match[1], message.get("message_id"))
         elif match := re.fullmatch(r"cancel visit ([a-f0-9]{12}) ([1-9][0-9]{0,8})", action):
@@ -256,7 +258,11 @@ class SearchBot:
                     self.stop_search(row["id"], row["display_number"])
         elif match := re.fullmatch(r"filter search ([1-9][0-9]{0,17}) (.+)", action):
             if match[2] in SEARCH_FILTER_CHOICES and (row := self.active_search_for_action(int(match[1]))) is not None:
+                self.editing_search_id = row["id"]
                 self.apply_search_change(row, match[2])
+        elif match := re.fullmatch(r"result list ([1-9][0-9]{0,17})", action):
+            if self.state.results(int(match[1])) is not None:
+                self.show_results(int(match[1]), current=True)
         elif CALLBACK_COMMAND.fullmatch(action):
             self.handle({"text": action, "reply_to_message": message})
 
@@ -269,6 +275,7 @@ class SearchBot:
         flow = self.questionnaire_booking
         answer = QUESTIONNAIRE_ANSWER.fullmatch(key)
         patient_question, self.patient_question = self.patient_question, None
+        editing_search_id, self.editing_search_id = self.editing_search_id, None
         if command == "/start" or conversational_key in {"hi", "hello", "hey", "hi there", "hello there"}:
             self.state.queue_message(WELCOME_MESSAGE)
         elif command == "/help" or conversational_key == "help":
@@ -314,6 +321,14 @@ class SearchBot:
             self.show_appointments(patient_name)
         elif command in {"/change", "change"}:
             self.change(text, reply)
+        elif not reply and conversational_key in {"any day", "any date"}:
+            if editing_search_id is None:
+                self.state.queue_message(
+                    "Which search should I open up to any day? Tap Active searches, then Change.",
+                    buttons=[[("Active searches", "active")]],
+                )
+            elif (row := self.active_search_for_action(editing_search_id)) is not None:
+                self.apply_search_change(row, conversational_key)
         elif command in {"book", "/book", "details", "/details", "select", "option"} or key in {
             "more", "/more", "continue", "/continue", "find something else",
         }:
@@ -921,10 +936,27 @@ class SearchBot:
             self.show_catalog_service_menu(json.loads(pending_service))
         elif pending := self.state.get_setting("pending"):
             self.show_pediatric_menu(json.loads(pending))
+        elif not reply and self.offer_result_list_choices():
+            return
         elif row := self.state.results():
             self.show_results(row["id"], current=True)
         else:
             self.show_patient_buttons()
+
+    def offer_result_list_choices(self) -> bool:
+        rows = self.state.selectable_result_lists(int(self.clock()))
+        if len(rows) < 2:
+            return False
+        lines = ["Which search do you mean? Tap a list, then reply to its options or use its buttons."]
+        buttons = []
+        for number, row in enumerate(rows, 1):
+            criteria = self.state.criteria(row)
+            heading = self.search_heading(row["display_number"], criteria).replace("\n", " · ")
+            lines.append(f"{number}. {heading}")
+            label = f"{number}. {self.profiles[criteria.patient].name} · {criteria.service}"
+            buttons.append([(label[:64], f"result list {row['id']}")])
+        self.state.queue_message("\n".join(lines), buttons=buttons)
+        return True
 
     def show_results(self, search_id: int, *, current: bool = False) -> None:
         row = self.state.results(search_id)
@@ -974,6 +1006,8 @@ class SearchBot:
         original = self.replied_search(reply)
         row = self.state.results(original["id"]) if original else None
         if not reply:
+            if self.offer_result_list_choices():
+                return
             row = self.state.results()
         if row is None:
             self.state.queue_message("I don’t have a numbered list for that search. Start a search to get a fresh list.")
@@ -1155,7 +1189,7 @@ class SearchBot:
 
     def change(self, text: str, reply: dict) -> None:
         parts = [part.strip() for part in text.split("|")]
-        match = re.fullmatch(r"/?change\s+#?([0-9]{1,18})(?:\s+to\s+(.+))?", parts[0], re.IGNORECASE)
+        match = re.fullmatch(r"/?change\s+(?:search\s+)?#?([0-9]{1,18})(?:\s+to\s+(.+))?", parts[0], re.IGNORECASE)
         if len(text) > 600 or match is None or len(parts) > 4 or (len(parts) == 1) != bool(match[2]):
             self.state.queue_message("Try Change 123 to after 16:00 or /change 123 | service | city | filters.")
             return
@@ -1211,11 +1245,13 @@ class SearchBot:
         return row
 
     def show_search_change(self, row) -> None:
+        self.editing_search_id = row["id"]
         heading = self.search_heading(row["display_number"], self.state.criteria(row))
         choices = [(label, f"filter search {row['id']} {label}") for label in SEARCH_FILTER_CHOICES]
         self.state.queue_message(
             f"{SEARCH_CHANGE_PROMPT}\n{heading}\n\n"
             "Tap a filter or reply to this message with a change like “tomorrow after 17:00”. "
+            "Choose Any day to clear dates or Any time to clear time-of-day limits. "
             "To change the service or city, reply with service | city | filters.",
             row["id"], buttons=[choices[:2], choices[2:4], choices[4:]],
         )

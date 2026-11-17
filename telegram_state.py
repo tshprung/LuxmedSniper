@@ -187,6 +187,17 @@ class SearchState:
             (search_id,),
         ).fetchone()
 
+    def selectable_result_lists(self, now: int) -> list[sqlite3.Row]:
+        return self.db.execute(
+            """SELECT searches.* FROM search_results JOIN searches ON searches.id = search_results.search_id
+               WHERE search_results.shown > 0 AND EXISTS (
+                   SELECT 1 FROM json_each(search_results.slots) AS slot
+                   WHERE CAST(json_extract(slot.value, '$.start') AS INTEGER) > ?
+               )
+               ORDER BY searches.id DESC LIMIT 5""",
+            (now,),
+        ).fetchall()
+
     def mark_continued(self, search_id: int) -> None:
         self.db.execute("UPDATE searches SET status = 'continued' WHERE id = ? AND status = 'found'", (search_id,))
 

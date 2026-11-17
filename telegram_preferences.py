@@ -13,8 +13,9 @@ WEEKDAY_TYPOS = {"monay": "monday"}
 WEEKDAY = r"(?:" + "|".join((*WEEKDAYS, *WEEKDAY_TYPOS)) + ")"
 RELATIVE_WEEKDAY = r"(?:next|comm?ing)"
 WEEKDAY_DATE = rf"(?:{RELATIVE_WEEKDAY}\s+)?{WEEKDAY}"
+ANY_DAY = r"any\s+(?:day|date)"
 DATE = (
-    rf"(?:today|tomorrow|this week|next week|(?:on\s+)?"
+    rf"(?:{ANY_DAY}|today|tomorrow|this week|next week|(?:on\s+)?"
     rf"(?:[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}|{WEEKDAY_DATE}(?:\s+or\s+(?:on\s+)?{WEEKDAY_DATE})*))"
 )
 FILTER = re.compile(
@@ -145,7 +146,9 @@ def parse_preferences(text: str, today: dt.date, base: Preferences = Preferences
             raise PreferenceError("Use one date range, time window, doctor, and clinic per search.")
         seen.add(field)
         value = match[kind].strip()
-        if kind == "date":
+        if kind == "date" and re.fullmatch(ANY_DAY, value, re.IGNORECASE):
+            base = replace(base, first_date=None, last_date=None, date_choices=())
+        elif kind == "date":
             date_parts = re.split(r"\s+or\s+", value, flags=re.IGNORECASE)
             first, last = date_range(date_parts[0], today)
             choices = [first]
